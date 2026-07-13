@@ -42,7 +42,7 @@ function fmtAgo(iso?: string): string {
 
 /** Best-effort operator snapshot. Individual read failures degrade gracefully. */
 export async function gatherStatus(ctx: DiagnosticsContext): Promise<StatusSnapshot> {
-  const { config, publicClient, account } = ctx
+  const { config, publicClient, botAddress } = ctx
   const notes: string[] = []
   const state = readRuntimeState()
   const run = computeRunning(state, config.POLL_INTERVAL_MS)
@@ -56,7 +56,7 @@ export async function gatherStatus(ctx: DiagnosticsContext): Promise<StatusSnaps
     chainId: config.CHAIN_ID,
     pool: config.POOL_ADDRESS,
     safe: config.SAFE_ADDRESS,
-    botAddress: account?.address,
+    botAddress,
     lastPoll: state?.lastPollAt
       ? `${fmtAgo(state.lastPollAt)} (${state.lastPollTrigger ?? '?'})`
       : 'never',
@@ -75,8 +75,8 @@ export async function gatherStatus(ctx: DiagnosticsContext): Promise<StatusSnaps
     })
     snap.poolPair = `${md.token0Symbol}/${md.token1Symbol}`
 
-    if (account) {
-      snap.botBalanceEth = formatEther(await publicClient.getBalance({ address: account.address }))
+    if (botAddress) {
+      snap.botBalanceEth = formatEther(await publicClient.getBalance({ address: botAddress }))
     }
     snap.safeOwners = (await readSafeOwners(publicClient, config.SAFE_ADDRESS)).join(', ')
     snap.moduleEnabled = await isModuleEnabled(
@@ -85,12 +85,12 @@ export async function gatherStatus(ctx: DiagnosticsContext): Promise<StatusSnaps
       config.ROLES_MODIFIER_ADDRESS,
     )
 
-    if (account) {
+    if (botAddress) {
       try {
         await verifyLoanOnlyScope({
           publicClient,
           rolesModifierAddress: config.ROLES_MODIFIER_ADDRESS,
-          botAddress: account.address,
+          botAddress,
           roleKey: config.ROLE_KEY,
           poolAddress: config.POOL_ADDRESS,
           poolId: md.poolId,

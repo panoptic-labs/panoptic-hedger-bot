@@ -39,7 +39,7 @@ export async function runDoctorChecks(
   ctx: DiagnosticsContext,
   opts: { sendTelegram?: boolean } = {},
 ): Promise<DoctorResult[]> {
-  const { config, publicClient, account, accountError } = ctx
+  const { config, publicClient, botAddress, addressError, account, accountError } = ctx
   const results: DoctorResult[] = []
   const push = (r: DoctorResult) => results.push(r)
 
@@ -74,8 +74,15 @@ export async function runDoctorChecks(
     })
   }
 
-  // 2. Bot key / keystore access.
-  const botAddress = account?.address
+  // 2. Bot key / keystore access. A locked keystore (address readable, but no
+  // passphrase provided to decrypt) is a WARNING, not a failure — the address is
+  // enough for every read-only check, and the bot will prompt for the passphrase
+  // at start. A genuinely unreadable key source (or a wrong passphrase) fails.
+  const keystoreLocked =
+    !account &&
+    !!botAddress &&
+    !!config.BOT_KEYSTORE_PATH &&
+    config.BOT_KEYSTORE_PASSPHRASE === undefined
   push(
     account
       ? {
@@ -84,13 +91,22 @@ export async function runDoctorChecks(
           status: 'pass',
           detail: `bot ${account.address}`,
         }
-      : {
-          id: 'key',
-          title: 'Bot key / keystore access',
-          status: 'fail',
-          detail: msg(accountError),
-          remedy: 'Check BOT_PRIVATE_KEY, or BOT_KEYSTORE_PATH + passphrase.',
-        },
+      : keystoreLocked
+        ? {
+            id: 'key',
+            title: 'Bot key / keystore access',
+            status: 'warn',
+            detail: `keystore locked for bot ${botAddress} (BOT_KEYSTORE_PASSPHRASE not set)`,
+            remedy:
+              'Set BOT_KEYSTORE_PASSPHRASE to verify the key here and start unattended; otherwise the bot prompts at start.',
+          }
+        : {
+            id: 'key',
+            title: 'Bot key / keystore access',
+            status: 'fail',
+            detail: msg(accountError ?? addressError),
+            remedy: 'Check BOT_PRIVATE_KEY, or BOT_KEYSTORE_PATH + passphrase.',
+          },
   )
 
   if (!chainOk) {

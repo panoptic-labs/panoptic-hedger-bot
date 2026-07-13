@@ -49,7 +49,6 @@ For the common case — a fresh Safe on a supported chain (Ethereum mainnet) —
 interactive wizard replaces Steps 1–3 below:
 
 ```bash
-# (repo root)
 pnpm onboard
 ```
 
@@ -89,7 +88,6 @@ modifier versions pack differently).
 ### 1. Deploy Safe + Roles + scope (programmatic)
 
 ```bash
-# (repo root)
 # On Ethereum mainnet the Safe/Zodiac addresses are built in — omit them. For other
 # chains add SAFE_PROXY_FACTORY / SAFE_SINGLETON / ZODIAC_MODULE_PROXY_FACTORY /
 # ROLES_MASTERCOPY as overrides.

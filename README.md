@@ -35,7 +35,6 @@ security boundary on-chain**, and writes a complete `.env`. You need Node.js
 corepack enable
 pnpm install
 
-# (repo root)
 pnpm onboard            # prompts, deploys Safe + Roles, verifies scope, writes .env
 ```
 
@@ -134,7 +133,6 @@ ROLE_KEY, BOT_PRIVATE_KEY`), deploying the Safe + Roles out-of-band first — se
 ### Development
 
 ```bash
-pnpm dev         # watch mode: rebuilds the SDK + restarts the bot on change
 pnpm typecheck   # type-check with tsconfig.build.json
 pnpm lint        # eslint (max-warnings=0)
 pnpm lint:fix    # eslint --fix
@@ -236,7 +234,6 @@ docker build -t hedger-bot .
 docker run --env-file .env hedger-bot
 ```
 
-
 Operational notes:
 
 - **Stateless / idempotent** — one bot instance per Safe+pool; on restart it
@@ -260,7 +257,7 @@ Operational notes:
 | `pnpm deploy:safe-roles` | Deploy Safe + Roles modifier and scope the bot |
 | `pnpm scope:bot-role` | (Re)scope the bot EOA on an existing modifier |
 | `pnpm manage-role` | Add/remove a role member on an existing Safe (routed via the Safe owner) |
-| `pnpm dev` / `typecheck` / `lint` / `test` | Development helpers |
+| `typecheck` / `lint` / `test` | Development helpers |
 
 ## Project Structure
 
@@ -280,7 +277,6 @@ Operational notes:
 ├── scripts/             # setup (wizard), deploySafeAndRoles, scopeBotRole, inspectHedge
 │   └── lib/             # deployCore, verifyScope, safeZodiacRegistry, renderEnv, prompts, rolesScope
 
-├── docs/                # Technical notes
 ├── runbook.md           # Deployment & operations runbook
 ├── Dockerfile · docker-compose.yml
 └── .env.example         # Annotated configuration template
@@ -292,8 +288,6 @@ Operational notes:
 |----------|-------------|
 | [runbook.md](./runbook.md) | Full deployment & ops guide: architecture, role scope, fork verification, cross-pool setup |
 | [.env.example](./.env.example) | Annotated configuration reference |
-| [EXECUTION_MODULES_PLAN.md](./EXECUTION_MODULES_PLAN.md) | Design for pluggable execution backends |
-| [docs/SWAPATMINT_DISCREPANCY.md](./docs/SWAPATMINT_DISCREPANCY.md) | Note on swap encoding differences |
 
 ## License
 
