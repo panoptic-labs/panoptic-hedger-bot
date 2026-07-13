@@ -1,0 +1,8 @@
+# Standalone repo (synced from the Panoptic monorepo) — allow the build
+# scripts required by the dev toolchain (tsx/vite/vitest need esbuild).
+allowBuilds:
+  esbuild: true
+ignoredBuiltDependencies:
+  - bufferutil
+  - msw
+  - utf-8-validate

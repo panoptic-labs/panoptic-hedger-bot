@@ -1,0 +1,51 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Testing
+coverage/
+
+# Production
+dist/
+build/
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Bot key material (encrypted keystore written by `pnpm onboard`)
+bot-keystore.json
+*.keystore.json
+
+# Interrupted-onboard resume state — may hold the plaintext bot key + Telegram token
+deploy-state.json
+
+# Per-machine runtime heartbeat + live-trading activation marker
+.hedger-runtime.json
+.hedger-activated.json
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# OS
+.DS_Store
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+
+# TypeScript
+*.tsbuildinfo
+
+# Misc
+.cache/

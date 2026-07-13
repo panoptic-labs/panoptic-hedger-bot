@@ -1,0 +1,16 @@
+# Build-context ignore for the standalone hedger-bot image. Keeps local
+# artifacts and secrets out of the `COPY . .` layer.
+node_modules
+dist
+.env
+.env.*
+!.env.example
+bot-keystore.json
+*.keystore.json
+deploy-state.json
+.hedger-runtime.json
+.hedger-activated.json
+*.log
+.git
+.DS_Store
+coverage

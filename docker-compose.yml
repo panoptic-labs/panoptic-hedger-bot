@@ -1,0 +1,25 @@
+# ============================================================================
+# docker-compose for the published (standalone) hedger-bot.
+#
+#   docker compose up -d --build
+#
+# Reads configuration from ./.env (see .env.example). Build context is this
+# package — @panoptic-eng/sdk is installed from npm, no workspace needed.
+# ============================================================================
+services:
+  hedger-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hedger-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    # Mount a read-only .env so config-only changes don't require a rebuild.
+    volumes:
+      - ./.env:/app/.env:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
