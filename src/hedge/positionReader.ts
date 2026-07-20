@@ -1,5 +1,5 @@
-import { getOpenPositionIds, getPosition } from '@panoptic-eng/sdk/v2'
-import type { Address, Hex, PublicClient } from 'viem'
+import { type StorageAdapter, getPosition, syncPositions } from '@panoptic-eng/sdk/v2'
+import type { Address, PublicClient } from 'viem'
 
 import { asSdkClient } from '../utils/sdkClient'
 import { type PositionSnapshot, isLoanPosition } from './frame'
@@ -10,10 +10,16 @@ export interface ReadSafePositionsDeps {
   chainId: bigint
   /** The Safe account holding the options + hedge loans. */
   safeAddress: Address
-  /** Tracked hedge tokenIds (authoritative when non-empty; else re-derived). */
-  trackedHedgeIds: Set<bigint>
-  /** Hash of the last dispatch tx so position discovery waits past it. */
-  lastDispatchTxHash?: Hex
+  /**
+   * Persistence for the SDK position sync (checkpoint + cached list). The bot
+   * uses an in-memory adapter, so each process start does a full event scan and
+   * subsequent cycles sync incrementally within the run.
+   */
+  storage: StorageAdapter
+  /** Block floor for the first (full) position-event scan. */
+  fromBlock?: bigint
+  /** Block at which every position read is pinned. */
+  blockNumber?: bigint
 }
 
 export interface SafePositions {
@@ -25,22 +31,23 @@ export interface SafePositions {
 
 /**
  * Read the Safe's open positions and split them into the option book and the
- * hedge-loan book. Hedges are identified by the tracked set when available;
- * otherwise (e.g. after a restart) every pure width=0 loan position is treated
- * as a hedge — a documented v1 simplification (no storage dependency).
+ * hedge-loan book. Every width-zero position is treated as a hedge loan.
  */
 export async function readSafePositions(deps: ReadSafePositionsDeps): Promise<SafePositions> {
-  const { publicClient, poolAddress, chainId, safeAddress, trackedHedgeIds, lastDispatchTxHash } =
-    deps
+  const { publicClient, poolAddress, chainId, safeAddress, storage, fromBlock, blockNumber } = deps
 
-  const openIds =
-    (await getOpenPositionIds({
-      client: asSdkClient<typeof getOpenPositionIds>(publicClient),
-      chainId,
-      poolAddress,
-      account: safeAddress,
-      lastDispatchTxHash,
-    })) ?? []
+  // Authoritative open-position set from the SDK sync (event-scan reconstruction
+  // anchored to the latest dispatch by ANY actor — captures positions the bot
+  // did not itself mint, unlike a scan pinned to the bot's own last dispatch).
+  const { positionIds: openIds } = await syncPositions({
+    client: asSdkClient<typeof syncPositions>(publicClient),
+    chainId,
+    poolAddress,
+    account: safeAddress,
+    storage,
+    fromBlock,
+    toBlock: blockNumber,
+  })
 
   // Fan out the per-position reads in parallel — sequential awaits add a full
   // RPC round-trip of latency per open id on every hedge cycle.
@@ -51,6 +58,7 @@ export async function readSafePositions(deps: ReadSafePositionsDeps): Promise<Sa
         poolAddress,
         owner: safeAddress,
         tokenId,
+        blockNumber,
       }).then((pos) => ({ tokenId, pos })),
     ),
   )
@@ -66,10 +74,7 @@ export async function readSafePositions(deps: ReadSafePositionsDeps): Promise<Sa
     })
   }
 
-  const useTracked = trackedHedgeIds.size > 0
-  const hedgePositions = positions.filter((p) =>
-    useTracked ? trackedHedgeIds.has(p.tokenId) : isLoanPosition(p.legs),
-  )
+  const hedgePositions = positions.filter((position) => isLoanPosition(position.legs))
 
   return { positions, hedgePositions }
 }

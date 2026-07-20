@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import type { HedgerBotConfig } from '../config'
 import type { AggregatedPrice, LatestPriceProvider } from './cexAggregator'
-import { createCexSource } from './cexSource'
+import { createCexSource, resolveCexAssetOrientation } from './cexSource'
 import { createPriceSignalSource } from './index'
 
 function fakeProvider(latest: AggregatedPrice | null): LatestPriceProvider {
@@ -22,6 +22,22 @@ const priced = (price: number, ts: number): AggregatedPrice => ({
 const WETH_USDC = { token0Decimals: 18n, token1Decimals: 6n }
 
 describe('createCexSource', () => {
+  it('derives orientation from registered mainnet token addresses, not symbols', () => {
+    expect(
+      resolveCexAssetOrientation(
+        1,
+        '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+        '0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48',
+      ),
+    ).toBe(0n)
+    expect(() =>
+      resolveCexAssetOrientation(
+        1,
+        '0x1111111111111111111111111111111111111111',
+        '0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48',
+      ),
+    ).toThrow(/registered WETH\/USD/)
+  })
   it('starts the provider on construction', () => {
     const provider = fakeProvider(null)
     createCexSource({ ...WETH_USDC, ethTokenIndex: 0n, staleMs: 12_000, minFeeds: 1, provider })

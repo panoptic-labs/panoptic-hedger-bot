@@ -1,3 +1,4 @@
+import { getAddress, isAddress, isHex, parseEther, parseUnits, size } from 'viem'
 import { z } from 'zod'
 
 /**
@@ -13,49 +14,112 @@ import { z } from 'zod'
 const addressSchema = z
   .string()
   .regex(/^0x[a-fA-F0-9]{40}$/, 'must be a 20-byte hex address')
-  .transform((v) => v as `0x${string}`)
+  .superRefine((value, ctx) => {
+    if (!isAddress(value, { strict: true })) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'mixed-case address checksum is invalid',
+      })
+    }
+  })
+  .transform((value) => getAddress(value))
 
 const bytes32Schema = z
   .string()
-  .regex(/^0x[a-fA-F0-9]{64}$/, 'must be a 32-byte hex value')
-  .transform((v) => v as `0x${string}`)
+  .refine(
+    (value): value is `0x${string}` => isHex(value) && size(value) === 32,
+    'must be a 32-byte hex value',
+  )
 
 const privateKeySchema = z
   .string()
-  .regex(/^0x[a-fA-F0-9]{64}$/, 'must be a 32-byte hex private key')
-  .transform((v) => v as `0x${string}`)
+  .refine(
+    (value): value is `0x${string}` => isHex(value) && size(value) === 32,
+    'must be a 32-byte hex private key',
+  )
+
+const rpcUrlSchema = z
+  .string()
+  .url()
+  .superRefine((value, ctx) => {
+    const url = new URL(value)
+    const loopback = ['localhost', '127.0.0.1', '::1'].includes(url.hostname)
+    if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'must use HTTPS (HTTP is allowed only for a loopback development RPC)',
+      })
+    }
+    if (url.username || url.password) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'must not embed credentials in the URL',
+      })
+    }
+  })
 
 const booleanSchema = z
   .enum(['true', 'false', '1', '0'])
   .transform((v) => v === 'true' || v === '1')
 
-/** One whitelisted cross-pool hedge venue on the vault's token pair. */
-const hedgePoolSchema = z.discriminatedUnion('version', [
-  z.object({
-    version: z.literal('v4'),
-    fee: z.coerce.number().int().nonnegative(),
-    tickSpacing: z.coerce.number().int().positive(),
-    hooks: addressSchema.optional(),
-  }),
-  z.object({
-    version: z.literal('v3'),
-    fee: z.coerce.number().int().nonnegative(),
-  }),
-])
-export type HedgePoolSpec = z.infer<typeof hedgePoolSchema>
+function boundedInteger(min: number, max: number, defaultValue?: number) {
+  const schema = z
+    .string()
+    .regex(/^(0|[1-9]\d*)$/, 'must be a plain non-negative integer')
+    .transform(Number)
+    .refine(Number.isSafeInteger, 'must be a safe integer')
+    .refine((value) => value >= min && value <= max, `must be between ${min} and ${max}`)
+  return defaultValue === undefined ? schema : schema.default(String(defaultValue))
+}
 
-/** A JSON array of hedge pools, parsed from the HEDGE_POOLS env string. */
-const hedgePoolsSchema = z
-  .string()
-  .transform((raw, ctx) => {
-    try {
-      return JSON.parse(raw) as unknown
-    } catch {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'HEDGE_POOLS must be valid JSON' })
-      return z.NEVER
-    }
-  })
-  .pipe(hedgePoolSchema.array().min(1, 'HEDGE_POOLS must list at least one pool'))
+function boundedBigint(min: bigint, max: bigint, defaultValue?: bigint) {
+  const schema = z
+    .string()
+    .regex(/^(0|[1-9]\d*)$/, 'must be a plain non-negative integer')
+    .transform(BigInt)
+    .refine((value) => value >= min && value <= max, `must be between ${min} and ${max}`)
+  return defaultValue === undefined ? schema : schema.default(defaultValue.toString())
+}
+
+// Signed variant of boundedBigint: accepts an optional leading minus sign so a
+// directional bias (e.g. a target-delta offset) can be negative. boundedBigint's
+// regex rejects '-', so this cannot reuse it.
+function boundedSignedBigint(min: bigint, max: bigint, defaultValue: bigint) {
+  return z
+    .string()
+    .regex(/^-?(0|[1-9]\d*)$/, 'must be a plain integer')
+    .transform(BigInt)
+    .refine((value) => value >= min && value <= max, `must be between ${min} and ${max}`)
+    .default(defaultValue.toString())
+}
+
+function boundedAmount(
+  parse: (value: string) => bigint,
+  min: string,
+  max: string,
+  defaultValue: string,
+) {
+  const minimum = parse(min)
+  const maximum = parse(max)
+  return z
+    .string()
+    .regex(/^(0|[1-9]\d*)(\.\d+)?$/, 'must be a plain finite decimal')
+    .transform((value, ctx) => {
+      try {
+        return parse(value)
+      } catch {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'has too many decimal places' })
+        return z.NEVER
+      }
+    })
+    .refine((value) => value >= minimum && value <= maximum, `must be between ${min} and ${max}`)
+    .default(defaultValue)
+}
+
+const boundedGwei = (min: string, max: string, defaultValue: string) =>
+  boundedAmount((value) => parseUnits(value, 9), min, max, defaultValue)
+const boundedEth = (min: string, max: string, defaultValue: string) =>
+  boundedAmount(parseEther, min, max, defaultValue)
 
 export const PRICE_SIGNAL_SOURCES = ['pool-tick', 'uniswap-pool', 'cex'] as const
 export type PriceSignalSourceKind = (typeof PRICE_SIGNAL_SOURCES)[number]
@@ -64,7 +128,7 @@ const rawEnvSchema = z
   .object({
     // Chain / RPC
     CHAIN_ID: z.coerce.number().int().positive(),
-    RPC_URL: z.string().url(),
+    RPC_URL: rpcUrlSchema,
 
     // Panoptic pool holding options + hedge loans
     POOL_ADDRESS: addressSchema,
@@ -81,12 +145,18 @@ const rawEnvSchema = z
     BOT_PRIVATE_KEY: privateKeySchema.optional(),
     BOT_KEYSTORE_PATH: z.string().min(1).optional(),
     BOT_KEYSTORE_PASSPHRASE: z.string().optional(),
+    BOT_KEYSTORE_PASSPHRASE_FILE: z.string().min(1).optional(),
 
     // Hedging parameters
     ASSET_INDEX: z.enum(['0', '1']).transform((v) => BigInt(v)),
-    DELTA_THRESHOLD_BPS: z.coerce.bigint().positive().default(200n),
-    MAX_HEDGE_SLOTS: z.coerce.number().int().positive().default(4),
-    SLIPPAGE_BPS: z.coerce.number().int().nonnegative().default(30),
+    DELTA_THRESHOLD_BPS: boundedBigint(1n, 5_000n, 200n),
+    // Target net delta the bot hedges TOWARD, as signed bps of portfolio size
+    // (0 = delta-neutral, positive = long bias, negative = short bias).
+    DELTA_OFFSET_BPS: boundedSignedBigint(-5_000n, 5_000n, 0n),
+    MAX_HEDGE_SLOTS: boundedInteger(1, 16, 4),
+    // 100 bps maps conservatively to a ±100 tick execution band for in-pool loans.
+    SLIPPAGE_BPS: boundedInteger(0, 500, 100),
+    MIN_MARGIN_RESERVE_BPS: boundedBigint(500n, 9_000n, 2_000n),
 
     // Price signal source
     PRICE_SIGNAL_SOURCE: z.enum(PRICE_SIGNAL_SOURCES).default('pool-tick'),
@@ -99,50 +169,60 @@ const rawEnvSchema = z
     // hardcoded to ETH/USD(T), so this defaults to ETH-USD and only needs setting
     // to assert intent (validated against the ETH/USD(T) pattern in priceSignal).
     CEX_SYMBOL: z.string().min(1).default('ETH-USD'),
-    CEX_STALE_MS: z.coerce.number().int().positive().default(12_000),
+    CEX_STALE_MS: boundedInteger(1_000, 60_000, 12_000),
     // Sanity guard: if the price-signal tick and the pool's on-chain tick differ
     // by more than this, the cycle is skipped (a huge gap means the signal is
     // misconfigured — wrong ASSET_INDEX inverts the price, wrong pool, etc. — and
     // dispatching would revert with PriceBoundFail). ~5000 ticks ≈ a 65% price gap.
-    SIGNAL_TICK_SANITY_MAX: z.coerce.number().int().positive().default(5_000),
-    CEX_MIN_FEEDS: z.coerce.number().int().positive().default(1),
+    SIGNAL_TICK_SANITY_MAX: boundedInteger(100, 10_000, 5_000),
+    MAX_SIGNAL_BLOCK_AGE_SECONDS: boundedInteger(15, 120, 36),
+    CEX_MIN_FEEDS: boundedInteger(1, 3, 3),
 
-    // Hedge venue: in-pool loan (v1) or cross-pool spot rebalance on another Uniswap pool.
-    HEDGE_VENUE: z.enum(['in-pool', 'cross-pool-uniswap']).default('in-pool'),
-    // cross-pool-uniswap: a JSON whitelist of Uniswap pools on the SAME token pair
-    // as the vault. The bot best-quotes across all of them each cycle and swaps
-    // the winner; the same list scopes UniversalRouter.execute (see routerScope).
-    // v4 entry: {"version":"v4","fee":500,"tickSpacing":10,"hooks":"0x.."}
-    // v3 entry: {"version":"v3","fee":3000}
-    HEDGE_POOLS: hedgePoolsSchema.optional(),
-    UNIVERSAL_ROUTER_ADDRESS: addressSchema.optional(),
-    PERMIT2_ADDRESS: addressSchema.optional(),
-    MULTISEND_ADDRESS: addressSchema.optional(),
+    // Kept as an explicit literal so old in-pool deployments remain valid while
+    // removed experimental venues fail instead of silently changing behavior.
+    HEDGE_VENUE: z.literal('in-pool').default('in-pool'),
 
     // Gas policy (keeper EOA pays all gas — no Safe refund).
     // Hard EIP-1559 caps applied to every send:
-    MAX_FEE_GWEI: z.coerce.number().positive().default(400),
-    MAX_PRIORITY_FEE_GWEI: z.coerce.number().positive().default(2),
+    MAX_FEE_GWEI: boundedGwei('1', '1000', '400'),
+    MAX_PRIORITY_FEE_GWEI: boundedGwei('0.01', '100', '2'),
+    // Urgent tip FLOOR: when a hedge is urgent (see URGENT_DRIFT_MULTIPLIER) the
+    // priority tip is lifted to at least this, so an RPC estimating a near-zero
+    // tip can't leave an urgent hedge unprioritised in a volatility spike. May
+    // deliberately exceed MAX_PRIORITY_FEE_GWEI (the routine ceiling) — only
+    // MAX_FEE_GWEI bounds it.
+    URGENT_PRIORITY_FEE_GWEI: boundedGwei('0.01', '100', '1'),
     // Two-tier deferral: routine hedges wait out basefee spikes; urgent hedges
     // (drift >= URGENT_DRIFT_MULTIPLIER x DELTA_THRESHOLD_BPS) tolerate more.
-    HEDGE_MAX_BASE_FEE_GWEI: z.coerce.number().positive().default(50),
-    URGENT_MAX_BASE_FEE_GWEI: z.coerce.number().positive().default(300),
-    URGENT_DRIFT_MULTIPLIER: z.coerce.number().positive().default(3),
+    HEDGE_MAX_BASE_FEE_GWEI: boundedGwei('1', '500', '50'),
+    URGENT_MAX_BASE_FEE_GWEI: boundedGwei('1', '1000', '300'),
+    URGENT_DRIFT_MULTIPLIER: boundedInteger(1, 20, 3),
     // The keeper's target minimum ETH — shown in the low-gas alert as the level
     // to top back up to. NOT the alert trigger (see KEEPER_BALANCE_WARN_ETH).
-    MIN_KEEPER_BALANCE_ETH: z.coerce.number().positive().default(0.05),
+    MIN_KEEPER_BALANCE_ETH: boundedEth('0.001', '100', '0.05'),
     // Only warn/alert once the keeper EOA's ETH actually falls below this — keeps
     // routine balances above the warn line from spamming the log every poll.
-    KEEPER_BALANCE_WARN_ETH: z.coerce.number().positive().default(0.015),
+    KEEPER_BALANCE_WARN_ETH: boundedEth('0.001', '100', '0.015'),
     // Give up waiting for a dispatch receipt after this long (alert; the next
     // cycle re-reads chain state and reconciles).
-    TX_RECEIPT_TIMEOUT_MS: z.coerce.number().int().positive().default(180_000),
+    TX_RECEIPT_TIMEOUT_MS: boundedInteger(30_000, 900_000, 180_000),
+    // While waiting, re-send the same nonce with >=12.5%-bumped fees every this
+    // often, until MAX_FEE_GWEI caps the escalation or the receipt budget ends.
+    TX_BUMP_INTERVAL_MS: boundedInteger(5_000, 300_000, 45_000),
 
     // Loop
-    POLL_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
+    POLL_INTERVAL_MS: boundedInteger(5_000, 300_000, 60_000),
     DRY_RUN: booleanSchema.default('false'),
 
     // Optional
+    // Block floor for the SDK position-event scan (syncPositions). Defaults to
+    // the chain's protocol genesis; override to a later block to speed the first
+    // (full) scan on chains not in the built-in genesis map.
+    SYNC_FROM_BLOCK: z
+      .string()
+      .regex(/^(0|[1-9]\d*)$/, 'must be a plain non-negative integer')
+      .transform(BigInt)
+      .optional(),
     PANOPTIC_BUILDER_CODE: z.string().optional(),
     // Telegram notifications (both required together to enable).
     TELEGRAM_BOT_TOKEN: z.string().optional(),
@@ -156,6 +236,13 @@ const rawEnvSchema = z
         code: z.ZodIssueCode.custom,
         path: [hasKey ? 'BOT_KEYSTORE_PATH' : 'BOT_PRIVATE_KEY'],
         message: 'set exactly one of BOT_PRIVATE_KEY or BOT_KEYSTORE_PATH',
+      })
+    }
+    if (cfg.BOT_KEYSTORE_PASSPHRASE !== undefined && cfg.BOT_KEYSTORE_PASSPHRASE_FILE) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['BOT_KEYSTORE_PASSPHRASE_FILE'],
+        message: 'set at most one of BOT_KEYSTORE_PASSPHRASE or BOT_KEYSTORE_PASSPHRASE_FILE',
       })
     }
     if (cfg.PRICE_SIGNAL_SOURCE === 'uniswap-pool') {
@@ -185,23 +272,6 @@ const rawEnvSchema = z
     }
     // CEX_SYMBOL now defaults to ETH-USD, so no required-field check is needed;
     // the ETH/USD(T) pattern is enforced where the cex source is constructed.
-    if (cfg.HEDGE_VENUE === 'cross-pool-uniswap') {
-      const missing = (
-        [
-          ['HEDGE_POOLS', cfg.HEDGE_POOLS],
-          ['UNIVERSAL_ROUTER_ADDRESS', cfg.UNIVERSAL_ROUTER_ADDRESS],
-          ['PERMIT2_ADDRESS', cfg.PERMIT2_ADDRESS],
-          ['MULTISEND_ADDRESS', cfg.MULTISEND_ADDRESS],
-        ] as const
-      ).filter(([, v]) => v === undefined || v === null)
-      for (const [name] of missing) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: [name],
-          message: `${name} is required when HEDGE_VENUE='cross-pool-uniswap'`,
-        })
-      }
-    }
     if (cfg.HEDGE_MAX_BASE_FEE_GWEI > cfg.URGENT_MAX_BASE_FEE_GWEI) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -217,6 +287,37 @@ const rawEnvSchema = z
           'MAX_FEE_GWEI must be >= URGENT_MAX_BASE_FEE_GWEI (urgent sends must be able to price in)',
       })
     }
+    // No check against MAX_PRIORITY_FEE_GWEI on purpose: the urgent floor is
+    // allowed to exceed the routine tip ceiling — that is its entire point.
+    if (cfg.URGENT_PRIORITY_FEE_GWEI > cfg.MAX_FEE_GWEI) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['URGENT_PRIORITY_FEE_GWEI'],
+        message: 'URGENT_PRIORITY_FEE_GWEI must be <= MAX_FEE_GWEI (the tip must fit the fee cap)',
+      })
+    }
+    if (cfg.TX_BUMP_INTERVAL_MS > cfg.TX_RECEIPT_TIMEOUT_MS) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['TX_BUMP_INTERVAL_MS'],
+        message:
+          'TX_BUMP_INTERVAL_MS must be <= TX_RECEIPT_TIMEOUT_MS (need at least one wait segment)',
+      })
+    }
+    if (cfg.KEEPER_BALANCE_WARN_ETH >= cfg.MIN_KEEPER_BALANCE_ETH) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['KEEPER_BALANCE_WARN_ETH'],
+        message: 'KEEPER_BALANCE_WARN_ETH must be below MIN_KEEPER_BALANCE_ETH',
+      })
+    }
+    if (cfg.PRICE_SIGNAL_SOURCE === 'cex' && cfg.CEX_MIN_FEEDS < 3) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['CEX_MIN_FEEDS'],
+        message: 'production CEX mode requires all three independent feeds',
+      })
+    }
     const hasTgToken = Boolean(cfg.TELEGRAM_BOT_TOKEN)
     const hasTgChat = Boolean(cfg.TELEGRAM_CHAT_ID)
     if (hasTgToken !== hasTgChat) {
@@ -230,11 +331,28 @@ const rawEnvSchema = z
 
 export type HedgerBotConfig = z.infer<typeof rawEnvSchema>
 
+const REMOVED_CROSS_POOL_KEYS = [
+  'HEDGE_VENUE',
+  'HEDGE_POOLS',
+  'UNIVERSAL_ROUTER_ADDRESS',
+  'PERMIT2_ADDRESS',
+  'MULTISEND_ADDRESS',
+] as const
+
 /**
  * Parse and validate configuration from a raw environment record.
  * Throws a readable aggregated error when validation fails.
  */
 export function parseHedgerBotConfig(env: NodeJS.ProcessEnv = process.env): HedgerBotConfig {
+  const removed = REMOVED_CROSS_POOL_KEYS.filter((name) =>
+    name === 'HEDGE_VENUE' ? env.HEDGE_VENUE === 'cross-pool-uniswap' : env[name] !== undefined,
+  )
+  if (removed.length > 0) {
+    throw new Error(
+      `Invalid hedger-bot configuration:\n  - ${removed.join(', ')}: ` +
+        'cross-pool execution was removed from the supported runtime',
+    )
+  }
   const result = rawEnvSchema.safeParse(env)
   if (!result.success) {
     const issues = result.error.issues

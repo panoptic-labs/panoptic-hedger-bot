@@ -1,33 +1,42 @@
-import dotenv from 'dotenv'
 import { setupServer } from 'msw/node'
-
-dotenv.config()
 
 // Create and export the MSW server instance for mocking http responses
 export const server = setupServer()
+const unhandledRequests = new Set<string>()
 
-const unhandledRequests = new Map<string, { request?: Request; response?: Response }>()
+const SECRET_ENV_NAME = /(private[_-]?key|passphrase|password|secret|token|rpc[_-]?url)/iu
 
-// Save and log any unhandled requests / response pairs (ignoring any localhost requests)
-server.events.on('request:unhandled', async ({ request, requestId }) => {
-  if (new URL(request.url).hostname !== '127.0.0.1') {
-    unhandledRequests.set(requestId, { request })
-  }
+// Unit tests must never inherit operator credentials. A suite may inject a
+// synthetic value after setup when the behavior under test requires one.
+for (const name of Object.keys(process.env)) {
+  if (SECRET_ENV_NAME.test(name)) delete process.env[name]
+}
+
+export function summarizeUnhandledRequest(request: Request): string {
+  const url = new URL(request.url)
+  return `${request.method} ${url.origin}/[redacted]`
+}
+
+server.events.on('request:unhandled', ({ request }) => {
+  unhandledRequests.add(summarizeUnhandledRequest(request))
 })
 
-server.events.on('response:bypass', async ({ response, request, requestId }) => {
-  if (new URL(request.url).hostname !== '127.0.0.1') {
-    const existingRequest = unhandledRequests.get(requestId) || {}
-    unhandledRequests.set(requestId, { ...existingRequest, response })
-  }
+beforeAll(() => {
+  server.listen({
+    onUnhandledRequest(request) {
+      throw new Error(`Unhandled outbound request: ${summarizeUnhandledRequest(request)}`)
+    },
+  })
+})
+
+afterEach(() => {
+  server.resetHandlers()
+  if (unhandledRequests.size === 0) return
+  const summaries = [...unhandledRequests]
+  unhandledRequests.clear()
+  throw new Error(`Test attempted unmocked outbound request(s): ${summaries.join(', ')}`)
 })
 
 afterAll(() => {
-  if (unhandledRequests.size > 0) {
-    console.log('Unhandled Requests')
-    console.log(unhandledRequests)
-    console.log(
-      "It's recommended to save these responses and use MSW to mock them to avoid making network requests in tests.",
-    )
-  }
+  server.close()
 })

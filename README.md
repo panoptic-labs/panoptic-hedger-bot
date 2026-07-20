@@ -17,9 +17,9 @@ The bot is **stateless** (it re-derives all hedge state from on-chain positions
 on every startup), so it is safe to restart or kill at any time.
 
 **Supported in v1:** loan-only hedging · in-pool venue · Ethereum mainnet ·
-pool-tick or CEX price signal · a single Safe + pool per instance. Cross-pool
-routing, the `uniswap-pool` signal, and the extra Zodiac keeper roles exist but
-are **experimental** (labelled below and in `.env.advanced.example`) — their
+pool-tick or CEX price signal · a single Safe + pool per instance. The
+`uniswap-pool` signal and extra Zodiac keeper roles exist but are **experimental**
+(labelled below and in `.env.advanced.example`) — their
 setup, monitoring, and recovery paths are not as hardened as the core.
 
 ## Quick start: `pnpm onboard`
@@ -60,11 +60,13 @@ The wizard asks for:
     transactions** for you to execute in the Safe UI (app.safe.global), then
     polls on-chain until the loan-only boundary is live. Roles scoping is
     additive, so adding a pool never un-scopes the others.
-- **Bot signer** — generate a fresh key or import one. Generation uses the OS
+- **Bot signer** — generate a fresh key, import one, or reuse an existing
+  owner-only `bot-keystore.json` without entering the plaintext key or rewriting
+  the file. Generation uses the OS
   CSPRNG (`randomBytes`), which is sufficient on its own; you can optionally fold
   in your own extra entropy (mixed via keccak256, so it can only add to the RNG).
-  Then choose how to store it: a **passphrase-encrypted keystore** (recommended —
-  no plaintext at rest) or plaintext in `.env`.
+  New or imported keys can be stored in a **passphrase-encrypted keystore**
+  (recommended — no plaintext at rest) or plaintext in `.env`.
 - Optional: rehedge threshold and `DRY_RUN`.
 - **Telegram alerts** are optional and configured out-of-band (not in the
   wizard): create a bot via @BotFather, then set `TELEGRAM_BOT_TOKEN` and
@@ -73,8 +75,12 @@ The wizard asks for:
   is fixed by the deploy salt, so the wizard can search salts locally (no chain
   writes) for an address starting with a hex prefix you choose. Each extra hex
   character makes the search ~16× slower; 3–5 characters is near-instant.
-The wizard deploys a strictly **loan-only** bot (minimal privilege): its role can
-only mint/burn pure loans against the Safe, never touch your option positions.
+The wizard deploys a **width-zero loan-only** bot. It cannot dispatch
+width-positive options, but the current role does not enforce loan size, tick,
+spread, premia-collateral, or builder-code bounds. A stolen bot key can therefore
+cause severe economic loss, including collateral exhaustion or liquidation. This
+profile remains **NO-GO for live funds**: loan-shape/size/tick bounds were
+explicitly deferred. Experimental swap executors are not part of the v1 runtime.
 
 **Advanced / EXPERIMENTAL: extra keeper roles.** The SDK also defines à-la-carte
 roles beyond loan-only — `deleverager` (burn-only close), `maintenance` (force-exercise /
@@ -82,20 +88,25 @@ settle / liquidate third-party accounts — high privilege), `roller`, and
 `size-adjuster`. This bot's runtime does **not** exercise them, so `pnpm onboard`
 does not scope them. If you run a separate keeper that uses these capabilities,
 scope one onto an existing modifier with `pnpm manage-role` (below).
+Any extra role/member makes the modifier differ from the exact production
+manifest, so `doctor` warns about the experimental permission graph. Re-onboard
+with a fresh modifier to restore the exact manifest when that is desired.
 
 **Changing role membership later.** Setup transfers the Roles modifier's
-ownership to the Safe, so role membership is changed by the **Safe owner**, not
-the bot. Use `pnpm manage-role` — it routes `assignRoles` through the Safe:
+ownership to the Safe, so role membership is changed by the **Safe**, not the
+bot host. `pnpm manage-role` emits unsigned Safe Transaction Builder JSON:
 
 ```bash
 ROLE=deleverager MEMBER=0x… ENABLED=true \
-SAFE_ADDRESS=0x… ROLES_MODIFIER_ADDRESS=0x… ROLES_OWNER_PRIVATE_KEY=0x… \
-RPC_URL=… CHAIN_ID=… pnpm manage-role
+SAFE_ADDRESS=0x… ROLES_MODIFIER_ADDRESS=0x… \
+CHAIN_ID=… pnpm manage-role > role-proposal.json
 ```
 
 `ROLE` is a canonical name (`deleverager`/`maintenance`/`roller`/`size-adjuster`)
 or a bytes32 role key (e.g. the bot's `ROLE_KEY` from `.env`); `ENABLED=false`
-revokes. You can also do this from the Zodiac app on app.safe.global.
+revokes. No Safe-owner key variable is accepted. Import the JSON into the Safe
+UI, inspect/simulate the batch, and
+collect the Safe's configured threshold approvals.
 
 Nothing is written to `.env` until the Safe + Roles are deployed **and** the
 loan-only scope is verified (bot can dispatch a width=0 loan, cannot dispatch a
@@ -117,6 +128,8 @@ pnpm start               # full loop; runs in dry-run until activated
 pnpm activate            # re-runs preflight, confirms, writes the activation marker
 pnpm start               # now trades live (needs DRY_RUN unset)
 pnpm status              # operator snapshot: running, mode, positions, delta, last poll/hedge
+pnpm health              # machine-readable readiness; non-zero unless healthy and ready
+pnpm deactivate          # emergency local kill marker; restart cannot trade until re-activated
 ```
 
 (`pnpm doctor` is an alias for `pnpm preflight`; invoke it as `pnpm run doctor`
@@ -158,12 +171,13 @@ it writes (and for the manual path). The full annotated list lives in
 | `BOT_PRIVATE_KEY` | ✅¹ | Bot signer key (raw hex) — **the only runtime secret** |
 | `BOT_KEYSTORE_PATH` | ✅¹ | …or a passphrase-encrypted v3 keystore instead of a raw key |
 | `BOT_KEYSTORE_PASSPHRASE` | | Keystore passphrase for unattended restart (else prompted at start) |
+| `BOT_KEYSTORE_PASSPHRASE_FILE` | | Preferred owner-only passphrase secret file; mutually exclusive with the environment value |
 | `ASSET_INDEX` | | Which token is the sizing asset: `0` or `1` |
 | `DELTA_THRESHOLD_BPS` | | Rehedge trigger, default `200` (2%) |
 | `MAX_HEDGE_SLOTS` | | Consolidate hedge loans above this count, default `4` |
-| `SLIPPAGE_BPS` | | Hedge swap slippage tolerance, default `30` |
+| `SLIPPAGE_BPS` | | Hedge swap slippage tolerance, default `100` (±100 ticks for in-pool loans) |
 | `PRICE_SIGNAL_SOURCE` | | `pool-tick` \| `cex` (v1); `uniswap-pool` (experimental) |
-| `HEDGE_VENUE` | | `in-pool` (v1) \| `cross-pool-uniswap` (experimental spot rebalance) |
+| `HEDGE_VENUE` | | `in-pool` (the only supported execution venue) |
 | `POLL_INTERVAL_MS` | | Loop interval, default `60000` |
 | `DRY_RUN` | | `true` simulates via `eth_call`; live also requires `pnpm activate` |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | | Optional alerting (set both to enable) |
@@ -171,15 +185,12 @@ it writes (and for the manual path). The full annotated list lives in
 ¹ Provide **exactly one** bot key source: `BOT_PRIVATE_KEY` (raw hex, plaintext
 at rest) **or** `BOT_KEYSTORE_PATH` (a geth-style passphrase-encrypted keystore,
 decrypted at startup — no plaintext at rest). `pnpm onboard` can generate the
-keystore for you. If a keystore is used and `BOT_KEYSTORE_PASSPHRASE` is unset,
-the bot prompts for the passphrase on startup (so unattended restart requires
-setting it).
+keystore for you. If a keystore is used and neither non-interactive passphrase
+source is set, the bot prompts at startup. Remote RPC endpoints must use HTTPS;
+plain HTTP is accepted only for a loopback development fork.
 
-The CEX signal variables (`CEX_*`) are core. The **experimental**
-`uniswap-pool` signal and `cross-pool-uniswap` venue variables
-(`UNISWAP_SIGNAL_*`, `HEDGE_POOLS`, `UNIVERSAL_ROUTER_ADDRESS`,
-`PERMIT2_ADDRESS`, `MULTISEND_ADDRESS`) live in `.env.advanced.example` — see
-[`runbook.md`](./runbook.md).
+The CEX signal variables (`CEX_*`) are core. The experimental `uniswap-pool`
+signal variables (`UNISWAP_SIGNAL_*`) live in `.env.advanced.example`.
 
 ## Deployment: Safe + Roles
 
@@ -215,10 +226,6 @@ transfers its ownership to the Safe — so no standing EOA-only admin remains.
 > before writing `.env`. Still run against a fork first for real deployments.
 > See runbook Step 0.
 
-**Experimental:** for the `cross-pool-uniswap` venue there is additional Roles
-scoping and one-time token approvals — see
-[runbook.md § Cross-pool venue](./runbook.md). Not covered by v1 support.
-
 ## Running in Production
 
 The bot ships with a multi-stage `Dockerfile` and a `docker-compose.yml`
@@ -226,21 +233,28 @@ The bot ships with a multi-stage `Dockerfile` and a `docker-compose.yml`
 `@panoptic-eng/sdk` is pulled from npm — so build straight from this directory:
 
 ```bash
-# Compose (reads ./.env; rebuilds the image)
+# Put the encrypted keystore and passphrase in the Compose secret files named
+# by docker-compose.yml; .env must not also define BOT_PRIVATE_KEY.
+# File-backed Compose secrets are bind mounts: both host files must be owned by
+# uid 1000 (the container's node user) and have mode 0600 before startup.
 docker compose up -d --build
-
-# Or plain docker
-docker build -t hedger-bot .
-docker run --env-file .env hedger-bot
 ```
+
+Set `SOURCE_SHA` to the exact reviewed 40-character commit before building; the
+image embeds it in `HEDGER_BUILD_ID`, and activation is invalidated when that
+artifact identity changes.
 
 Operational notes:
 
-- **Stateless / idempotent** — one bot instance per Safe+pool; on restart it
-  reconciles hedge state from on-chain positions. Safe to kill and relaunch.
-- **Logging** is to stdout; **alerting** is optional Telegram. There is no
-  metrics endpoint or health/liveness probe yet — add those in your orchestrator
-  if you need them.
+- **Durable and fenced** — mount `/var/lib/hedger` persistently. The transaction
+  journal recovers replacement hashes and sender/nonce provenance across
+  restarts, and the instance lease blocks two writers for the same Safe+pool.
+- **Read-only container** — the root filesystem is read-only; state is confined
+  to `/var/lib/hedger`, key material to `/run/secrets`, and `/tmp` is a small
+  no-exec tmpfs. The image runs bundled JavaScript as the unprivileged `node` user.
+- **Health** — the image healthcheck runs the signer-free compiled health command.
+  Readiness fails on stale heartbeat, lifecycle failure, or repeated signal or
+  notification failures.
 - **RPC** is a single endpoint with retry/backoff but no failover; front it with
   a resilient RPC gateway for production.
 
@@ -249,9 +263,12 @@ Operational notes:
 | Script | Description |
 |--------|-------------|
 | `pnpm onboard` | Interactive wizard: deploy Safe + Roles, verify scope, write `.env` |
+| `pnpm onboard:cleanup` | Report resume artifacts; remove only with explicit `--confirm` |
 | `pnpm preflight` | Read-only preflight checks (alias: `pnpm run doctor`); sends nothing |
 | `pnpm start` | Run the hedging loop; dry-run until activated (`tsx src/main.ts`) |
 | `pnpm activate` | Re-run preflight, confirm, and write the live-trading activation marker |
+| `pnpm deactivate` | Write the emergency local deactivation marker (sends nothing) |
+| `pnpm health` | Signer-free machine-readable liveness/readiness check |
 | `pnpm status` | Operator snapshot: running, mode, positions, delta, last poll/hedge |
 | `pnpm inspect:hedge` | Dry-run one cycle, print the plan, send nothing |
 | `pnpm deploy:safe-roles` | Deploy Safe + Roles modifier and scope the bot |
@@ -269,7 +286,7 @@ Operational notes:
 │   ├── hedgerBot.ts     # Orchestrator (per-cycle logic)
 │   ├── hedge/           # Delta decision, reconciliation, safety gates
 │   ├── priceSignal/     # Price sources: pool-tick, uniswap-pool, cex
-│   ├── executor/        # Hedge execution (in-pool loans, cross-pool swaps)
+│   ├── executor/        # In-pool loan execution
 │   ├── safe/            # Zodiac Roles executor
 │   ├── notify/          # Telegram notifications
 │   ├── presenters/      # Cycle summary formatting
@@ -286,7 +303,7 @@ Operational notes:
 
 | Document | Description |
 |----------|-------------|
-| [runbook.md](./runbook.md) | Full deployment & ops guide: architecture, role scope, fork verification, cross-pool setup |
+| [runbook.md](./runbook.md) | Full deployment & ops guide: architecture, role scope, and fork verification |
 | [.env.example](./.env.example) | Annotated configuration reference |
 
 ## License

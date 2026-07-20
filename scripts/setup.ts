@@ -2,17 +2,39 @@ import 'dotenv/config'
 
 import { randomBytes } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { readFile, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 import { getChainDeployment, getPoolMetadata, isSupportedChain } from '@panoptic-eng/sdk/v2'
-import { type PublicClient, createPublicClient, createWalletClient, formatEther, http } from 'viem'
+import {
+  type PublicClient,
+  createPublicClient,
+  createWalletClient,
+  formatEther,
+  getAddress,
+  http,
+  isHex,
+  size,
+} from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
+import { z } from 'zod'
 
 import { parseHedgerBotConfig } from '../src/config'
+import {
+  readSecureJson,
+  removeSecureFile,
+  writeSecureJson,
+  writeSecureText,
+} from '../src/runtime/secureFile'
+import { assertBotIsNotSafeOwner, BotIsSafeOwnerError } from '../src/security/safeOwnerInvariant'
 import { defineBotChain } from '../src/utils/chain'
 import { deriveBotPrivateKey } from '../src/utils/entropy'
-import { type KeystoreV3, encryptKeystore } from '../src/utils/keystore'
+import {
+  decryptKeystore,
+  encryptKeystore,
+  isKeystorePassphraseMismatch,
+  keystoreV3Schema,
+} from '../src/utils/keystore'
+import { sanitizeError } from '../src/utils/sanitize'
 import { asSdkClient } from '../src/utils/sdkClient'
 import {
   type ExtraRoleKind,
@@ -21,6 +43,7 @@ import {
   deploySafeAndRoles,
 } from './lib/deployCore'
 import { configureExistingSafe, readSafeOwners } from './lib/existingSafe'
+import { loadKeystorePrivateKey } from './lib/loadKeystorePrivateKey'
 import { Prompter, validateAddress, validatePrivateKey, validateUrl } from './lib/prompts'
 import { type EnvValues, renderEnvFile } from './lib/renderEnv'
 import {
@@ -77,24 +100,68 @@ interface DeployState {
   saltNonce: string
   assetIndex: 0 | 1
   deltaThresholdBps?: number
+  deltaOffset?: number
   dryRun: boolean
   storage: 'keystore' | 'plaintext'
-  /** Only set for plaintext storage — keystore mode keeps the key in the file. */
-  botPrivateKey?: `0x${string}`
-  telegramToken?: string
-  telegramChat?: string
   extraRoles: { kind: ExtraRoleKind; member: `0x${string}`; sizeCap?: string }[]
   /** Filled in by onDeployed as each contract lands, for a clean resume. */
   safeAddress?: `0x${string}`
   rolesModifierAddress?: `0x${string}`
 }
 
+const addressSchema = z
+  .string()
+  .regex(/^0x[0-9a-fA-F]{40}$/)
+  .transform((value) => getAddress(value))
+const deployStateSchema: z.ZodType<DeployState, z.ZodTypeDef, unknown> = z
+  .object({
+    version: z.literal(1),
+    safeMode: z.enum(['new', 'existing']),
+    chainId: z.number().int().positive(),
+    rpcUrl: z.string().url(),
+    poolAddress: addressSchema,
+    finalSafeOwner: addressSchema.optional(),
+    botAddress: addressSchema,
+    roleKey: z
+      .string()
+      .refine(
+        (value): value is `0x${string}` => isHex(value) && size(value) === 32,
+        'role key must be 32-byte hex',
+      ),
+    saltNonce: z.string().regex(/^(0|[1-9]\d*)$/),
+    assetIndex: z.union([z.literal(0), z.literal(1)]),
+    deltaThresholdBps: z.number().int().positive().optional(),
+    deltaOffset: z.number().int().optional(),
+    dryRun: z.boolean(),
+    storage: z.enum(['keystore', 'plaintext']),
+    extraRoles: z.array(
+      z
+        .object({
+          kind: z.enum(['deleverager', 'maintenance', 'roller', 'size-adjuster']),
+          member: addressSchema,
+          sizeCap: z
+            .string()
+            .regex(/^(0|[1-9]\d*)$/)
+            .optional(),
+        })
+        .strict(),
+    ),
+    safeAddress: addressSchema.optional(),
+    rolesModifierAddress: addressSchema.optional(),
+  })
+  .strict()
+
 async function writeState(state: DeployState): Promise<void> {
-  await writeFile(STATE_PATH, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 })
+  writeSecureJson(STATE_PATH, deployStateSchema, state)
 }
 
 async function readState(): Promise<DeployState> {
-  return JSON.parse(await readFile(STATE_PATH, 'utf8')) as DeployState
+  const state = readSecureJson(STATE_PATH, deployStateSchema, {
+    maxBytes: 32_768,
+    invalid: 'throw',
+  })
+  if (!state) throw new Error('resume state does not exist')
+  return state
 }
 
 function toExtraRoleSpecs(state: DeployState): ExtraRoleSpec[] {
@@ -103,6 +170,153 @@ function toExtraRoleSpecs(state: DeployState): ExtraRoleSpec[] {
     member: r.member,
     sizeCap: r.sizeCap === undefined ? undefined : BigInt(r.sizeCap),
   }))
+}
+
+interface TargetInput {
+  chainId: number
+  rpcUrl: string
+  poolAddress: `0x${string}`
+}
+
+async function collectTargetInput(p: Prompter): Promise<TargetInput> {
+  const supportedChains = Object.keys(SAFE_ZODIAC_ADDRESSES)
+    .map(Number)
+    .filter((id) => isSupportedChain(id))
+  const chainChoices = [
+    ...supportedChains.map((id) => ({ label: `chain ${id}`, value: String(id) })),
+    { label: 'other (manual — requires Safe/Zodiac env overrides)', value: 'other' },
+  ]
+  const picked = await p.choice('Target chain:', chainChoices, chainChoices[0]?.value as string)
+  const chainId =
+    picked === 'other'
+      ? Number(
+          await p.text('CHAIN_ID', {
+            validate: (value) =>
+              Number.isInteger(Number(value)) && Number(value) > 0 ? undefined : 'positive integer',
+          }),
+        )
+      : Number(picked)
+
+  return {
+    chainId,
+    rpcUrl: await p.text('RPC_URL', { validate: validateUrl }),
+    poolAddress: (await p.text('POOL_ADDRESS (PanopticPool)', {
+      validate: validateAddress,
+    })) as `0x${string}`,
+  }
+}
+
+interface SafeSetupInput {
+  safeMode: 'new' | 'existing'
+  finalSafeOwner?: `0x${string}`
+  existingSafeAddress?: `0x${string}`
+  existingRolesModifier?: `0x${string}`
+  existingRoleKey?: `0x${string}`
+}
+
+async function collectSafeSetupInput(p: Prompter): Promise<SafeSetupInput> {
+  const safeMode = (await p.choice(
+    'Safe setup:',
+    [
+      { label: 'Deploy a new Safe (recommended)', value: 'new' },
+      { label: 'Use an existing Safe I control', value: 'existing' },
+    ],
+    'new',
+  )) as SafeSetupInput['safeMode']
+
+  if (safeMode === 'new') {
+    return {
+      safeMode,
+      finalSafeOwner: (await p.text(
+        'Safe owner address (Ledger / MetaMask / Rabby — controls the Safe, NOT the bot)',
+        { validate: validateAddress },
+      )) as `0x${string}`,
+    }
+  }
+
+  const existingSafeAddress = (await p.text('SAFE_ADDRESS (a Safe you already control)', {
+    validate: validateAddress,
+  })) as `0x${string}`
+  const rolesModifier = await p.text('ROLES_MODIFIER_ADDRESS (leave blank to deploy a new one)', {
+    default: '',
+    validate: (value) =>
+      value === '' || /^0x[a-fA-F0-9]{40}$/.test(value)
+        ? undefined
+        : 'a 20-byte hex address, or blank',
+  })
+  const existingRolesModifier = rolesModifier === '' ? undefined : (rolesModifier as `0x${string}`)
+  const existingRoleKey = existingRolesModifier
+    ? ((await p.text('ROLE_KEY (the bot role on that modifier, 0x… 32 bytes)', {
+        validate: (value) =>
+          /^0x[a-fA-F0-9]{64}$/.test(value) ? undefined : 'a 32-byte hex role key',
+      })) as `0x${string}`)
+    : undefined
+
+  return { safeMode, existingSafeAddress, existingRolesModifier, existingRoleKey }
+}
+
+interface BotSignerInput {
+  botMode: 'generate' | 'import' | 'keystore'
+  botKey: `0x${string}`
+  botStorage: 'keystore' | 'plaintext'
+  keystorePassphrase?: string
+}
+
+async function collectBotSignerInput(p: Prompter): Promise<BotSignerInput> {
+  const botMode = await p.choice(
+    'Bot signer key:',
+    [
+      { label: 'generate a new key', value: 'generate' },
+      { label: 'import an existing key', value: 'import' },
+      ...(existsSync(KEYSTORE_PATH)
+        ? [{ label: 'reuse bot-keystore.json', value: 'keystore' as const }]
+        : []),
+    ],
+    existsSync(KEYSTORE_PATH) ? 'keystore' : 'generate',
+  )
+
+  let botKey: `0x${string}`
+  if (botMode === 'keystore') {
+    botKey = await loadKeystorePrivateKey(
+      KEYSTORE_PATH,
+      () => p.secret('Existing keystore passphrase'),
+      () => console.log('  ✗ wrong passphrase or MAC mismatch — try again'),
+    )
+  } else if (botMode === 'import') {
+    botKey = (await p.secret('BOT_PRIVATE_KEY', validatePrivateKey)) as `0x${string}`
+  } else {
+    const userEntropy = (await p.confirm('Add your own extra entropy? (optional, advanced)', false))
+      ? await p.secret('Extra entropy (any text)')
+      : ''
+    botKey = deriveBotPrivateKey(userEntropy, randomBytes(32))
+  }
+
+  if (botMode === 'keystore') {
+    return { botMode, botKey, botStorage: 'keystore' }
+  }
+
+  const botStorage = await p.choice(
+    'Store the bot key as:',
+    [
+      { label: 'passphrase-encrypted keystore file (recommended)', value: 'keystore' },
+      { label: 'plaintext in .env', value: 'plaintext' },
+    ],
+    'keystore',
+  )
+  for (;;) {
+    const passphrase = await p.secret(
+      botStorage === 'keystore'
+        ? 'Keystore passphrase (min 12 chars)'
+        : 'Encrypted resume passphrase (min 12 chars)',
+      (value) => (value.length >= 12 ? undefined : 'at least 12 characters'),
+    )
+    if (passphrase !== (await p.secret('Confirm passphrase'))) {
+      console.log('  ✗ passphrases do not match — try again')
+      continue
+    }
+    console.log('  ⚠️  If you lose this passphrase, interrupted onboarding cannot be resumed.')
+    return { botMode, botKey, botStorage, keystorePassphrase: passphrase }
+  }
 }
 
 function fail(
@@ -124,7 +338,7 @@ function fail(
   } else {
     console.error('  Nothing was deployed and no funds were sent.')
   }
-  console.error(`\n${err instanceof Error ? err.message : String(err)}`)
+  console.error(`\n${sanitizeError(err)}`)
   process.exit(1)
 }
 
@@ -172,138 +386,32 @@ async function main(): Promise<void> {
     console.log('\n Hedger-bot setup — wires a loan-only Safe + Roles modifier and writes .env.\n')
 
     // ---- Phase A: prompt (no chain writes) ----------------------------------
-    const supportedChains = Object.keys(SAFE_ZODIAC_ADDRESSES)
-      .map(Number)
-      .filter((id) => isSupportedChain(id))
-    const chainChoices = [
-      ...supportedChains.map((id) => ({ label: `chain ${id}`, value: String(id) })),
-      { label: 'other (manual — requires Safe/Zodiac env overrides)', value: 'other' },
-    ]
-    let chainId: number
-    const picked = await p.choice('Target chain:', chainChoices, chainChoices[0]?.value as string)
-    if (picked === 'other') {
-      chainId = Number(
-        await p.text('CHAIN_ID', {
-          validate: (v) =>
-            Number.isInteger(Number(v)) && Number(v) > 0 ? undefined : 'positive integer',
-        }),
-      )
-    } else {
-      chainId = Number(picked)
-    }
-
-    const rpcUrl = await p.text('RPC_URL', { validate: validateUrl })
-    const poolAddress = (await p.text('POOL_ADDRESS (PanopticPool)', {
-      validate: validateAddress,
-    })) as `0x${string}`
-
-    // Two ways to get a scoped Safe: let the bot deploy a fresh one, or wire onto
-    // a Safe the user already controls (add a new pool to an existing hedger, or
-    // bring a clean self-generated Safe).
-    const safeMode = (await p.choice(
-      'Safe setup:',
-      [
-        { label: 'Deploy a new Safe (recommended)', value: 'new' },
-        { label: 'Use an existing Safe I control', value: 'existing' },
-      ],
-      'new',
-    )) as 'new' | 'existing'
-
-    // 'new': the Safe owner — your own wallet (hardware / browser). It controls
-    // the Safe (burn positions, withdraw funds, re-scope roles); it is NOT the
-    // bot and never pastes a private key here. The bot deploys everything and
-    // hands ownership to this address.
-    // 'existing': you already own the Safe; the bot only deploys the Roles
-    // modifier (if needed) and you authorize the enable/scope calls in the Safe UI.
-    let finalSafeOwner: `0x${string}` | undefined
-    let existingSafeAddress: `0x${string}` | undefined
-    let existingRolesModifier: `0x${string}` | undefined
-    let existingRoleKey: `0x${string}` | undefined
-    if (safeMode === 'new') {
-      finalSafeOwner = (await p.text(
-        'Safe owner address (Ledger / MetaMask / Rabby — controls the Safe, NOT the bot)',
-        { validate: validateAddress },
-      )) as `0x${string}`
-    } else {
-      existingSafeAddress = (await p.text('SAFE_ADDRESS (a Safe you already control)', {
-        validate: validateAddress,
-      })) as `0x${string}`
-      const rm = await p.text('ROLES_MODIFIER_ADDRESS (leave blank to deploy a new one)', {
-        default: '',
-        validate: (v) =>
-          v === '' || /^0x[a-fA-F0-9]{40}$/.test(v) ? undefined : 'a 20-byte hex address, or blank',
-      })
-      existingRolesModifier = rm === '' ? undefined : (rm as `0x${string}`)
-      if (existingRolesModifier) {
-        // Add-pool onto an existing modifier reuses the bot's existing role.
-        existingRoleKey = (await p.text('ROLE_KEY (the bot role on that modifier, 0x… 32 bytes)', {
-          validate: (v) => (/^0x[a-fA-F0-9]{64}$/.test(v) ? undefined : 'a 32-byte hex role key'),
-        })) as `0x${string}`
-      }
-    }
-
-    const botMode = await p.choice(
-      'Bot signer key:',
-      [
-        { label: 'generate a new key', value: 'generate' },
-        { label: 'import an existing key', value: 'import' },
-      ],
-      'generate',
-    )
-    let botKey: `0x${string}`
-    if (botMode === 'import') {
-      botKey = (await p.secret('BOT_PRIVATE_KEY', validatePrivateKey)) as `0x${string}`
-    } else {
-      // The key comes from the OS CSPRNG (randomBytes) — already sufficient on
-      // its own. Advanced users can optionally fold in their own entropy; it is
-      // mixed in (keccak256) so it can only add to, never weaken, the system RNG.
-      let userEntropy = ''
-      if (await p.confirm('Add your own extra entropy? (optional, advanced)', false)) {
-        userEntropy = await p.secret('Extra entropy (any text)')
-      }
-      botKey = deriveBotPrivateKey(userEntropy, randomBytes(32))
-    }
+    const { chainId, rpcUrl, poolAddress } = await collectTargetInput(p)
+    const {
+      safeMode,
+      finalSafeOwner,
+      existingSafeAddress,
+      existingRolesModifier,
+      existingRoleKey,
+    } = await collectSafeSetupInput(p)
+    const { botMode, botKey, botStorage, keystorePassphrase } = await collectBotSignerInput(p)
     const botAccount = privateKeyToAccount(botKey)
     console.log(
       `  → Bot EOA is ${botAccount.address} (deploys, then runs hedging — fund it with gas)`,
     )
 
-    // How to persist the bot key. Encrypted keystore keeps no plaintext at rest.
-    const botStorage = (await p.choice(
-      'Store the bot key as:',
-      [
-        { label: 'passphrase-encrypted keystore file (recommended)', value: 'keystore' },
-        { label: 'plaintext in .env', value: 'plaintext' },
-      ],
-      'keystore',
-    )) as 'keystore' | 'plaintext'
-    let keystorePassphrase: string | undefined
-    if (botStorage === 'keystore') {
-      for (;;) {
-        const pass = await p.secret('Keystore passphrase (min 12 chars)', (v) =>
-          v.length >= 12 ? undefined : 'at least 12 characters',
-        )
-        const confirm = await p.secret('Confirm passphrase')
-        if (pass !== confirm) {
-          console.log('  ✗ passphrases do not match — try again')
-          continue
-        }
-        keystorePassphrase = pass
-        break
-      }
-      console.log('  ⚠️  If you lose this passphrase the bot key is unrecoverable.')
-    }
-
     const deltaThresholdBps = Number(
       await p.text('DELTA_THRESHOLD_BPS (rehedge trigger)', { default: '200' }),
+    )
+    const deltaOffset = Number(
+      await p.text('DELTA_OFFSET_BPS (target delta bias, bps; 0 = neutral, +long / -short)', {
+        default: '0',
+      }),
     )
     const dryRun = await p.confirm('Start in DRY_RUN (simulate, send nothing)?', true)
     // Telegram alerts are optional and configured out-of-band: set TELEGRAM_BOT_TOKEN
     // and TELEGRAM_CHAT_ID in .env after onboarding (see README). The wizard no
     // longer walks through BotFather so it stays focused on the on-chain setup.
-    const telegramToken: string | undefined = undefined
-    const telegramChat: string | undefined = undefined
-
     // The onboard wizard deploys a strictly loan-only bot (minimal privilege).
     // The à-la-carte keeper roles (deleverager / maintenance / roller /
     // size-adjuster) have no consumer in this bot's runtime, so they are not
@@ -347,7 +455,7 @@ async function main(): Promise<void> {
     const publicClient = createPublicClient({ chain, transport: http(rpcUrl) })
 
     const rpcChainId = await publicClient.getChainId().catch((e) => {
-      throw new Error(`RPC unreachable at ${rpcUrl}: ${e instanceof Error ? e.message : String(e)}`)
+      throw new Error(`RPC unreachable: ${sanitizeError(e)}`)
     })
     if (rpcChainId !== chainId) {
       throw new Error(`RPC reports chainId ${rpcChainId}, but you selected ${chainId}.`)
@@ -363,7 +471,7 @@ async function main(): Promise<void> {
     }).catch((e) => {
       throw new Error(
         `Could not read pool metadata at ${poolAddress} — is it a PanopticPool on chain ${chainId}? ` +
-          (e instanceof Error ? e.message : String(e)),
+          sanitizeError(e),
       )
     })
     console.log(
@@ -395,18 +503,18 @@ async function main(): Promise<void> {
     // Existing-Safe: confirm the address is actually a Safe and show its owners
     // (the bot must NOT be one — it only ever gets a scoped role).
     if (safeMode === 'existing' && existingSafeAddress) {
-      const owners = await readSafeOwners(publicClient, existingSafeAddress).catch((e) => {
+      const owners = await assertBotIsNotSafeOwner(
+        publicClient,
+        existingSafeAddress,
+        botAccount.address,
+      ).catch((e) => {
+        if (e instanceof BotIsSafeOwnerError) throw e
         throw new Error(
           `${existingSafeAddress} does not look like a Safe (getOwners failed): ` +
-            (e instanceof Error ? e.message : String(e)),
+            sanitizeError(e),
         )
       })
       console.log(`  → Safe owners: ${owners.join(', ')}`)
-      if (owners.some((o) => o.toLowerCase() === botAccount.address.toLowerCase())) {
-        console.log(
-          '  ⚠️  the bot EOA is a Safe owner — for least privilege it should only hold a role.',
-        )
-      }
     }
 
     // Mine the vanity saltNonce now that the factory + deployer are known. The
@@ -473,15 +581,21 @@ async function main(): Promise<void> {
 
     // Persist the bot key + resume state BEFORE asking for funds. From here on a
     // crash can never strand ETH at an unrecoverable address.
-    let botPrivateKey: `0x${string}` | undefined
-    let botKeystorePath: string | undefined
-    if (botStorage === 'keystore' && keystorePassphrase) {
+    const botKeystorePath = botStorage === 'keystore' ? KEYSTORE_PATH : undefined
+    if (botMode !== 'keystore') {
+      if (!keystorePassphrase) throw new Error('keystore passphrase was not collected')
+      // A new/imported key would overwrite an existing keystore in place, which
+      // could destroy the only copy of a funded key. Require explicit consent.
+      if (botStorage === 'keystore' && existsSync(KEYSTORE_PATH)) {
+        if (!(await p.confirm(`Overwrite existing keystore ${KEYSTORE_PATH}?`, false))) {
+          throw new Error('aborted: existing keystore preserved (re-run and choose "reuse")')
+        }
+      }
       const keystore = encryptKeystore(botKey, keystorePassphrase)
-      await writeFile(KEYSTORE_PATH, `${JSON.stringify(keystore, null, 2)}\n`, { mode: 0o600 })
-      botKeystorePath = './bot-keystore.json'
-      console.log(`✓ Wrote encrypted keystore ${KEYSTORE_PATH}`)
+      writeSecureJson(KEYSTORE_PATH, keystoreV3Schema, keystore)
+      console.log(`✓ Wrote encrypted recovery keystore ${KEYSTORE_PATH}`)
     } else {
-      botPrivateKey = botKey
+      console.log(`✓ Reusing encrypted bot keystore ${KEYSTORE_PATH} without rewriting it`)
     }
     const state: DeployState = {
       version: 1,
@@ -495,11 +609,9 @@ async function main(): Promise<void> {
       saltNonce: saltNonce.toString(),
       assetIndex,
       deltaThresholdBps: Number.isFinite(deltaThresholdBps) ? deltaThresholdBps : undefined,
+      deltaOffset: Number.isFinite(deltaOffset) ? deltaOffset : undefined,
       dryRun,
       storage: botStorage,
-      botPrivateKey,
-      telegramToken,
-      telegramChat,
       extraRoles: extraRoles.map((r) => ({
         kind: r.kind,
         member: r.member,
@@ -558,30 +670,26 @@ async function main(): Promise<void> {
 async function runResume(p: Prompter, state: DeployState, envPath: string): Promise<void> {
   console.log(`\n Resuming deployment on chain ${state.chainId} (pool ${state.poolAddress}).`)
 
-  // Reconstruct the bot key: from the encrypted keystore (prompt passphrase) or
-  // from the saved plaintext key.
-  let botKey: `0x${string}`
-  let keystorePath: string | undefined
-  if (state.storage === 'keystore') {
-    if (!existsSync(KEYSTORE_PATH)) {
-      throw new Error(`keystore ${KEYSTORE_PATH} missing — cannot resume`)
-    }
-    const { decryptKeystore } = await import('../src/utils/keystore')
-    const keystore = JSON.parse(await readFile(KEYSTORE_PATH, 'utf8')) as KeystoreV3
-    for (;;) {
-      const pass = await p.secret('Keystore passphrase')
-      try {
-        botKey = decryptKeystore(keystore, pass)
-        break
-      } catch {
-        console.log('  ✗ wrong passphrase — try again')
-      }
-    }
-    keystorePath = './bot-keystore.json'
-  } else {
-    if (!state.botPrivateKey) throw new Error('resume state missing plaintext key')
-    botKey = state.botPrivateKey
+  if (!existsSync(KEYSTORE_PATH)) {
+    throw new Error(`encrypted recovery keystore ${KEYSTORE_PATH} missing — cannot resume`)
   }
+  const keystore = readSecureJson(KEYSTORE_PATH, keystoreV3Schema, {
+    maxBytes: 16_384,
+    invalid: 'throw',
+  })
+  if (!keystore) throw new Error('encrypted recovery keystore does not exist')
+  let botKey: `0x${string}`
+  for (;;) {
+    const pass = await p.secret('Recovery keystore passphrase')
+    try {
+      botKey = decryptKeystore(keystore, pass)
+      break
+    } catch (error) {
+      if (!isKeystorePassphraseMismatch(error)) throw error
+      console.log('  ✗ wrong passphrase or MAC mismatch — try again')
+    }
+  }
+  const keystorePath = state.storage === 'keystore' ? KEYSTORE_PATH : undefined
   const botAccount = privateKeyToAccount(botKey)
   if (botAccount.address.toLowerCase() !== state.botAddress.toLowerCase()) {
     throw new Error('recovered key does not match the saved bot address')
@@ -705,29 +813,40 @@ async function finalizeDeployment(args: {
     BOT_KEYSTORE_PATH: state.storage === 'keystore' ? keystorePath : undefined,
     ASSET_INDEX: state.assetIndex,
     DELTA_THRESHOLD_BPS: state.deltaThresholdBps,
+    DELTA_OFFSET_BPS: state.deltaOffset,
     PRICE_SIGNAL_SOURCE: 'pool-tick',
     HEDGE_VENUE: 'in-pool',
     DRY_RUN: state.dryRun,
-    TELEGRAM_BOT_TOKEN: state.telegramToken,
-    TELEGRAM_CHAT_ID: state.telegramChat,
   }
   const body = renderEnvFile(values)
 
   // Re-validate before writing, so a schema mismatch surfaces now.
   parseHedgerBotConfig(dotenvObject(body))
 
-  await writeFile(envPath, body, { mode: 0o600 })
+  writeSecureText(envPath, body)
   console.log(`✓ Wrote ${envPath}`)
 
   // Success: the .env is the source of truth now — remove the resume state.
   // If cleanup fails, warn loudly: the state file may still hold the plaintext
   // bot private key on disk.
-  await unlink(STATE_PATH).catch((err) => {
+  try {
+    removeSecureFile(STATE_PATH)
+  } catch (err) {
     console.warn(
-      `  ⚠️  Could not remove resume state ${STATE_PATH}: ${err instanceof Error ? err.message : String(err)}\n` +
-        `      It may still contain the plaintext bot private key — delete it manually.`,
+      `  ⚠️  Could not remove resume state ${STATE_PATH}: ${sanitizeError(err)}\n` +
+        `      It contains sensitive deployment metadata — remove it with onboard cleanup.`,
     )
-  })
+  }
+  if (state.storage === 'plaintext') {
+    try {
+      removeSecureFile(KEYSTORE_PATH)
+    } catch (err) {
+      console.warn(
+        `  ⚠️  Could not remove temporary recovery keystore ${KEYSTORE_PATH}: ` +
+          sanitizeError(err),
+      )
+    }
+  }
 
   console.log('\nNext steps:')
   console.log(`  Safe ${result.safeAddress} is owned by ${result.safeOwner}.`)
@@ -735,13 +854,17 @@ async function finalizeDeployment(args: {
   console.log(
     `  2. As the Safe owner (${result.safeOwner}), buy options into the Safe + deposit collateral.`,
   )
-  console.log('  3. pnpm inspect:hedge      # dry-run one cycle')
-  console.log('  4. DRY_RUN=true pnpm start  # full loop, simulated')
-  console.log('  5. pnpm start               # live')
+  console.log('  3. pnpm preflight          # read-only release checks')
+  console.log('  4. pnpm inspect:hedge      # dry-run one cycle')
+  console.log('  5. DRY_RUN=true pnpm start # full loop, simulated')
+  console.log('  6. pnpm activate           # bind approval to policy + artifact')
+  console.log('  7. pnpm start              # live only after activation')
+  console.log('  8. pnpm status && pnpm health')
   if (state.storage === 'keystore') {
     console.log(
       '\n  The bot key is stored encrypted; you will be prompted for the keystore\n' +
-        '  passphrase at startup. For unattended restarts, set BOT_KEYSTORE_PASSPHRASE.',
+        '  passphrase at startup. For unattended restarts, prefer the owner-only\n' +
+        '  BOT_KEYSTORE_PASSPHRASE_FILE secret.',
     )
   }
 }
@@ -760,6 +883,6 @@ function dotenvObject(body: string): NodeJS.ProcessEnv {
 }
 
 main().catch((err) => {
-  console.error(err)
+  console.error(sanitizeError(err))
   process.exit(1)
 })

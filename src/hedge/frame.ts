@@ -1,7 +1,7 @@
 import type { TokenIdLeg } from '@panoptic-eng/sdk/v2'
 import {
   createTokenIdBuilder,
-  getLegDelta,
+  getLegDeltaInVaultFrame,
   isDefinedRisk,
   tickToSqrtPriceX96,
 } from '@panoptic-eng/sdk/v2'
@@ -37,28 +37,21 @@ export function toVaultFrameAtSqrtPriceX96(
   return flipSignOnAssetInversion ? -converted : converted
 }
 
-export function toVaultFrameAtTick(
-  delta: bigint,
-  fromAsset: bigint,
-  vaultAssetIndex: 0n | 1n,
-  currentTick: bigint,
-  flipSignOnAssetInversion = false,
-): bigint {
-  if (fromAsset === vaultAssetIndex) return delta
-  const sqrtPriceX96 = tickToSqrtPriceX96(currentTick)
-  return toVaultFrameAtSqrtPriceX96(
-    delta,
-    fromAsset,
-    vaultAssetIndex,
-    sqrtPriceX96,
-    flipSignOnAssetInversion,
-  )
-}
-
 /**
- * Wallet-aware option-book delta (collateral term added by the caller). For each
- * leg, computes delta in its own `leg.asset` frame then converts to the vault
- * frame. For loans (width=0), getLegDelta returns debt-only delta.
+ * Wallet-aware option-book delta (free-collateral term added by the caller).
+ *
+ * Option legs (width>0): delta is computed in the leg's own `leg.asset` frame then
+ * converted to the vault frame.
+ *
+ * Loan/credit legs (width=0): evaluated DIRECTLY in the vault frame. A width=0 leg
+ * on the vault asset is spot the user has "tucked away" — credit = +notional,
+ * loan = -notional (in vault-asset units); a width=0 leg on the numeraire has no
+ * asset delta (0). `getLegDelta` already returns exactly this when passed the vault
+ * `assetIndex`, so it is added directly with no frame conversion. This is NOT the
+ * old debt-only convention: it must be counted here because the zapped/committed
+ * holdings of a width=0 leg are locked inside the position and therefore absent
+ * from the caller's free-collateral term (previously these legs were silently
+ * dropped, under-hedging positions that carry ITM-neutralizing credit/loan legs).
  */
 export function computePortfolioDelta(
   positions: PositionSnapshot[],
@@ -66,22 +59,87 @@ export function computePortfolioDelta(
   tickSpacing: bigint,
   assetIndex: 0n | 1n,
 ): bigint {
-  let delta = 0n
+  return computePortfolioDeltaDetailed(positions, currentTick, tickSpacing, assetIndex).total
+}
+
+/** Per-leg delta contribution (vault frame), for diagnostics/tracing. */
+export interface LegDeltaBreakdown {
+  index: bigint
+  width: bigint
+  asset: bigint
+  tokenType: bigint
+  isLong: boolean
+  /** 'option' | 'loan' | 'credit' */
+  kind: 'option' | 'loan' | 'credit'
+  /** Delta contribution in the vault-asset frame (smallest units). */
+  delta: bigint
+}
+
+/** Per-position delta contribution (vault frame), for diagnostics/tracing. */
+export interface PositionDeltaBreakdown {
+  tokenId: bigint
+  positionSize: bigint
+  tickAtMint: bigint
+  legs: LegDeltaBreakdown[]
+  /** Sum of this position's leg deltas (vault-asset frame). */
+  total: bigint
+}
+
+export interface PortfolioDeltaBreakdown {
+  positions: PositionDeltaBreakdown[]
+  /** Sum across all positions (vault-asset frame) — equals computePortfolioDelta. */
+  total: bigint
+}
+
+/**
+ * Same math as {@link computePortfolioDelta} but returns the full per-position,
+ * per-leg breakdown so `inspect:hedge` (and tests) can show exactly how the
+ * aggregate delta is built. `computePortfolioDelta` delegates here so there is a
+ * single source of truth for the aggregation.
+ */
+export function computePortfolioDeltaDetailed(
+  positions: PositionSnapshot[],
+  currentTick: bigint,
+  tickSpacing: bigint,
+  assetIndex: 0n | 1n,
+): PortfolioDeltaBreakdown {
+  let total = 0n
+  const positionBreakdowns: PositionDeltaBreakdown[] = []
   for (const p of positions) {
     const definedRisk = isDefinedRisk(p.legs)
+    let posTotal = 0n
+    const legBreakdowns: LegDeltaBreakdown[] = []
     for (const leg of p.legs) {
-      const legDelta = getLegDelta(
+      const delta = getLegDeltaInVaultFrame(
         leg,
         currentTick,
         p.positionSize,
         tickSpacing,
         p.tickAtMint,
         definedRisk,
+        assetIndex,
       )
-      delta += toVaultFrameAtTick(legDelta, leg.asset, assetIndex, currentTick, leg.width > 0n)
+      posTotal += delta
+      legBreakdowns.push({
+        index: leg.index,
+        width: leg.width,
+        asset: leg.asset,
+        tokenType: leg.tokenType,
+        isLong: leg.isLong,
+        kind: leg.width === 0n ? (leg.isLong ? 'credit' : 'loan') : 'option',
+        delta,
+      })
     }
+    total += posTotal
+    positionBreakdowns.push({
+      tokenId: p.tokenId,
+      positionSize: p.positionSize,
+      tickAtMint: p.tickAtMint,
+      legs: legBreakdowns,
+      total: posTotal,
+    })
   }
-  return delta
+  return { positions: positionBreakdowns, total }
 }
 
 /** Portfolio size in the vault asset frame, restricted to non-loan (option) legs. */

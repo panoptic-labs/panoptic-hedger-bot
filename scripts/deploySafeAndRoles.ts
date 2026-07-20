@@ -4,6 +4,7 @@ import { createPublicClient, createWalletClient, http } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 
 import { defineBotChain } from '../src/utils/chain'
+import { sanitizeError } from '../src/utils/sanitize'
 import { deploySafeAndRoles } from './lib/deployCore'
 import { ADDRESS_RE, getSafeZodiacAddresses } from './lib/safeZodiacRegistry'
 
@@ -81,6 +82,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error(err)
+  console.error(sanitizeError(err))
   process.exit(1)
 })

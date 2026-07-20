@@ -1,5 +1,5 @@
 import type { PublicClient } from 'viem'
-import { getAddress } from 'viem'
+import { getAddress, keccak256 } from 'viem'
 
 /**
  * Chain-indexed Safe + Zodiac infrastructure the deploy path needs. These are
@@ -52,6 +52,17 @@ const CANONICAL: SafeZodiacAddresses = {
   multiSend: SAFE_V1_4_1_MULTISEND_CALL_ONLY,
 }
 
+const CANONICAL_CODE_HASHES: Record<keyof SafeZodiacAddresses, `0x${string}`> = {
+  // @safe-global/safe-deployments v1.4.1 canonical artifacts.
+  safeProxyFactory: '0x50c3cdc4074750a7a974204a716c999edd37482f907608d960b2b025ee0b3317',
+  safeSingleton: '0xb1f926978a0f44a2c0ec8fe822418ae969bd8c3f18d61e5103100339894f81ff',
+  multiSend: '0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939',
+  // gnosisguild/zodiac pinned deployment artifacts: ModuleProxyFactory 1.2.0
+  // and Roles 2.1.0 respectively.
+  moduleProxyFactory: '0x01623cbcf010a1c326230f1b2d5f48a66b440232ee49096102bc84967dc5f21e',
+  rolesMastercopy: '0x87911cbc6aa0496e6bcb07dab2462b9c76daea130dede6dcc57d0adf307fa7ec',
+}
+
 /**
  * Safe + Zodiac addresses keyed by chainId. Only chains listed here (plus any
  * fully env-overridden chain) can be onboarded without manual address entry.
@@ -75,6 +86,28 @@ const ENV_OVERRIDES: Record<keyof SafeZodiacAddresses, string> = {
 }
 
 export const ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/
+
+/** Find the first block containing code, avoiding unbounded full-history log scans. */
+export async function findContractDeploymentBlock(
+  client: PublicClient,
+  address: `0x${string}`,
+): Promise<bigint> {
+  let low = 0n
+  // cacheTime: 0 forces a fresh head read. viem caches getBlockNumber per
+  // client, so a caller that fetched the height earlier (e.g. a reachability
+  // probe) would otherwise hand us a stale height from BEFORE a just-deployed
+  // contract existed — making the getCode-at-head check below spuriously fail.
+  let high = await client.getBlockNumber({ cacheTime: 0 })
+  const latestCode = await client.getCode({ address, blockNumber: high })
+  if (!latestCode || latestCode === '0x') throw new Error(`no deployed code at ${address}`)
+  while (low < high) {
+    const middle = (low + high) / 2n
+    const code = await client.getCode({ address, blockNumber: middle })
+    if (code && code !== '0x') high = middle
+    else low = middle + 1n
+  }
+  return low
+}
 
 /**
  * Resolve the Safe + Zodiac addresses for a chain, letting explicit overrides
@@ -111,6 +144,17 @@ export function getSafeZodiacAddresses(
     resolved[key] = getAddress(value)
   }
 
+  if (chainId === 1) {
+    const changed = keys.filter(
+      (key) => resolved[key] && getAddress(resolved[key]) !== getAddress(CANONICAL[key]),
+    )
+    if (changed.length > 0) {
+      throw new Error(
+        `Canonical mainnet Safe/Zodiac addresses cannot be overridden: ${changed.join(', ')}`,
+      )
+    }
+  }
+
   if (malformed.length > 0) {
     throw new Error(`Malformed Safe/Zodiac address override(s): ${malformed.join(', ')}`)
   }
@@ -134,13 +178,112 @@ export async function verifySafeZodiacBytecode(
 ): Promise<void> {
   const entries = Object.entries(addrs) as [keyof SafeZodiacAddresses, `0x${string}`][]
   const codes = await Promise.all(entries.map(([, address]) => client.getCode({ address })))
-  const empty = entries
-    .filter((_, i) => !codes[i] || codes[i] === '0x')
-    .map(([name, address]) => `${name} (${address})`)
-  if (empty.length > 0) {
+  const invalid = entries.flatMap(([name, address], index) => {
+    const code = codes[index]
+    if (!code || code === '0x') return [`${name} (${address}): no bytecode`]
+    const actual = keccak256(code)
+    return actual === CANONICAL_CODE_HASHES[name]
+      ? []
+      : [`${name} (${address}): code hash ${actual} is not the reviewed canonical hash`]
+  })
+  if (invalid.length > 0) {
     throw new Error(
-      `Safe/Zodiac contract(s) have no bytecode on this chain: ${empty.join(', ')}. ` +
-        `Is the RPC pointed at the right chain, or are these addresses correct?`,
+      `Safe/Zodiac contract identity verification failed: ${invalid.join('; ')}. ` +
+        `Do not onboard or activate against unreviewed implementations.`,
     )
+  }
+}
+
+const safeProxyReadAbi = [
+  {
+    type: 'function',
+    name: 'masterCopy',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ type: 'address' }],
+  },
+] as const
+
+const safeFactoryEvents = [
+  {
+    type: 'event',
+    name: 'ProxyCreation',
+    inputs: [
+      { name: 'proxy', type: 'address', indexed: true },
+      { name: 'singleton', type: 'address', indexed: false },
+    ],
+  },
+] as const
+
+const moduleFactoryEvents = [
+  {
+    type: 'event',
+    name: 'ModuleProxyCreation',
+    inputs: [
+      { name: 'proxy', type: 'address', indexed: true },
+      { name: 'masterCopy', type: 'address', indexed: true },
+    ],
+  },
+] as const
+
+/** Verify that the configured Safe and Roles proxy came from the reviewed factories/implementations. */
+export async function verifySafeAndRolesProxyIdentities(
+  client: PublicClient,
+  addrs: SafeZodiacAddresses,
+  safeAddress: `0x${string}`,
+  rolesModifierAddress: `0x${string}`,
+  // Known deployment blocks from the deploy tx receipts. When supplied, we skip
+  // the numeric-block `getCode` discovery in findContractDeploymentBlock — anvil
+  // forks serve that unreliably for locally-deployed contracts, whereas the
+  // getLogs/readContract('latest') checks below work there. Real-RPC callers
+  // (prod diagnostics) omit these and keep the discovery fallback.
+  knownBlocks?: { safe?: bigint; roles?: bigint },
+): Promise<void> {
+  await verifySafeZodiacBytecode(client, addrs)
+
+  const [safeDeploymentBlock, rolesDeploymentBlock] = await Promise.all([
+    knownBlocks?.safe ?? findContractDeploymentBlock(client, safeAddress),
+    knownBlocks?.roles ?? findContractDeploymentBlock(client, rolesModifierAddress),
+  ])
+  const [safeMasterCopy, safeCreation, rolesCreation, rolesCode] = await Promise.all([
+    client.readContract({
+      address: safeAddress,
+      abi: safeProxyReadAbi,
+      functionName: 'masterCopy',
+    }),
+    client.getLogs({
+      address: addrs.safeProxyFactory,
+      event: safeFactoryEvents[0],
+      args: { proxy: safeAddress },
+      fromBlock: safeDeploymentBlock,
+      toBlock: 'latest',
+      strict: true,
+    }),
+    client.getLogs({
+      address: addrs.moduleProxyFactory,
+      event: moduleFactoryEvents[0],
+      args: { proxy: rolesModifierAddress, masterCopy: addrs.rolesMastercopy },
+      fromBlock: rolesDeploymentBlock,
+      toBlock: 'latest',
+      strict: true,
+    }),
+    client.getCode({ address: rolesModifierAddress }),
+  ])
+
+  if (getAddress(safeMasterCopy) !== getAddress(addrs.safeSingleton) || safeCreation.length !== 1) {
+    throw new Error('configured Safe is not a unique proxy of the reviewed canonical singleton')
+  }
+  if (getAddress(safeCreation[0].args.singleton) !== getAddress(addrs.safeSingleton)) {
+    throw new Error('configured Safe factory event names an unreviewed singleton')
+  }
+  if (rolesCreation.length !== 1) {
+    throw new Error('configured Roles modifier is not a unique proxy of the reviewed mastercopy')
+  }
+
+  const expectedRolesProxy =
+    `0x363d3d373d3d3d363d73${addrs.rolesMastercopy.slice(2).toLowerCase()}` +
+    '5af43d82803e903d91602b57fd5bf3'
+  if (rolesCode?.toLowerCase() !== expectedRolesProxy) {
+    throw new Error('configured Roles proxy runtime does not embed the reviewed mastercopy')
   }
 }

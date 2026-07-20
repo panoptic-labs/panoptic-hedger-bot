@@ -1,4 +1,5 @@
 import type { HedgerBotConfig } from '../config'
+import { sanitizeError, sanitizeText } from '../utils/sanitize'
 
 export interface Notifier {
   /** Send a notification. Never throws — notification failures must not break the loop. */
@@ -15,6 +16,7 @@ export interface Notifier {
 export function createTelegramNotifier(
   config: Pick<HedgerBotConfig, 'TELEGRAM_BOT_TOKEN' | 'TELEGRAM_CHAT_ID'>,
   fetchFn: typeof fetch = fetch,
+  recordHealth?: (result: 'success' | 'failure') => void,
 ): Notifier {
   const token = config.TELEGRAM_BOT_TOKEN
   const chatId = config.TELEGRAM_CHAT_ID
@@ -36,15 +38,23 @@ export function createTelegramNotifier(
         const res = await fetchFn(url, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ chat_id: chatId, text: message, disable_web_page_preview: true }),
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: sanitizeText(message, 4_000),
+            disable_web_page_preview: true,
+          }),
           signal: controller.signal,
         })
         if (!res.ok) {
-          const body = await res.text().catch(() => '')
-          console.error(`[telegram] sendMessage failed: ${res.status} ${body}`)
+          await res.body?.cancel().catch(() => undefined)
+          console.error(`[telegram] sendMessage failed: HTTP ${res.status}`)
+          recordHealth?.('failure')
+        } else {
+          recordHealth?.('success')
         }
       } catch (err) {
-        console.error('[telegram] notify error', err)
+        console.error(`[telegram] notify error: ${sanitizeError(err)}`)
+        recordHealth?.('failure')
       } finally {
         clearTimeout(timer)
       }

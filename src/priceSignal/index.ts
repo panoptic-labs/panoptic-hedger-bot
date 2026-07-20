@@ -35,6 +35,7 @@ export function createPriceSignalSource(
         publicClient: deps.publicClient,
         poolAddress: config.POOL_ADDRESS,
         chainId,
+        maxSignalAgeSeconds: config.MAX_SIGNAL_BLOCK_AGE_SECONDS,
       })
     case 'uniswap-pool':
       return createUniswapPoolSource({

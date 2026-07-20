@@ -1,6 +1,7 @@
 import 'dotenv/config'
 
 import { parseHedgerBotConfig } from '../src/config'
+import { sanitizeError } from '../src/utils/sanitize'
 import { runDoctorChecks } from './lib/diagnostics/checks'
 import { buildDiagnosticsContext } from './lib/diagnostics/context'
 import { renderDoctor } from './lib/diagnostics/render'
@@ -18,7 +19,7 @@ async function main(): Promise<void> {
   try {
     config = parseHedgerBotConfig()
   } catch (err) {
-    console.error(err instanceof Error ? err.message : String(err))
+    console.error(sanitizeError(err))
     process.exitCode = 1
     return
   }
@@ -33,6 +34,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error(err instanceof Error ? (err.stack ?? err.message) : String(err))
+  console.error(sanitizeError(err))
   process.exitCode = 1
 })

@@ -1,7 +1,11 @@
-import { getAddress } from 'viem'
-import { describe, expect, it } from 'vitest'
+import type { PublicClient } from 'viem'
+import { describe, expect, it, vi } from 'vitest'
 
-import { getSafeZodiacAddresses, ROLES_V2_1_MASTERCOPY } from './safeZodiacRegistry'
+import {
+  findContractDeploymentBlock,
+  getSafeZodiacAddresses,
+  ROLES_V2_1_MASTERCOPY,
+} from './safeZodiacRegistry'
 
 const A = (n: number) => `0x${n.toString(16).padStart(40, '0')}` as `0x${string}`
 
@@ -15,10 +19,11 @@ describe('getSafeZodiacAddresses', () => {
     expect(addrs.multiSend).toMatch(/^0x[a-fA-F0-9]{40}$/)
   })
 
-  it('lets explicit overrides win over the registry', () => {
+  it('rejects noncanonical mainnet overrides', () => {
     const override = A(0xabc)
-    const addrs = getSafeZodiacAddresses(1, { rolesMastercopy: override }, {})
-    expect(addrs.rolesMastercopy).toBe(getAddress(override))
+    expect(() => getSafeZodiacAddresses(1, { rolesMastercopy: override }, {})).toThrow(
+      /cannot be overridden/,
+    )
   })
 
   it('reads overrides from env for an unlisted chain', () => {
@@ -50,5 +55,17 @@ describe('getSafeZodiacAddresses', () => {
     // getAddress returns EIP-55 checksummed form — not all-lowercase.
     expect(addrs.safeProxyFactory).not.toBe(lower)
     expect(addrs.safeProxyFactory.toLowerCase()).toBe(lower)
+  })
+
+  it('derives a bounded log lower bound from the first block containing code', async () => {
+    const client = {
+      getBlockNumber: vi.fn().mockResolvedValue(100n),
+      getCode: vi.fn(async ({ blockNumber }: { blockNumber?: bigint }) =>
+        blockNumber !== undefined && blockNumber >= 37n ? '0x01' : '0x',
+      ),
+    } as unknown as PublicClient
+
+    await expect(findContractDeploymentBlock(client, A(9))).resolves.toBe(37n)
+    expect(client.getCode).toHaveBeenCalledTimes(8)
   })
 })

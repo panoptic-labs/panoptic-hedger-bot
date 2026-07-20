@@ -27,11 +27,19 @@ describe('createTelegramNotifier', () => {
   })
 
   it('never throws when fetch rejects', async () => {
-    const fetchFn = vi.fn().mockRejectedValue(new Error('network'))
+    const token = ['123456789', 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi'].join(':')
+    const fetchFn = vi
+      .fn()
+      .mockRejectedValue(new Error(`network https://api.telegram.org/bot${token}/sendMessage`))
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
     const n = createTelegramNotifier(
-      { TELEGRAM_BOT_TOKEN: 'T', TELEGRAM_CHAT_ID: '42' },
+      { TELEGRAM_BOT_TOKEN: token, TELEGRAM_CHAT_ID: '42' },
       fetchFn as never,
     )
     await expect(n.notify('x')).resolves.toBeUndefined()
+    const output = error.mock.calls.flat().join(' ')
+    expect(output).not.toContain(token)
+    expect(output).toContain('notify error')
+    error.mockRestore()
   })
 })

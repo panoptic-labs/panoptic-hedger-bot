@@ -36,7 +36,16 @@ export function renderStatus(s: StatusSnapshot): void {
     console.log(`  ${k.padEnd(16)} ${v === undefined ? dim('—') : String(v)}`)
   console.log(`\nHedger-bot status  ${dim(`v${s.version}`)}\n`)
   row('status', s.running)
-  row('mode', s.mode === 'live' ? paint(31, 'LIVE') : paint(33, 'dry-run'))
+  row('readiness', s.readiness)
+  row(
+    'running mode',
+    s.runningMode === undefined
+      ? '—'
+      : s.runningMode === 'live'
+        ? paint(31, 'LIVE')
+        : paint(33, 'dry-run'),
+  )
+  row('next start', s.nextStartMode === 'live' ? paint(31, 'LIVE') : paint(33, 'dry-run'))
   row('chain', s.chainId)
   row('pool', `${s.pool}${s.poolPair ? `  ${s.poolPair}` : ''}`)
   row('safe', s.safe)

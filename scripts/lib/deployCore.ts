@@ -19,6 +19,10 @@ import {
 } from 'viem'
 
 import { type MultiSendCall, encodeMultiSend } from '../../src/executor/multiSend'
+import {
+  assertBotIsNotSafeOwner,
+  assertPlannedSafeOwnerIsNotBot,
+} from '../../src/security/safeOwnerInvariant'
 import { execFromSoleOwner } from './safeExec'
 import type { SafeZodiacAddresses } from './safeZodiacRegistry'
 import { type FeeOptions, hasCode, resolveTxFees, waitForReceiptResilient } from './txWait'
@@ -266,7 +270,7 @@ export async function deployRolesModifier(params: {
   feeOptions?: FeeOptions
   timeoutMs?: number
   log?: (line: string) => void
-}): Promise<`0x${string}`> {
+}): Promise<{ rolesModifierAddress: `0x${string}`; deploymentBlock: bigint }> {
   const { publicClient, walletClient, addresses, safeAddress, saltNonce } = params
   const log = params.log ?? console.log
   const rolesInit = encodeAbiParameters(
@@ -289,7 +293,13 @@ export async function deployRolesModifier(params: {
     timeoutMs: params.timeoutMs,
     log,
   })
-  return extractEventAddress(receipt.logs, moduleProxyFactoryAbi, 'ModuleProxyCreation', 'proxy')
+  const rolesModifierAddress = extractEventAddress(
+    receipt.logs,
+    moduleProxyFactoryAbi,
+    'ModuleProxyCreation',
+    'proxy',
+  )
+  return { rolesModifierAddress, deploymentBlock: receipt.blockNumber }
 }
 
 /** One owner-authorized configuration call, with a human-readable summary. */
@@ -444,6 +454,16 @@ export interface DeploySafeAndRolesResult {
   roleKey: `0x${string}`
   /** Final Safe owner (finalSafeOwner if handed off, else the deployer). */
   safeOwner: `0x${string}`
+  /**
+   * Block the Safe proxy was deployed in, from the deploy tx receipt. Lets
+   * callers verify identity via event logs without re-discovering the block
+   * through a numeric-block `getCode` scan (which anvil forks serve unreliably
+   * for locally-deployed contracts). Undefined when the Safe was resumed from a
+   * prior run (no fresh receipt this call).
+   */
+  safeDeploymentBlock?: bigint
+  /** Block the Roles modifier proxy was deployed in. Undefined on resume. */
+  rolesDeploymentBlock?: bigint
 }
 
 /**
@@ -520,6 +540,9 @@ export async function deploySafeAndRoles(
   const { feeOptions, timeoutMs } = params
   const known = params.known ?? {}
 
+  if (finalSafeOwner) assertPlannedSafeOwnerIsNotBot(finalSafeOwner, botAddress)
+  if (!finalSafeOwner) assertPlannedSafeOwnerIsNotBot(deployer.address, botAddress)
+
   // A single deployer-EOA transaction: non-zero priority tip + resilient wait.
   const write = (address: `0x${string}`, abi: unknown, functionName: string, args: unknown[]) =>
     sendResilientTx({
@@ -537,6 +560,7 @@ export async function deploySafeAndRoles(
   // 1. Deploy the Safe (owner = deployer, threshold 1). Skipped on resume if the
   //    address from a prior run already has code.
   let safeAddress = known.safeAddress
+  let safeDeploymentBlock: bigint | undefined
   if (safeAddress && (await hasCode(publicClient, safeAddress))) {
     log(`→ Safe already deployed (${safeAddress}) — skipping`)
   } else {
@@ -554,6 +578,7 @@ export async function deploySafeAndRoles(
       'ProxyCreation',
       'proxy',
     )
+    safeDeploymentBlock = safeReceipt.blockNumber
     log(`  Safe: ${safeAddress}`)
     await params.onDeployed?.({ safeAddress })
   }
@@ -562,6 +587,7 @@ export async function deploySafeAndRoles(
   //    the OWNER to the Safe from birth means all scoping is done through the Safe
   //    (step 3) and there is no separate transferOwnership tx to send.
   let rolesModifierAddress = known.rolesModifierAddress
+  let rolesDeploymentBlock: bigint | undefined
   if (
     rolesModifierAddress &&
     safeAddress &&
@@ -571,7 +597,7 @@ export async function deploySafeAndRoles(
     log(`→ Roles modifier already deployed (${rolesModifierAddress}) — skipping`)
   } else {
     log('→ deploy Roles modifier (owner = Safe)')
-    rolesModifierAddress = await deployRolesModifier({
+    ;({ rolesModifierAddress, deploymentBlock: rolesDeploymentBlock } = await deployRolesModifier({
       publicClient,
       walletClient,
       addresses,
@@ -580,7 +606,7 @@ export async function deploySafeAndRoles(
       feeOptions,
       timeoutMs,
       log,
-    })
+    }))
     log(`  Roles: ${rolesModifierAddress}`)
     await params.onDeployed?.({ rolesModifierAddress })
   }
@@ -647,11 +673,15 @@ export async function deploySafeAndRoles(
     })
   }
 
+  await assertBotIsNotSafeOwner(publicClient, safeAddress, botAddress)
+
   return {
     safeAddress,
     rolesModifierAddress,
     roleKey,
     safeOwner: finalSafeOwner ?? deployer.address,
+    safeDeploymentBlock,
+    rolesDeploymentBlock,
   }
 }
 

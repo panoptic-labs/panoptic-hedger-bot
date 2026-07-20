@@ -1,4 +1,4 @@
-import { getPool } from '@panoptic-eng/sdk/v2'
+import { getOracleState, tickToSqrtPriceX96 } from '@panoptic-eng/sdk/v2'
 import type { Address, PublicClient } from 'viem'
 
 import { asSdkClient } from '../utils/sdkClient'
@@ -24,18 +24,17 @@ export interface PoolTickSourceDeps {
  * checks reflect true chain freshness.
  */
 export function createPoolTickSource(deps: PoolTickSourceDeps): PriceSignalSource {
-  const { publicClient, poolAddress, chainId, maxSignalAgeSeconds } = deps
+  const { publicClient, poolAddress, maxSignalAgeSeconds } = deps
   const nowMs = deps.nowMs ?? (() => Date.now())
 
   return {
     kind: 'pool-tick',
     async getSignal(): Promise<PriceSignal> {
-      const pool = await getPool({
-        client: asSdkClient<typeof getPool>(publicClient),
+      const oracle = await getOracleState({
+        client: asSdkClient<typeof getOracleState>(publicClient),
         poolAddress,
-        chainId,
       })
-      const blockTimestampSec = pool._meta.blockTimestamp
+      const blockTimestampSec = oracle._meta.blockTimestamp
       const observedAtMs = Number(blockTimestampSec) * 1000
 
       if (maxSignalAgeSeconds !== undefined) {
@@ -48,11 +47,20 @@ export function createPoolTickSource(deps: PoolTickSourceDeps): PriceSignalSourc
         }
       }
 
+      // Use the live pool spot tick (`referenceTick` = pool.currentTick), NOT the
+      // median. Delta hedging must neutralize CURRENT price exposure: the median
+      // lags spot (median smoothing), and when they diverge (e.g. a persistent
+      // ~300-tick gap) near-the-money option legs get marked mid-strike-range,
+      // producing partial deltas and a systematically mis-sized hedge. Spot makes
+      // the bot's exposure match reality (and the UI).
+      const tick = oracle.referenceTick
       return {
-        tick: pool.currentTick,
-        sqrtPriceX96: pool.sqrtPriceX96,
+        tick,
+        sqrtPriceX96: tickToSqrtPriceX96(tick),
         observedAtMs,
+        blockNumber: oracle._meta.blockNumber,
         source: 'pool-tick',
+        detail: `Panoptic pool spot tick (median reference ${oracle.medianTick})`,
       }
     },
   }

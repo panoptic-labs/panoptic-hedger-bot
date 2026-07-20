@@ -1,8 +1,30 @@
 import { priceToTick } from '@panoptic-eng/sdk/v2'
-import { formatUnits, parseUnits } from 'viem'
+import type { Address } from 'viem'
+import { formatUnits, getAddress, parseUnits } from 'viem'
 
 import { type LatestPriceProvider, PriceAggregator } from './cexAggregator'
 import { type PriceSignal, type PriceSignalSource, PriceSignalUnavailableError } from './types'
+
+const MAINNET_WETH = getAddress('0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2')
+const MAINNET_USD_ASSETS = new Set([
+  getAddress('0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48'), // USDC
+  getAddress('0xdAC17F958D2ee523a2206206994597C13D831ec7'), // USDT
+  getAddress('0x6B175474E89094C44Da98b954EedeAC495271d0F'), // DAI
+])
+
+/** Resolve orientation from an explicit production asset registry, never symbols. */
+export function resolveCexAssetOrientation(
+  chainId: number,
+  token0: Address,
+  token1: Address,
+): 0n | 1n {
+  if (chainId !== 1) throw new Error('CEX production signal supports Ethereum mainnet only')
+  const zero = getAddress(token0)
+  const one = getAddress(token1)
+  if (zero === MAINNET_WETH && MAINNET_USD_ASSETS.has(one)) return 0n
+  if (one === MAINNET_WETH && MAINNET_USD_ASSETS.has(zero)) return 1n
+  throw new Error('CEX signal pool assets are not a registered WETH/USD pair')
+}
 
 export interface CexSourceDeps {
   /** Options pool token decimals, needed to convert a USD price into a tick. */

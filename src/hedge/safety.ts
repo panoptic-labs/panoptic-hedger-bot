@@ -1,17 +1,8 @@
 import type { PoolHealthStatus } from '@panoptic-eng/sdk/v2'
-import { isLiquidatable } from '@panoptic-eng/sdk/v2'
-import type { Address, PublicClient } from 'viem'
-
-import { asSdkClient } from '../utils/sdkClient'
 
 export interface SafetyDeps {
-  publicClient: PublicClient
-  poolAddress: Address
-  safeAddress: Address
-  /** Open position tokenIds held by the Safe. */
-  tokenIds: bigint[]
-  /** Pool health from getPool. */
   poolHealthStatus: PoolHealthStatus
+  isLiquidatable: boolean
 }
 
 export interface SafetyAssessment {
@@ -26,22 +17,12 @@ export interface SafetyAssessment {
  * pool) the caller should skip hedging and alert — never widen risk near
  * liquidation.
  *
- * v1 gates on `isLiquidatable` + pool health. A margin-buffer percentage (via
- * getMarginBuffer, which needs the PanopticQuery address) is a future add.
+ * Chain reads live in the block-pinned snapshot module; this function is pure.
  */
-export async function assessSafety(deps: SafetyDeps): Promise<SafetyAssessment> {
-  const { publicClient, poolAddress, safeAddress, tokenIds, poolHealthStatus } = deps
+export function assessSafety(deps: SafetyDeps): SafetyAssessment {
   const reasons: string[] = []
+  if (deps.isLiquidatable) reasons.push('account is liquidatable')
+  if (deps.poolHealthStatus === 'paused') reasons.push('pool is paused')
 
-  const liq = await isLiquidatable({
-    client: asSdkClient<typeof isLiquidatable>(publicClient),
-    poolAddress,
-    account: safeAddress,
-    tokenIds,
-  })
-
-  if (liq.isLiquidatable) reasons.push('account is liquidatable')
-  if (poolHealthStatus === 'paused') reasons.push('pool is paused')
-
-  return { safe: reasons.length === 0, reasons, isLiquidatable: liq.isLiquidatable }
+  return { safe: reasons.length === 0, reasons, isLiquidatable: deps.isLiquidatable }
 }

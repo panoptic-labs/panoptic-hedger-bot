@@ -1,11 +1,22 @@
 import { getPool, getPoolMetadata } from '@panoptic-eng/sdk/v2'
-import { formatEther, parseEther } from 'viem'
+import { formatEther } from 'viem'
 
 import { validateBotToken } from '../../../src/notify/telegramOnboard'
 import { createPriceSignalSource, PriceSignalUnavailableError } from '../../../src/priceSignal'
 import { rolesModifierV2Abi } from '../../../src/safe/rolesAbi'
+import {
+  isProductionEligibleConfig,
+  productionProfileViolations,
+} from '../../../src/security/productionProfile'
+import { sanitizeError } from '../../../src/utils/sanitize'
 import { asSdkClient } from '../../../src/utils/sdkClient'
+import { verifyExactAuthorizationManifest } from '../authorizationManifest'
 import { isModuleEnabled, readSafeOwners } from '../existingSafe'
+import {
+  findContractDeploymentBlock,
+  getSafeZodiacAddresses,
+  verifySafeAndRolesProxyIdentities,
+} from '../safeZodiacRegistry'
 import { hasCode } from '../txWait'
 import { verifyLoanOnlyScope } from '../verifyScope'
 import type { DiagnosticsContext } from './context'
@@ -114,16 +125,30 @@ export async function runDoctorChecks(
     return results
   }
 
+  const supportedProfile = isProductionEligibleConfig(config)
+  push({
+    id: 'production-profile',
+    title: 'Production eligibility profile',
+    status: supportedProfile ? 'pass' : 'fail',
+    detail: supportedProfile
+      ? 'Ethereum mainnet, in-pool hedge venue, supported signal'
+      : productionProfileViolations(config).join('; '),
+    remedy: supportedProfile
+      ? undefined
+      : 'Use the supported mainnet in-pool profile; experimental profiles cannot activate.',
+  })
+
   // 3. Contract bytecode present for pool / safe / modifier.
-  for (const [id, label, addr] of [
-    ['pool', 'PanopticPool', config.POOL_ADDRESS],
-    ['safe', 'Safe', config.SAFE_ADDRESS],
-    ['modifier', 'Roles modifier', config.ROLES_MODIFIER_ADDRESS],
-  ] as const) {
-    try {
-      const ok = await hasCode(publicClient, addr)
-      push(
-        ok
+  const codeChecks = await Promise.all(
+    (
+      [
+        ['pool', 'PanopticPool', config.POOL_ADDRESS],
+        ['safe', 'Safe', config.SAFE_ADDRESS],
+        ['modifier', 'Roles modifier', config.ROLES_MODIFIER_ADDRESS],
+      ] as const
+    ).map(async ([id, label, addr]): Promise<DoctorResult> => {
+      try {
+        return (await hasCode(publicClient, addr))
           ? { id: `code-${id}`, title: `${label} bytecode`, status: 'pass', detail: addr }
           : {
               id: `code-${id}`,
@@ -131,11 +156,36 @@ export async function runDoctorChecks(
               status: 'fail',
               detail: `no code at ${addr}`,
               remedy: `Check ${label} address / chain.`,
-            },
-      )
-    } catch (err) {
-      push({ id: `code-${id}`, title: `${label} bytecode`, status: 'fail', detail: msg(err) })
-    }
+            }
+      } catch (err) {
+        return { id: `code-${id}`, title: `${label} bytecode`, status: 'fail', detail: msg(err) }
+      }
+    }),
+  )
+  codeChecks.forEach(push)
+
+  try {
+    const addresses = getSafeZodiacAddresses(config.CHAIN_ID)
+    await verifySafeAndRolesProxyIdentities(
+      publicClient,
+      addresses,
+      config.SAFE_ADDRESS,
+      config.ROLES_MODIFIER_ADDRESS,
+    )
+    push({
+      id: 'contract-identities',
+      title: 'Safe/Zodiac code identities',
+      status: 'pass',
+      detail: 'canonical factories, implementations, and proxy provenance verified',
+    })
+  } catch (err) {
+    push({
+      id: 'contract-identities',
+      title: 'Safe/Zodiac code identities',
+      status: 'fail',
+      detail: msg(err),
+      remedy: 'Use the reviewed canonical mainnet Safe/Zodiac deployments.',
+    })
   }
 
   // 4. Safe owners — the bot must NOT be one (least privilege).
@@ -146,7 +196,7 @@ export async function runDoctorChecks(
     push({
       id: 'owners',
       title: 'Safe ownership',
-      status: botIsOwner ? 'warn' : 'pass',
+      status: botIsOwner ? 'fail' : 'pass',
       detail: `owners: ${owners.join(', ')}`,
       remedy: botIsOwner
         ? 'The bot EOA is a Safe owner — it should only hold a scoped role.'
@@ -267,6 +317,45 @@ export async function runDoctorChecks(
     push(skip('scope', 'Loan-only scope', 'pool metadata or bot key unavailable'))
   }
 
+  if (botAddress && supportedProfile) {
+    try {
+      await verifyExactAuthorizationManifest({
+        publicClient,
+        rolesModifierAddress: config.ROLES_MODIFIER_ADDRESS,
+        botAddress,
+        roleKey: config.ROLE_KEY,
+        poolAddress: config.POOL_ADDRESS,
+        deploymentBlock: await findContractDeploymentBlock(
+          publicClient,
+          config.ROLES_MODIFIER_ADDRESS,
+        ),
+      })
+      push({
+        id: 'permission-manifest',
+        title: 'Complete Roles permission manifest',
+        status: 'pass',
+        detail: 'exactly one member, role, pool target, and reviewed loan-only function scope',
+      })
+    } catch (err) {
+      push({
+        id: 'permission-manifest',
+        title: 'Complete Roles permission manifest',
+        status: 'warn',
+        detail: msg(err),
+        remedy:
+          'Review stale permissions; re-onboard with a fresh modifier/role for the exact manifest.',
+      })
+    }
+  } else {
+    push(
+      skip(
+        'permission-manifest',
+        'Complete Roles permission manifest',
+        'unsupported profile or bot address unavailable',
+      ),
+    )
+  }
+
   // 8. Token orientation (which side is ETH vs stable).
   if (token0Symbol) {
     const eth = deriveEthTokenIndex(token0Symbol, token1Symbol)
@@ -335,12 +424,12 @@ export async function runDoctorChecks(
   if (botAddress) {
     try {
       const bal = await publicClient.getBalance({ address: botAddress })
-      const warn = parseEther(String(config.KEEPER_BALANCE_WARN_ETH))
+      const warn = config.KEEPER_BALANCE_WARN_ETH
       push({
         id: 'gas',
         title: 'Keeper gas balance',
         status: bal === 0n ? 'fail' : bal < warn ? 'warn' : 'pass',
-        detail: `${formatEther(bal)} ETH (warn < ${config.KEEPER_BALANCE_WARN_ETH})`,
+        detail: `${formatEther(bal)} ETH (warn < ${formatEther(config.KEEPER_BALANCE_WARN_ETH)})`,
         remedy: bal < warn ? `Top up the bot ${botAddress} with ETH for gas.` : undefined,
       })
     } catch (err) {
@@ -375,16 +464,12 @@ export async function runDoctorChecks(
   }
 
   // 12. Experimental-feature warning (narrowed v1).
-  const experimental: string[] = []
-  if (config.HEDGE_VENUE !== 'in-pool') experimental.push(`HEDGE_VENUE=${config.HEDGE_VENUE}`)
-  if (config.PRICE_SIGNAL_SOURCE === 'uniswap-pool')
-    experimental.push('PRICE_SIGNAL_SOURCE=uniswap-pool')
-  if (experimental.length > 0) {
+  if (config.PRICE_SIGNAL_SOURCE === 'uniswap-pool') {
     push({
       id: 'experimental',
       title: 'Experimental features',
       status: 'warn',
-      detail: experimental.join(', '),
+      detail: 'PRICE_SIGNAL_SOURCE=uniswap-pool',
       remedy:
         'These are not covered by v1 support — their setup/monitoring/recovery are not as hardened as the core.',
     })
@@ -398,5 +483,5 @@ function skip(id: string, title: string, reason: string): DoctorResult {
 }
 
 function msg(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
+  return sanitizeError(err)
 }

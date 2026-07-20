@@ -1,16 +1,38 @@
-# Build-context ignore for the standalone hedger-bot image. Keeps local
-# artifacts and secrets out of the `COPY . .` layer.
+# Docker reads this file for `docker build -f Dockerfile.standalone .`.
 node_modules
+**/node_modules
 dist
+**/dist
 .env
+**/.env
 .env.*
+**/.env.*
 !.env.example
 bot-keystore.json
+**/bot-keystore.json
 *.keystore.json
+**/*.keystore.json
 deploy-state.json
+**/deploy-state.json
 .hedger-runtime.json
+**/.hedger-runtime.json
 .hedger-activated.json
+**/.hedger-activated.json
+.hedger-journal.json
+**/.hedger-journal.json
+.hedger-disabled.json
+**/.hedger-disabled.json
+.hedger-instance.lock
+**/.hedger-instance.lock
+bot-keystore-passphrase
+**/bot-keystore-passphrase
+RECOVERY.md
+**/RECOVERY.md
 *.log
+**/*.log
 .git
+**/.git
 .DS_Store
+**/.DS_Store
 coverage
+**/coverage

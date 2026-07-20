@@ -1,7 +1,13 @@
 import 'dotenv/config'
 
 import { parseHedgerBotConfig } from '../src/config'
-import { buildActivationMarker, writeActivation } from '../src/runtime/activation'
+import {
+  buildActivationEvidence,
+  buildActivationMarker,
+  writeActivation,
+} from '../src/runtime/activation'
+import { clearDeactivation } from '../src/runtime/deactivation'
+import { sanitizeError } from '../src/utils/sanitize'
 import { runDoctorChecks } from './lib/diagnostics/checks'
 import { buildDiagnosticsContext } from './lib/diagnostics/context'
 import { renderDoctor } from './lib/diagnostics/render'
@@ -29,6 +35,9 @@ async function main(): Promise<void> {
     process.exitCode = 1
     return
   }
+  if (!ctx.botAddress) {
+    throw new Error('Preflight did not resolve the bot public address; refusing activation')
+  }
 
   const p = new Prompter()
   let confirmed = false
@@ -54,11 +63,15 @@ async function main(): Promise<void> {
     return
   }
 
-  writeActivation(buildActivationMarker(config, true, new Date().toISOString()))
+  const evidence = await buildActivationEvidence(ctx.publicClient, config)
+  writeActivation(
+    buildActivationMarker(config, ctx.botAddress, evidence, true, new Date().toISOString()),
+  )
+  clearDeactivation()
   console.log('\n✓ Activated. Start (or restart) the bot with `pnpm start` to trade live.')
 }
 
 main().catch((err) => {
-  console.error(err instanceof Error ? (err.stack ?? err.message) : String(err))
+  console.error(sanitizeError(err))
   process.exitCode = 1
 })

@@ -1,22 +1,26 @@
-import { getPool, getPoolMetadata } from '@panoptic-eng/sdk/v2'
+import { createMemoryStorage, getPoolMetadata } from '@panoptic-eng/sdk/v2'
 import { formatEther, formatUnits } from 'viem'
 
+import { protocolGenesisBlock } from '../../../src/constants/genesis'
 import { computeHedgePlan } from '../../../src/hedge/decision'
-import { readSafePositions } from '../../../src/hedge/positionReader'
+import { readHedgeSnapshot } from '../../../src/hedge/snapshot'
 import { createPriceSignalSource } from '../../../src/priceSignal'
-import { isActivated } from '../../../src/runtime/activation'
+import { resolveCexAssetOrientation } from '../../../src/priceSignal/cexSource'
+import { buildActivationEvidence, isActivated } from '../../../src/runtime/activation'
 import { botVersion, computeRunning, readRuntimeState } from '../../../src/runtime/stateFile'
+import { botWarn } from '../../../src/utils/log'
+import { sanitizeError } from '../../../src/utils/sanitize'
 import { asSdkClient } from '../../../src/utils/sdkClient'
 import { isModuleEnabled, readSafeOwners } from '../existingSafe'
 import { verifyLoanOnlyScope } from '../verifyScope'
-import type { DiagnosticsContext } from './context'
-
-const STABLES = new Set(['USDC', 'USDT', 'DAI', 'USDC.E', 'USDBC', 'FRAX', 'LUSD', 'GUSD'])
+import type { StatusDiagnosticsContext } from './context'
 
 export interface StatusSnapshot {
   version: string
   running: string
-  mode: 'live' | 'dry-run'
+  readiness: string
+  runningMode?: 'live' | 'dry-run'
+  nextStartMode: 'live' | 'dry-run'
   chainId: number
   pool: string
   poolPair?: string
@@ -41,18 +45,36 @@ function fmtAgo(iso?: string): string {
 }
 
 /** Best-effort operator snapshot. Individual read failures degrade gracefully. */
-export async function gatherStatus(ctx: DiagnosticsContext): Promise<StatusSnapshot> {
+export async function gatherStatus(ctx: StatusDiagnosticsContext): Promise<StatusSnapshot> {
   const { config, publicClient, botAddress } = ctx
   const notes: string[] = []
   const state = readRuntimeState()
   const run = computeRunning(state, config.POLL_INTERVAL_MS)
-  const activated = isActivated(config)
+  const evidence = await (async () => {
+    if (!botAddress || config.CHAIN_ID !== 1 || config.HEDGE_VENUE !== 'in-pool') return undefined
+    return buildActivationEvidence(publicClient, config)
+  })().catch((error) => {
+    botWarn(`[hedger-bot] activation evidence unavailable: ${sanitizeError(error)}`)
+    return undefined
+  })
+  const activated = isActivated(config, botAddress, evidence)
   const effectiveDryRun = config.DRY_RUN || !activated
+  const stateIdentityMatches =
+    state?.chainId === config.CHAIN_ID &&
+    state.safe.toLowerCase() === config.SAFE_ADDRESS.toLowerCase() &&
+    state.pool.toLowerCase() === config.POOL_ADDRESS.toLowerCase() &&
+    state.version === botVersion()
+  const runningMode =
+    run.running && stateIdentityMatches ? (state.dryRun ? 'dry-run' : 'live') : undefined
 
   const snap: StatusSnapshot = {
     version: botVersion(),
     running: run.running ? `running (${run.reason})` : `not running (${run.reason})`,
-    mode: effectiveDryRun ? 'dry-run' : 'live',
+    readiness: stateIdentityMatches
+      ? `${state.ready ? 'ready' : 'not ready'} (${state.lifecycle})`
+      : 'unknown (untrusted heartbeat)',
+    runningMode,
+    nextStartMode: effectiveDryRun ? 'dry-run' : 'live',
     chainId: config.CHAIN_ID,
     pool: config.POOL_ADDRESS,
     safe: config.SAFE_ADDRESS,
@@ -67,6 +89,13 @@ export async function gatherStatus(ctx: DiagnosticsContext): Promise<StatusSnaps
   }
   if (!activated && !config.DRY_RUN)
     notes.push('not activated — start would force dry-run (run `pnpm activate`)')
+  if (state && !stateIdentityMatches)
+    notes.push('runtime heartbeat identity/version mismatch — ignored')
+  if (runningMode && runningMode !== (effectiveDryRun ? 'dry-run' : 'live')) {
+    notes.push(
+      `running mode is ${runningMode}; next start would be ${effectiveDryRun ? 'dry-run' : 'live'}`,
+    )
+  }
 
   try {
     const md = await getPoolMetadata({
@@ -104,27 +133,25 @@ export async function gatherStatus(ctx: DiagnosticsContext): Promise<StatusSnaps
       snap.loanOnlyScope = 'unknown'
     }
 
-    // Positions + net delta (read-only; computeHedgePlan does no execution).
-    const pool = await getPool({
-      client: asSdkClient<typeof getPool>(publicClient),
-      poolAddress: config.POOL_ADDRESS,
-      chainId: BigInt(config.CHAIN_ID),
-    })
-    const read = await readSafePositions({
+    const snapshot = await readHedgeSnapshot({
       publicClient,
       poolAddress: config.POOL_ADDRESS,
       chainId: BigInt(config.CHAIN_ID),
       safeAddress: config.SAFE_ADDRESS,
-      trackedHedgeIds: new Set<bigint>(),
+      storage: createMemoryStorage(),
+      fromBlock: config.SYNC_FROM_BLOCK ?? protocolGenesisBlock(config.CHAIN_ID),
     })
-    const hedgeCount = read.hedgePositions.length
-    snap.positions = `${read.positions.length} open (${hedgeCount} hedge loan${hedgeCount === 1 ? '' : 's'})`
+    const hedgeCount = snapshot.hedgePositions.length
+    snap.positions = `${snapshot.positions.length} open (${hedgeCount} hedge loan${
+      hedgeCount === 1 ? '' : 's'
+    })`
 
     // Price signal (best-effort; falls back to pool tick for the delta calc).
-    const s0 = STABLES.has(md.token0Symbol.toUpperCase())
-    const s1 = STABLES.has(md.token1Symbol.toUpperCase())
-    const ethTokenIndex: 0n | 1n | undefined = s0 && !s1 ? 1n : s1 && !s0 ? 0n : undefined
-    let signalTick = pool.currentTick
+    const ethTokenIndex =
+      config.PRICE_SIGNAL_SOURCE === 'cex'
+        ? resolveCexAssetOrientation(config.CHAIN_ID, md.token0Asset, md.token1Asset)
+        : undefined
+    let signalTick = snapshot.pool.currentTick
     const source = createPriceSignalSource(config, {
       publicClient,
       token0Decimals: BigInt(md.token0Decimals),
@@ -137,29 +164,28 @@ export async function gatherStatus(ctx: DiagnosticsContext): Promise<StatusSnaps
       const ageS = Math.round((Date.now() - signal.observedAtMs) / 1000)
       snap.priceSignal = `${signal.source} tick=${signal.tick} (${ageS}s old)${signal.price !== undefined ? ` ~$${signal.price}` : ''}`
     } catch (err) {
-      snap.priceSignal = `unavailable: ${err instanceof Error ? err.message : String(err)}`
+      snap.priceSignal = `unavailable: ${sanitizeError(err)}`
     } finally {
       source.stop?.()
     }
 
-    const plan = await computeHedgePlan({
-      publicClient,
-      poolAddress: config.POOL_ADDRESS,
-      chainId: BigInt(config.CHAIN_ID),
-      safeAddress: config.SAFE_ADDRESS,
+    const plan = computeHedgePlan({
+      pool: snapshot.pool,
+      collateral: snapshot.collateral,
       signalTick,
       assetIndex: config.ASSET_INDEX as 0n | 1n,
       deltaThresholdBps: config.DELTA_THRESHOLD_BPS,
+      deltaOffsetBps: config.DELTA_OFFSET_BPS,
       absoluteMaxHedgeCount: config.MAX_HEDGE_SLOTS,
       slippageBps: BigInt(config.SLIPPAGE_BPS),
-      positions: read.positions,
-      hedgePositions: read.hedgePositions,
+      positions: snapshot.positions,
+      hedgePositions: snapshot.hedgePositions,
     })
     const dec = config.ASSET_INDEX === 0n ? Number(md.token0Decimals) : Number(md.token1Decimals)
     const sym = config.ASSET_INDEX === 0n ? md.token0Symbol : md.token1Symbol
     snap.netDelta = `${formatUnits(plan.netDelta, dec)} ${sym} (drift ${plan.driftBps}bps, action ${plan.action})`
   } catch (err) {
-    notes.push(`on-chain read failed: ${err instanceof Error ? err.message : String(err)}`)
+    notes.push(`on-chain read failed: ${sanitizeError(err)}`)
   }
 
   return snap

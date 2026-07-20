@@ -1,15 +1,77 @@
 import { describe, expect, it } from 'vitest'
 
-import { type HedgeItem, type PlanHedgeConfig, planHedge } from './decision'
+import { type HedgeItem, type PlanHedgeConfig, computeHedgePlan, planHedge } from './decision'
 
 // assetIndex = 1n → short hedge tokenType = 1n (asset), long hedge tokenType = 0n (numeraire).
-const CFG: PlanHedgeConfig = { assetIndex: 1n, deltaThresholdBps: 200n, absoluteMaxHedgeCount: 4 }
+const CFG: PlanHedgeConfig = {
+  assetIndex: 1n,
+  deltaThresholdBps: 200n,
+  deltaOffsetBps: 0n,
+  absoluteMaxHedgeCount: 4,
+}
 const PORT = 10_000n
 const SHORT = 1n
 const LONG = 0n
 
 const short = (tokenId: bigint, size: bigint): HedgeItem => ({ tokenId, tokenType: SHORT, size })
 const long = (tokenId: bigint, size: bigint): HedgeItem => ({ tokenId, tokenType: LONG, size })
+
+function planWithCollateral(args: {
+  assetIndex: 0n | 1n
+  currentTick: bigint
+  token0Assets: bigint
+  token1Assets: bigint
+}) {
+  return computeHedgePlan({
+    pool: {
+      currentTick: args.currentTick,
+      poolId: 1n,
+      poolKey: { tickSpacing: 10 },
+    } as never,
+    collateral: {
+      token0: { assets: args.token0Assets },
+      token1: { assets: args.token1Assets },
+    } as never,
+    signalTick: args.currentTick,
+    assetIndex: args.assetIndex,
+    deltaThresholdBps: 200n,
+    deltaOffsetBps: 0n,
+    absoluteMaxHedgeCount: 4,
+    slippageBps: 30n,
+    positions: [],
+    hedgePositions: [],
+  })
+}
+
+describe('computeHedgePlan — collateral delta', () => {
+  it('uses only token0 collateral when token0 is the vault asset', () => {
+    const token0Assets = 100n
+    const plan = planWithCollateral({
+      assetIndex: 0n,
+      currentTick: 1_000n,
+      token0Assets,
+      token1Assets: 1_000_000n,
+    })
+
+    expect(plan.breakdown.collateralDelta).toBe(token0Assets)
+    expect(plan.netDelta).toBe(token0Assets)
+  })
+
+  it('uses only token1 collateral when token1 is the vault asset', () => {
+    const token1Assets = 100n
+    const plan = planWithCollateral({
+      assetIndex: 1n,
+      currentTick: -1_000n,
+      token0Assets: 1_000_000n,
+      token1Assets,
+    })
+
+    expect(plan.breakdown.collateralDelta).toBe(token1Assets)
+    expect(plan.netDelta).toBe(token1Assets)
+    // No mint planned here → the collision diagnostic is threaded as an empty list.
+    expect(plan.intent.skippedCollidingTokenIds).toEqual([])
+  })
+})
 
 describe('planHedge — gating', () => {
   it('no action when drift is below threshold and no other trigger', () => {
@@ -106,6 +168,36 @@ describe('planHedge — 5-case tree', () => {
     const r = planHedge(-120n, 100n, 0n, [short(1n, 100n)], PORT, CFG)
     expect(r.triggers.signFlip).toBe(true)
     expect(r.action).toBe('flip')
+  })
+})
+
+describe('planHedge — delta offset (target bias)', () => {
+  // targetDelta = sizeBasis * offsetBps / 10_000; effectiveDelta = netDelta - targetDelta.
+  const withOffset = (bps: bigint): PlanHedgeConfig => ({ ...CFG, deltaOffsetBps: bps })
+
+  it('positive offset on a neutral book opens a long hedge toward the biased target', () => {
+    // offset +500 → targetDelta +500 (PORT 10_000); effectiveDelta 0 - 500 = -500
+    // → H* = +500 (long), drift 500bps > 200.
+    const r = planHedge(0n, 0n, 0n, [], PORT, withOffset(500n))
+    expect(r.action).toBe('open')
+    expect(r.Hstar).toBe(500n)
+    expect(r.mints).toEqual([{ tokenType: LONG, size: 500n }])
+    expect(r.swapAtMint).toBe(true)
+  })
+
+  it('negative offset flips the target side to a short hedge', () => {
+    // offset -500 → targetDelta -500; effectiveDelta 0 - (-500) = +500 → H* = -500 (short).
+    const r = planHedge(0n, 0n, 0n, [], PORT, withOffset(-500n))
+    expect(r.action).toBe('open')
+    expect(r.Hstar).toBe(-500n)
+    expect(r.mints).toEqual([{ tokenType: SHORT, size: 500n }])
+  })
+
+  it('re-centers the neutral point: net delta at the target no longer triggers', () => {
+    // netDelta +300 would breach the 200bps band at offset 0, but offset +300
+    // makes it the target (effectiveDelta 0) → no action.
+    expect(planHedge(300n, 0n, 0n, [], PORT, CFG).action).toBe('open')
+    expect(planHedge(300n, 0n, 0n, [], PORT, withOffset(300n)).action).toBe('none')
   })
 })
 

@@ -11,15 +11,44 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        SOURCE_SHA: ${SOURCE_SHA:?set SOURCE_SHA to the exact reviewed commit}
     image: hedger-bot
     restart: unless-stopped
+    mem_limit: 512m
+    pids_limit: 128
+    environment:
+      NODE_OPTIONS: --max-old-space-size=256
+      HEDGER_STATE_DIR: /var/lib/hedger
+      BOT_KEYSTORE_PATH: /run/secrets/bot-keystore
+      BOT_KEYSTORE_PASSPHRASE_FILE: /run/secrets/bot-keystore-passphrase
     env_file:
       - .env
     # Mount a read-only .env so config-only changes don't require a rebuild.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
     volumes:
-      - ./.env:/app/.env:ro
+      - hedger-state:/var/lib/hedger
+    secrets:
+      - source: bot-keystore
+        target: bot-keystore
+      - source: bot-keystore-passphrase
+        target: bot-keystore-passphrase
     logging:
       driver: json-file
       options:
         max-size: '10m'
         max-file: '3'
+secrets:
+  # Compose implements local file-backed secrets as bind mounts and ignores
+  # long-syntax uid/gid/mode. Before startup, both source files must be owned by
+  # uid 1000 (the container's node user) and have mode 0600.
+  bot-keystore:
+    file: ./bot-keystore.json
+  bot-keystore-passphrase:
+    file: ./bot-keystore-passphrase
+volumes:
+  hedger-state:

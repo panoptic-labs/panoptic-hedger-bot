@@ -6,16 +6,9 @@
  */
 export {
   type ConditionFlat,
-  addressEqualCompValue,
-  buildDepositConditions,
   buildLoanOnlyDispatchConditions,
-  buildWithdrawConditions,
-  DEPOSIT_SELECTOR,
-  EXECUTE_SELECTOR,
   LOAN_BITMASK_WINDOW_SHIFTS,
   loanBitmaskCompValueAt,
   Operator,
   ParameterType,
-  ROUTER_EXECUTE_SELECTOR_ONLY,
-  WITHDRAW_SELECTOR,
 } from '@panoptic-eng/sdk/zodiac'

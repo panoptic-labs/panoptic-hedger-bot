@@ -1,5 +1,5 @@
 import type { Account, PublicClient } from 'viem'
-import { formatEther, parseEther } from 'viem'
+import { formatEther, formatUnits } from 'viem'
 
 import type { Notifier } from '../notify/telegram'
 import { botWarn } from '../utils/log'
@@ -27,8 +27,8 @@ export interface GasFees {
 export interface GasAssessment {
   proceed: boolean
   urgent: boolean
-  baseFeeGwei: number
-  capGwei: number
+  baseFeeGwei: string
+  capGwei: string
   /** True the first time a deferral streak starts (rate-limits skip alerts). */
   shouldNotifySkip: boolean
 }
@@ -39,19 +39,27 @@ export interface GasPolicy {
   /**
    * Fee-cap overrides for a send. Returns undefined on pre-EIP-1559 chains
    * (no basefee), letting the wallet client fall back to its own estimation.
+   * `urgent` lifts the tip to at least URGENT_PRIORITY_FEE_GWEI.
    */
-  fees(): Promise<GasFees | undefined>
+  fees(opts?: { urgent?: boolean }): Promise<GasFees | undefined>
+  /**
+   * Replacement fees for a stuck send: elementwise max of a fresh estimate and
+   * prev x 1.125 (geth requires >=10% on BOTH fields). Returns null once the
+   * bumped maxFeePerGas would exceed MAX_FEE_GWEI — stop bumping, keep waiting.
+   */
+  bumped(prev: GasFees, opts?: { urgent?: boolean }): Promise<GasFees | null>
   /** Alert (rate-limited) when the keeper EOA runs low on gas money. */
   checkKeeperBalance(): Promise<void>
 }
 
 export interface GasPolicyConfig {
-  MAX_FEE_GWEI: number
-  MAX_PRIORITY_FEE_GWEI: number
-  HEDGE_MAX_BASE_FEE_GWEI: number
-  URGENT_MAX_BASE_FEE_GWEI: number
-  MIN_KEEPER_BALANCE_ETH: number
-  KEEPER_BALANCE_WARN_ETH: number
+  MAX_FEE_GWEI: bigint
+  MAX_PRIORITY_FEE_GWEI: bigint
+  URGENT_PRIORITY_FEE_GWEI: bigint
+  HEDGE_MAX_BASE_FEE_GWEI: bigint
+  URGENT_MAX_BASE_FEE_GWEI: bigint
+  MIN_KEEPER_BALANCE_ETH: bigint
+  KEEPER_BALANCE_WARN_ETH: bigint
 }
 
 export interface GasPolicyDeps {
@@ -63,28 +71,20 @@ export interface GasPolicyDeps {
   now?: () => number
 }
 
-const GWEI = 1_000_000_000n
 const SKIP_ALERT_COOLDOWN_MS = 30 * 60 * 1000
 const BALANCE_ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000
-
-function toGweiNumber(wei: bigint): number {
-  return Number(wei / 1_000_000n) / 1000 // 3 decimals is plenty for display
-}
-
-function gweiToWei(gwei: number): bigint {
-  return BigInt(Math.round(gwei * 1000)) * (GWEI / 1000n)
-}
 
 export function createGasPolicy(deps: GasPolicyDeps): GasPolicy {
   const { publicClient, account, notifier, config } = deps
   const now = deps.now ?? Date.now
 
-  const maxFeeCap = gweiToWei(config.MAX_FEE_GWEI)
-  const priorityCap = gweiToWei(config.MAX_PRIORITY_FEE_GWEI)
+  const maxFeeCap = config.MAX_FEE_GWEI
+  const priorityCap = config.MAX_PRIORITY_FEE_GWEI
+  const urgentPriorityFloor = config.URGENT_PRIORITY_FEE_GWEI
   // Only warn once the balance falls below this (defaults below the target
   // MIN_KEEPER_BALANCE_ETH, so routine balances above the warn line don't spam
   // the log every poll).
-  const warnBalance = parseEther(String(config.KEEPER_BALANCE_WARN_ETH))
+  const warnBalance = config.KEEPER_BALANCE_WARN_ETH
 
   // -Infinity = "never alerted", so the first breach always alerts even at t=0.
   let lastSkipAlertAt = Number.NEGATIVE_INFINITY
@@ -95,12 +95,45 @@ export function createGasPolicy(deps: GasPolicyDeps): GasPolicy {
     return block.baseFeePerGas ?? null
   }
 
+  // Lexical (not a method) so `bumped` can call it without relying on dynamic
+  // `this` — the policy's functions are passed around as detached callbacks.
+  async function fees(opts?: { urgent?: boolean }): Promise<GasFees | undefined> {
+    const base = await baseFee()
+    if (base === null) return undefined
+    // Tip = the network-estimated priority fee, clamped to MAX_PRIORITY_FEE_GWEI
+    // (a true ceiling, not the paid value) so quiet networks pay the small tip
+    // they actually need instead of a flat cap. If the RPC can't estimate,
+    // fall back to the cap (previous behavior). The tip also never exceeds the
+    // fee cap itself.
+    const ceil = priorityCap > maxFeeCap ? maxFeeCap : priorityCap
+    let estimated: bigint
+    try {
+      estimated = await publicClient.estimateMaxPriorityFeePerGas()
+    } catch {
+      estimated = ceil
+    }
+    let maxPriorityFeePerGas = estimated > ceil ? ceil : estimated
+    // Urgent hedges must land NOW: lift the tip to the urgent floor even past
+    // the routine ceiling (an RPC estimating ~0 during a spike would otherwise
+    // leave the tx unprioritised exactly when it matters). Only the fee cap
+    // bounds it.
+    if (opts?.urgent && maxPriorityFeePerGas < urgentPriorityFloor) {
+      maxPriorityFeePerGas = urgentPriorityFloor > maxFeeCap ? maxFeeCap : urgentPriorityFloor
+    }
+    // Standard headroom: 2x current basefee + tip, hard-clamped to the fee cap.
+    const uncapped = 2n * base + maxPriorityFeePerGas
+    return {
+      maxFeePerGas: uncapped > maxFeeCap ? maxFeeCap : uncapped,
+      maxPriorityFeePerGas,
+    }
+  }
+
   return {
     async assess(urgent: boolean): Promise<GasAssessment> {
       const base = await baseFee()
-      const capGwei = urgent ? config.URGENT_MAX_BASE_FEE_GWEI : config.HEDGE_MAX_BASE_FEE_GWEI
+      const cap = urgent ? config.URGENT_MAX_BASE_FEE_GWEI : config.HEDGE_MAX_BASE_FEE_GWEI
       // No basefee (pre-1559 chain): the deferral gate can't apply.
-      const proceed = base === null || base <= gweiToWei(capGwei)
+      const proceed = base === null || base <= cap
       let shouldNotifySkip = false
       if (!proceed) {
         const t = now()
@@ -114,34 +147,27 @@ export function createGasPolicy(deps: GasPolicyDeps): GasPolicy {
       return {
         proceed,
         urgent,
-        baseFeeGwei: base === null ? 0 : toGweiNumber(base),
-        capGwei,
+        baseFeeGwei: base === null ? '0' : formatUnits(base, 9),
+        capGwei: formatUnits(cap, 9),
         shouldNotifySkip,
       }
     },
 
-    async fees(): Promise<GasFees | undefined> {
-      const base = await baseFee()
-      if (base === null) return undefined
-      // Tip = the network-estimated priority fee, clamped to MAX_PRIORITY_FEE_GWEI
-      // (a true ceiling, not the paid value) so quiet networks pay the small tip
-      // they actually need instead of a flat cap. If the RPC can't estimate,
-      // fall back to the cap (previous behavior). The tip also never exceeds the
-      // fee cap itself.
-      const ceil = priorityCap > maxFeeCap ? maxFeeCap : priorityCap
-      let estimated: bigint
-      try {
-        estimated = await publicClient.estimateMaxPriorityFeePerGas()
-      } catch {
-        estimated = ceil
+    fees,
+
+    async bumped(prev: GasFees, opts?: { urgent?: boolean }): Promise<GasFees | null> {
+      // Fresh estimate tracks a moving basefee; prev x 1.125 satisfies geth's
+      // >=10% replacement minimum on both fields. Take the max of each.
+      const fresh = await fees(opts)
+      let maxFeePerGas = (prev.maxFeePerGas * 1125n) / 1000n
+      if (fresh && fresh.maxFeePerGas > maxFeePerGas) maxFeePerGas = fresh.maxFeePerGas
+      let maxPriorityFeePerGas = (prev.maxPriorityFeePerGas * 1125n) / 1000n
+      if (fresh && fresh.maxPriorityFeePerGas > maxPriorityFeePerGas) {
+        maxPriorityFeePerGas = fresh.maxPriorityFeePerGas
       }
-      const maxPriorityFeePerGas = estimated > ceil ? ceil : estimated
-      // Standard headroom: 2x current basefee + tip, hard-clamped to the fee cap.
-      const uncapped = 2n * base + maxPriorityFeePerGas
-      return {
-        maxFeePerGas: uncapped > maxFeeCap ? maxFeeCap : uncapped,
-        maxPriorityFeePerGas,
-      }
+      if (maxPriorityFeePerGas > maxFeePerGas) maxPriorityFeePerGas = maxFeePerGas
+      if (maxFeePerGas > maxFeeCap) return null
+      return { maxFeePerGas, maxPriorityFeePerGas }
     },
 
     async checkKeeperBalance(): Promise<void> {
@@ -158,11 +184,13 @@ export function createGasPolicy(deps: GasPolicyDeps): GasPolicy {
       lastBalanceAlertAt = t
       botWarn(
         `[hedger-bot] keeper balance low: ${formatEther(balance)} ETH < ` +
-          `${config.KEEPER_BALANCE_WARN_ETH} ETH warn (top up to ${config.MIN_KEEPER_BALANCE_ETH} ETH)`,
+          `${formatEther(config.KEEPER_BALANCE_WARN_ETH)} ETH warn ` +
+          `(top up to ${formatEther(config.MIN_KEEPER_BALANCE_ETH)} ETH)`,
       )
       await notifier.notify(
         `⛽️ keeper ${account.address} is low on gas: ${formatEther(balance)} ETH ` +
-          `(warn below ${config.KEEPER_BALANCE_WARN_ETH} ETH; top up to ${config.MIN_KEEPER_BALANCE_ETH} ETH) — ` +
+          `(warn below ${formatEther(config.KEEPER_BALANCE_WARN_ETH)} ETH; ` +
+          `top up to ${formatEther(config.MIN_KEEPER_BALANCE_ETH)} ETH) — ` +
           `hedging will halt when it hits zero`,
       )
     },

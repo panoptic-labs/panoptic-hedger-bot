@@ -15,6 +15,8 @@ export interface PriceSignal {
    * The main loop gates on this for staleness.
    */
   observedAtMs: number
+  /** Exact chain block for on-chain observations. */
+  blockNumber?: bigint
   source: PriceSignalSourceKind
   /** Human price (token1 per token0 units, or USD for cex) when derivable — for logs. */
   price?: number

@@ -4,11 +4,11 @@
  * mainnet Safe/Zodiac infrastructure and a real PanopticPool.
  *
  * Prerequisites:
- *   1. export FORK_URL=<mainnet RPC>
- *   2. anvil --fork-url $FORK_URL   (defaults to 127.0.0.1:8545)
- *   3. pnpm test scripts/setup.fork.test.ts
+ *   1. Start an isolated, pinned mainnet fork.
+ *   2. export HEDGER_FORK_RPC_URL=http://127.0.0.1:<isolated-port>
+ *   3. pnpm security:test-fork
  *
- * Skips automatically when no fork node is reachable.
+ * This suite never skips. Missing/unreachable fork configuration is a failure.
  */
 
 import {
@@ -25,6 +25,7 @@ import { beforeAll, describe, expect, it } from 'vitest'
 
 import { parseHedgerBotConfig } from '../src/config'
 import { rolesModifierV2Abi } from '../src/safe/rolesAbi'
+import { verifyExactAuthorizationManifest } from './lib/authorizationManifest'
 import {
   buildConfigureCalls,
   buildSafeSetupInitializer,
@@ -34,11 +35,16 @@ import {
 } from './lib/deployCore'
 import { renderEnvFile } from './lib/renderEnv'
 import { execFromSoleOwner } from './lib/safeExec'
-import { getSafeZodiacAddresses } from './lib/safeZodiacRegistry'
+import { getSafeZodiacAddresses, verifySafeAndRolesProxyIdentities } from './lib/safeZodiacRegistry'
 import { fetchProxyCreationCode, makeSafeAddressPredictor } from './lib/vanitySafe'
 import { verifyLoanOnlyScope } from './lib/verifyScope'
 
-const RPC_URL = 'http://127.0.0.1:8545'
+const RPC_URL = process.env.HEDGER_FORK_RPC_URL
+if (!RPC_URL) {
+  throw new Error(
+    'HEDGER_FORK_RPC_URL is required; start an explicitly configured pinned fork before running security:test-fork',
+  )
+}
 const CHAIN_ID = 1
 // The scope targets this address; the loan-only assertion checks the tokenId
 // width fields in dispatch arg0 BEFORE any call to the pool, so it does not
@@ -48,18 +54,7 @@ const POOL_ADDRESS = '0x00000000563b70d704f4c6675a5f6ac989fbae13' as `0x${string
 // Bitmask on the width fields is independent of the poolId value.
 const SYNTHETIC_POOL_ID = 0x3c08ae4977f78dn
 
-async function forkReachable(): Promise<boolean> {
-  try {
-    await createPublicClient({ chain: mainnet, transport: http(RPC_URL) }).getBlockNumber()
-    return true
-  } catch {
-    return false
-  }
-}
-
-const available = await forkReachable()
-
-describe.skipIf(!available)('hedger-bot setup core (mainnet fork)', () => {
+describe('hedger-bot setup core (mainnet fork)', () => {
   let publicClient: PublicClient
   const deployerKey = generatePrivateKey()
   const botKey = generatePrivateKey()
@@ -69,6 +64,9 @@ describe.skipIf(!available)('hedger-bot setup core (mainnet fork)', () => {
 
   beforeAll(async () => {
     publicClient = createPublicClient({ chain: mainnet, transport: http(RPC_URL) })
+    await publicClient.getBlockNumber().catch(() => {
+      throw new Error(`isolated fork is unreachable at ${RPC_URL}`)
+    })
     const testClient = createTestClient({ chain: mainnet, mode: 'anvil', transport: http(RPC_URL) })
     await testClient.setBalance({ address: deployer.address, value: parseEther('100') })
   })
@@ -90,11 +88,6 @@ describe.skipIf(!available)('hedger-bot setup core (mainnet fork)', () => {
       roleKey,
       addresses,
       saltNonce: 424242n,
-      // Exercise the à-la-carte role scoping end-to-end against a live modifier.
-      extraRoles: [
-        { kind: 'deleverager', member: privateKeyToAccount(generatePrivateKey()).address },
-        { kind: 'roller', member: privateKeyToAccount(generatePrivateKey()).address, sizeCap: 0n },
-      ],
       // Burner deploys, then hands Safe ownership to a separate EOA.
       finalSafeOwner: finalOwner,
       log: () => {},
@@ -149,6 +142,21 @@ describe.skipIf(!available)('hedger-bot setup core (mainnet fork)', () => {
     ])
     expect(avatar.toLowerCase()).toBe(result.safeAddress.toLowerCase())
     expect(target.toLowerCase()).toBe(result.safeAddress.toLowerCase())
+    await verifySafeAndRolesProxyIdentities(
+      publicClient,
+      addresses,
+      result.safeAddress,
+      result.rolesModifierAddress,
+      { safe: result.safeDeploymentBlock, roles: result.rolesDeploymentBlock },
+    )
+
+    // Fresh deploy always yields the Roles modifier's deployment block from the
+    // deploy tx receipt; the manifest checks below use it as the getLogs floor
+    // instead of a numeric-block getCode scan (unreliable on anvil forks).
+    const rolesBlock = result.rolesDeploymentBlock
+    if (rolesBlock === undefined) {
+      throw new Error('expected rolesDeploymentBlock from a fresh deploy')
+    }
 
     // Batched path: the Roles modifier is owned by the Safe from birth (no
     // standing EOA admin, and no separate transferOwnership tx).
@@ -210,6 +218,16 @@ describe.skipIf(!available)('hedger-bot setup core (mainnet fork)', () => {
         poolAddress: POOL_ADDRESS,
         poolId: SYNTHETIC_POOL_ID,
         log: () => {},
+      }),
+    ).resolves.toBeUndefined()
+    await expect(
+      verifyExactAuthorizationManifest({
+        publicClient,
+        rolesModifierAddress: result.rolesModifierAddress,
+        botAddress: bot.address,
+        roleKey,
+        poolAddress: POOL_ADDRESS,
+        deploymentBlock: rolesBlock,
       }),
     ).resolves.toBeUndefined()
 
@@ -292,14 +310,15 @@ describe.skipIf(!available)('hedger-bot setup core (mainnet fork)', () => {
 
     // 2. Bot deploys the Roles modifier (permissionless), owner/avatar/target = Safe.
     const existingRoleKey = `0x${'22'.repeat(32)}` as `0x${string}`
-    const modifier = await deployRolesModifier({
-      publicClient,
-      walletClient: botWallet,
-      addresses,
-      safeAddress,
-      saltNonce: 987654n,
-      log: () => {},
-    })
+    const { rolesModifierAddress: modifier, deploymentBlock: modifierBlock } =
+      await deployRolesModifier({
+        publicClient,
+        walletClient: botWallet,
+        addresses,
+        safeAddress,
+        saltNonce: 987654n,
+        log: () => {},
+      })
 
     // Helper: the owner executes each printed configure call as a plain CALL.
     const execAsOwner = async (calls: ReturnType<typeof buildConfigureCalls>): Promise<void> => {
@@ -370,5 +389,15 @@ describe.skipIf(!available)('hedger-bot setup core (mainnet fork)', () => {
         }),
       ).resolves.toBeUndefined()
     }
+    await expect(
+      verifyExactAuthorizationManifest({
+        publicClient,
+        rolesModifierAddress: modifier,
+        botAddress: bot.address,
+        roleKey: existingRoleKey,
+        poolAddress: POOL_ADDRESS,
+        deploymentBlock: modifierBlock,
+      }),
+    ).rejects.toThrow(/does not exactly match/)
   }, 120_000)
 })

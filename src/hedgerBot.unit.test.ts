@@ -4,9 +4,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { HedgerBotConfig } from './config'
 import type { HedgeExecutionResult, HedgeExecutor } from './executor/types'
 import { computeHedgePlan } from './hedge/decision'
-import { readSafePositions } from './hedge/positionReader'
+import { readHedgeSnapshot } from './hedge/snapshot'
 import { HedgerBot } from './hedgerBot'
-import type { RolesExecutor } from './safe/rolesExecutor'
+import { type RolesExecutor, TxNotMinedError } from './safe/rolesExecutor'
 
 vi.mock('@panoptic-eng/sdk/v2', () => ({
   getPool: vi.fn(async () => ({
@@ -33,11 +33,13 @@ vi.mock('@panoptic-eng/sdk/v2', () => ({
   })),
   isNonceError: () => false,
   isRetryableRpcError: () => false,
+  isGasError: () => false,
+  parsePanopticError: () => null,
   tickToSqrtPriceX96: () => 1n << 96n,
 }))
-vi.mock('./hedge/positionReader', () => ({ readSafePositions: vi.fn() }))
+vi.mock('./hedge/snapshot', () => ({ readHedgeSnapshot: vi.fn() }))
 vi.mock('./hedge/safety', () => ({
-  assessSafety: vi.fn(async () => ({ safe: true, reasons: [], isLiquidatable: false })),
+  assessSafety: vi.fn(() => ({ safe: true, reasons: [], isLiquidatable: false })),
 }))
 vi.mock('./hedge/decision', () => ({ computeHedgePlan: vi.fn() }))
 
@@ -53,6 +55,7 @@ const CONFIG = {
   URGENT_DRIFT_MULTIPLIER: 3,
   TX_RECEIPT_TIMEOUT_MS: 180_000,
   SIGNAL_TICK_SANITY_MAX: 5_000,
+  MIN_MARGIN_RESERVE_BPS: 2_000n,
 } as unknown as HedgerBotConfig
 
 /** A permissive gas policy stub: never defers, never alerts. */
@@ -60,11 +63,12 @@ const openGasPolicy = {
   assess: async () => ({
     proceed: true,
     urgent: false,
-    baseFeeGwei: 1,
-    capGwei: 50,
+    baseFeeGwei: '1',
+    capGwei: '50',
     shouldNotifySkip: false,
   }),
   fees: async () => undefined,
+  bumped: async () => null,
   checkKeeperBalance: async () => undefined,
 }
 
@@ -74,6 +78,37 @@ const positionsOnChain = [
   { tokenId: 7n, legs: [loanLeg], positionSize: 10n, tickAtMint: 0n },
   { tokenId: 8n, legs: [loanLeg], positionSize: 10n, tickAtMint: 0n },
 ]
+
+const defaultBuyingPower = {
+  collateralBalance0: 0n,
+  requiredCollateral0: 0n,
+  collateralBalance1: 0n,
+  requiredCollateral1: 0n,
+}
+
+const snapshot = (
+  positions = positionsOnChain,
+  hedgePositions = positionsOnChain,
+  buyingPower = defaultBuyingPower,
+) =>
+  ({
+    blockNumber: 123n,
+    positions,
+    hedgePositions,
+    pool: {
+      healthStatus: 'active',
+      currentTick: 0n,
+      metadata: {
+        token0Decimals: 18n,
+        token1Decimals: 6n,
+        token0Symbol: 'WETH',
+        token1Symbol: 'USDC',
+      },
+    },
+    buyingPower,
+    collateral: { token0: { assets: 0n }, token1: { assets: 0n } },
+    liquidation: { isLiquidatable: false },
+  }) as never
 
 /** A plan that closes hedge 7n. */
 const closeSevenPlan = {
@@ -94,6 +129,32 @@ const closeSevenPlan = {
     swapAtMint: true,
     closeTokenIds: [7n],
     existingPositionIds: [7n, 8n],
+    skippedCollidingTokenIds: [],
+    currentTick: 0n,
+    slippageBps: 30n,
+  },
+} as never
+
+/** A consolidation that burns both old loans before minting one replacement. */
+const consolidatePlan = {
+  action: 'consolidate',
+  mints: [{ tokenType: 1n, size: 20n }],
+  burns: [7n, 8n],
+  swapAtMint: false,
+  H: -20n,
+  Hstar: -20n,
+  driftBps: 0n,
+  triggers: { drift: false, overCap: true, signFlip: false },
+  netDelta: 0n,
+  portfolioSize: 100n,
+  intent: {
+    action: 'consolidate',
+    openTokenId: 99n,
+    openPositionSize: 20n,
+    swapAtMint: false,
+    closeTokenIds: [7n, 8n],
+    existingPositionIds: [7n, 8n],
+    skippedCollidingTokenIds: [],
     currentTick: 0n,
     slippageBps: 30n,
   },
@@ -101,15 +162,31 @@ const closeSevenPlan = {
 
 type BotDeps = ConstructorParameters<typeof HedgerBot>[0]
 
-function makeBot(
+async function makeBot(
   executeResult: HedgeExecutionResult,
   receiptStatus: 'success' | 'reverted',
-  overrides: Partial<Pick<BotDeps, 'executor' | 'notifier' | 'gasPolicy'>> = {},
+  overrides: Partial<Pick<BotDeps, 'executor' | 'notifier' | 'gasPolicy' | 'hedgeJournal'>> = {},
 ) {
-  const execute = vi.fn(async () => executeResult)
+  const receipt = {
+    status: receiptStatus,
+    transactionHash: '0x01',
+    blockNumber: 123n,
+    blockHash: `0x${'ab'.repeat(32)}`,
+  } as never
+  const normalizedResult = executeResult.dryRun
+    ? executeResult
+    : { ...executeResult, transactionHash: '0x01', receipt }
+  const execute = vi.fn(async (..._args: unknown[]) => normalizedResult)
   const publicClient = {
-    waitForTransactionReceipt: vi.fn(async () => ({ status: receiptStatus })),
+    getBlockNumber: vi.fn(async () => 123n),
+    waitForTransactionReceipt: vi.fn(async () => ({
+      status: receiptStatus,
+      transactionHash: '0x01',
+      blockNumber: 123n,
+      blockHash: `0x${'ab'.repeat(32)}`,
+    })),
   } as unknown as PublicClient
+  const notifier = overrides.notifier ?? { notify: vi.fn(async () => undefined) }
   const bot = new HedgerBot({
     config: CONFIG,
     publicClient,
@@ -121,32 +198,36 @@ function makeBot(
     vaultAsset: { decimals: 6, symbol: 'USDC' },
     executor:
       overrides.executor ?? ({ kind: 'same-pool-loan', execute } as unknown as HedgeExecutor),
-    rolesExecutor: {} as RolesExecutor,
-    notifier: overrides.notifier ?? { notify: vi.fn(async () => undefined) },
+    rolesExecutor: { preflight: vi.fn(async () => undefined) } as unknown as RolesExecutor,
+    notifier,
     gasPolicy: overrides.gasPolicy ?? openGasPolicy,
+    // Unused here: readHedgeSnapshot (the only storage consumer) is mocked.
+    storage: {} as never,
+    hedgeJournal: overrides.hedgeJournal ?? {
+      begin: vi.fn(),
+      observeTransaction: vi.fn(),
+      confirm: vi.fn(),
+      fail: vi.fn(),
+      recover: vi.fn(async () => undefined),
+      checkpoint: () => ({}),
+    },
   })
+  await bot.init()
+  vi.mocked(notifier.notify).mockClear()
   return { bot, execute, publicClient }
 }
 
-/** The tracked-hedge set the bot handed to the position reader on a given call. */
-function trackedIdsOnCall(callIndex: number): Set<bigint> {
-  const mock = vi.mocked(readSafePositions).mock
-  return mock.calls[callIndex][0].trackedHedgeIds
-}
-
 beforeEach(() => {
-  vi.mocked(readSafePositions).mockReset()
-  vi.mocked(readSafePositions).mockResolvedValue({
-    positions: positionsOnChain as never,
-    hedgePositions: positionsOnChain as never,
-  })
+  vi.mocked(readHedgeSnapshot).mockReset()
+  vi.mocked(readHedgeSnapshot).mockResolvedValue(snapshot())
   vi.mocked(computeHedgePlan).mockReset()
-  vi.mocked(computeHedgePlan).mockResolvedValue(closeSevenPlan)
+  vi.mocked(computeHedgePlan).mockReturnValue(closeSevenPlan)
 })
 
 describe('HedgerBot gas deferral gate', () => {
   const deferResult = {
-    txHashes: [],
+    transactionHash: null,
+    receipt: null,
     openedTokenId: null,
     closedTokenIds: [7n],
     dryRun: false,
@@ -155,7 +236,7 @@ describe('HedgerBot gas deferral gate', () => {
   it('a deferring gas policy blocks execution before the executor runs', async () => {
     const execute = vi.fn()
     const notify = vi.fn(async () => undefined)
-    const { bot } = makeBot(deferResult, 'success', {
+    const { bot } = await makeBot(deferResult, 'success', {
       executor: { kind: 'same-pool-loan', execute } as unknown as HedgeExecutor,
       notifier: { notify },
       gasPolicy: {
@@ -163,8 +244,8 @@ describe('HedgerBot gas deferral gate', () => {
         assess: vi.fn(async () => ({
           proceed: false,
           urgent: false,
-          baseFeeGwei: 120,
-          capGwei: 50,
+          baseFeeGwei: '120',
+          capGwei: '50',
           shouldNotifySkip: true,
         })),
       },
@@ -178,56 +259,232 @@ describe('HedgerBot gas deferral gate', () => {
     const assess = vi.fn(async () => ({
       proceed: false,
       urgent: true,
-      baseFeeGwei: 120,
-      capGwei: 300,
+      baseFeeGwei: '120',
+      capGwei: '300',
       shouldNotifySkip: false,
     }))
-    vi.mocked(computeHedgePlan).mockResolvedValue({
+    vi.mocked(computeHedgePlan).mockReturnValue({
       ...(closeSevenPlan as object),
       driftBps: 700n, // >= 3 x 200
     } as never)
-    const { bot } = makeBot(deferResult, 'success', {
+    const { bot } = await makeBot(deferResult, 'success', {
       executor: { kind: 'same-pool-loan', execute: vi.fn() } as unknown as HedgeExecutor,
       gasPolicy: { ...openGasPolicy, assess },
     })
     await bot.runCycle('c1')
     expect(assess).toHaveBeenCalledWith(true)
   })
+
+  it('threads urgency into the executor context', async () => {
+    vi.mocked(computeHedgePlan).mockReturnValue({
+      ...(closeSevenPlan as object),
+      driftBps: 700n, // >= 3 x 200
+    } as never)
+    const { bot, execute } = await makeBot(deferResult, 'success')
+    await bot.runCycle('c1')
+    expect(execute.mock.calls[0][1]).toMatchObject({ urgent: true })
+  })
+
+  it('marks routine drift non-urgent in the executor context', async () => {
+    const { bot, execute } = await makeBot(deferResult, 'success') // driftBps=0
+    await bot.runCycle('c1')
+    expect(execute.mock.calls[0][1]).toMatchObject({ urgent: false })
+  })
 })
 
-describe('HedgerBot hedge tracking vs execution outcome', () => {
-  it('dry-run does not mutate the tracked hedge set', async () => {
-    const { bot } = makeBot(
-      { txHashes: [], openedTokenId: null, closedTokenIds: [7n], dryRun: true },
-      'success',
+describe('HedgerBot final-state margin reserve', () => {
+  const executionResult = {
+    transactionHash: '0x01',
+    receipt: {
+      status: 'success',
+      transactionHash: '0x01',
+      blockNumber: 123n,
+      blockHash: `0x${'ab'.repeat(32)}`,
+    },
+    openedTokenId: 99n,
+    closedTokenIds: [7n, 8n],
+    dryRun: false,
+  } as unknown as HedgeExecutionResult
+
+  beforeEach(() => {
+    vi.mocked(readHedgeSnapshot).mockResolvedValue(
+      snapshot(positionsOnChain, positionsOnChain, {
+        collateralBalance0: 1_000n,
+        requiredCollateral0: 850n,
+        collateralBalance1: 1_000n,
+        requiredCollateral1: 850n,
+      }),
     )
-    await bot.runCycle('c1') // seeds tracker {7n, 8n}, then "closes" 7n in dry-run
-    await bot.runCycle('c2')
-    // 7n is still open on-chain; a dry-run must not declassify it as a hedge.
-    expect(trackedIdsOnCall(1)).toEqual(new Set([7n, 8n]))
+    vi.mocked(computeHedgePlan).mockReturnValue(consolidatePlan)
   })
 
-  it('a reverted dispatch does not mutate the tracked hedge set', async () => {
-    const { bot } = makeBot(
-      { txHashes: ['0x01'], openedTokenId: null, closedTokenIds: [7n], dryRun: false },
+  it('allows consolidation when 15% free before becomes 50% free afterward', async () => {
+    const previewFinalState = vi.fn(async () => ({
+      success: true as const,
+      margin: {
+        collateralBalance0: 1_000n,
+        requiredCollateral0: 500n,
+        collateralBalance1: 1_000n,
+        requiredCollateral1: 500n,
+      },
+    }))
+    const execute = vi.fn(async () => executionResult)
+    const { bot } = await makeBot(executionResult, 'success', {
+      executor: { kind: 'same-pool-loan', previewFinalState, execute },
+    })
+
+    expect(await bot.runCycle('c1')).toBe('complete')
+    expect(previewFinalState).toHaveBeenCalledTimes(2)
+    expect(previewFinalState).toHaveBeenNthCalledWith(1, consolidatePlan.intent, 123n)
+    expect(execute).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects consolidation when the simulated final state remains below reserve', async () => {
+    const previewFinalState = vi.fn(async () => ({
+      success: true as const,
+      margin: {
+        collateralBalance0: 1_000n,
+        requiredCollateral0: 850n,
+        collateralBalance1: 1_000n,
+        requiredCollateral1: 850n,
+      },
+    }))
+    const execute = vi.fn(async () => executionResult)
+    const { bot } = await makeBot(executionResult, 'success', {
+      executor: { kind: 'same-pool-loan', previewFinalState, execute },
+    })
+
+    expect(await bot.runCycle('c1')).toBe('complete')
+    expect(previewFinalState).toHaveBeenCalledTimes(1)
+    expect(execute).not.toHaveBeenCalled()
+  })
+})
+
+describe('HedgerBot stuck dispatch (TxNotMinedError)', () => {
+  it('alerts once and leaves the tracked hedge set untouched', async () => {
+    const notify = vi.fn(async () => undefined)
+    const execute = vi
+      .fn()
+      .mockRejectedValueOnce(new TxNotMinedError(['0xaa', '0xbb'] as never, 180_000))
+      .mockResolvedValue({
+        transactionHash: '0x01',
+        receipt: {
+          status: 'success',
+          transactionHash: '0x01',
+          blockNumber: 123n,
+          blockHash: `0x${'ab'.repeat(32)}`,
+        },
+        openedTokenId: null,
+        closedTokenIds: [],
+        dryRun: false,
+      })
+    const { bot } = await makeBot(
+      {
+        transactionHash: null,
+        receipt: null,
+        openedTokenId: null,
+        closedTokenIds: [],
+        dryRun: false,
+      },
+      'success',
+      {
+        executor: { kind: 'same-pool-loan', execute } as unknown as HedgeExecutor,
+        notifier: { notify },
+      },
+    )
+    await bot.runCycle('c1') // executor throws TxNotMinedError
+    expect(notify).toHaveBeenCalledTimes(1)
+    await bot.runCycle('c2')
+    // The next cycle re-reads a fresh snapshot and retries; position discovery is
+    // now via syncPositions (event scan), so recovery no longer threads a
+    // best-guess dispatch hash into the read.
+    expect(vi.mocked(readHedgeSnapshot).mock.calls.length).toBe(2)
+    expect(execute).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('HedgerBot hedge classification', () => {
+  it('treats unjournaled width-zero loans as hedge positions', async () => {
+    const { bot } = await makeBot(
+      {
+        transactionHash: null,
+        receipt: null,
+        openedTokenId: null,
+        closedTokenIds: [],
+        dryRun: true,
+      },
+      'success',
+      {
+        hedgeJournal: {
+          begin: vi.fn(),
+          observeTransaction: vi.fn(),
+          confirm: vi.fn(),
+          fail: vi.fn(),
+          recover: vi.fn(async () => undefined),
+          checkpoint: () => ({}),
+        },
+      },
+    )
+    await bot.runCycle('c1')
+
+    expect(vi.mocked(computeHedgePlan).mock.calls[0][0].hedgePositions).toEqual(positionsOnChain)
+  })
+
+  it('dry-run continues to leave on-chain loans unchanged', async () => {
+    const { bot } = await makeBot(
+      {
+        transactionHash: null,
+        receipt: null,
+        openedTokenId: null,
+        closedTokenIds: [7n],
+        dryRun: true,
+      },
+      'success',
+    )
+    await bot.runCycle('c1')
+    await bot.runCycle('c2')
+    expect(vi.mocked(readHedgeSnapshot)).toHaveBeenCalledTimes(2)
+    // The second cycle re-reads the on-chain loans and plans against them.
+    expect(vi.mocked(computeHedgePlan).mock.calls[1][0].hedgePositions).toEqual(positionsOnChain)
+  })
+
+  it('a reverted dispatch returns an error outcome without removing on-chain loans', async () => {
+    const { bot } = await makeBot(
+      {
+        transactionHash: '0x01',
+        receipt: null,
+        openedTokenId: null,
+        closedTokenIds: [7n],
+        dryRun: false,
+      },
       'reverted',
     )
-    await bot.runCycle('c1')
-    await bot.runCycle('c2')
-    expect(trackedIdsOnCall(1)).toEqual(new Set([7n, 8n]))
+    expect(await bot.runCycle('c1')).toBe('error')
+    expect(await bot.runCycle('c2')).toBe('error')
+    expect(vi.mocked(computeHedgePlan)).toHaveBeenCalledTimes(2)
+    // The reverted dispatch must not strip the on-chain loans from the re-plan.
+    expect(vi.mocked(computeHedgePlan).mock.calls[1][0].hedgePositions).toEqual(positionsOnChain)
   })
 
-  it('a successful dispatch applies burns to the tracked hedge set', async () => {
-    const { bot, publicClient } = makeBot(
-      { txHashes: ['0x01'], openedTokenId: null, closedTokenIds: [7n], dryRun: false },
+  it('a successful dispatch uses the next on-chain position snapshot', async () => {
+    vi.mocked(readHedgeSnapshot)
+      .mockResolvedValueOnce(snapshot(positionsOnChain, []))
+      .mockResolvedValueOnce(snapshot([positionsOnChain[1]], [positionsOnChain[1]]))
+    const { bot, publicClient } = await makeBot(
+      {
+        transactionHash: '0x01',
+        receipt: null,
+        openedTokenId: null,
+        closedTokenIds: [7n],
+        dryRun: false,
+      },
       'success',
     )
     await bot.runCycle('c1')
     await bot.runCycle('c2')
-    expect(publicClient.waitForTransactionReceipt).toHaveBeenCalledWith({
-      hash: '0x01',
-      timeout: CONFIG.TX_RECEIPT_TIMEOUT_MS,
-    })
-    expect(trackedIdsOnCall(1)).toEqual(new Set([8n]))
+    expect(publicClient.waitForTransactionReceipt).not.toHaveBeenCalled()
+    expect(vi.mocked(computeHedgePlan).mock.calls[1][0].hedgePositions).toEqual([
+      positionsOnChain[1],
+    ])
   })
 })

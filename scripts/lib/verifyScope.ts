@@ -5,6 +5,7 @@ import { encodeFunctionData, toFunctionSelector } from 'viem'
 
 import { MAX_TICK, MIN_TICK } from '../../src/constants/ticks'
 import { rolesModifierV2Abi } from '../../src/safe/rolesAbi'
+import { sanitizeError } from '../../src/utils/sanitize'
 
 /**
  * Automate runbook Step 0 — the load-bearing security assertion: with the bot
@@ -178,7 +179,7 @@ export async function verifyLoanOnlyScope(params: VerifyScopeParams): Promise<vo
     throw new Error(
       'Scope check inconclusive: the option dispatch reverted, but NOT with a Roles ' +
         'ConditionViolation — it may have passed the scope gate and reverted downstream. ' +
-        `Do NOT trust this deployment. Revert: ${optionErr instanceof Error ? optionErr.message : String(optionErr)}`,
+        `Do NOT trust this deployment. Revert: ${sanitizeError(optionErr)}`,
     )
   }
   log('  ✓ option dispatch was blocked by the Roles modifier (ConditionViolation)')

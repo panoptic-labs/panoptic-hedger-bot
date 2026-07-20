@@ -21,12 +21,20 @@ build/
 bot-keystore.json
 *.keystore.json
 
-# Interrupted-onboard resume state — may hold the plaintext bot key + Telegram token
+# Interrupted-onboard resume state (sensitive even when encrypted)
 deploy-state.json
 
 # Per-machine runtime heartbeat + live-trading activation marker
 .hedger-runtime.json
 .hedger-activated.json
+.hedger-journal.json
+.hedger-disabled.json
+.hedger-instance.lock
+bot-keystore-passphrase
+
+# Private operator recovery notes are never publication inputs. Keep them
+# outside the repository; this ignore is immediate local containment only.
+/RECOVERY.md
 
 # Logs
 logs/

@@ -12,9 +12,13 @@
 #   docker build -t hedger-bot .
 # Run:
 #   docker run --env-file .env hedger-bot
+# When using docker-compose.standalone.yml, both local secret source files must
+# be owned by uid 1000 and mode 0600; Compose ignores uid/gid/mode overrides for
+# file-backed secrets.
 # ============================================================================
 
-FROM node:22-alpine AS base
+ARG NODE_IMAGE=node:22-alpine@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2
+FROM ${NODE_IMAGE} AS base
 
 # Corepack resolves the pinned pnpm version from package.json's packageManager.
 RUN corepack enable
@@ -31,16 +35,36 @@ RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store \
     pnpm install --frozen-lockfile
 
 # -----------------------------------------------------------------------------
-# Production image: layer the source over the installed node_modules.
-# (.dockerignore keeps node_modules/.env/keys out of the COPY.)
+# Production image: copy only executable source/configuration.
 # -----------------------------------------------------------------------------
-FROM deps AS runner
+FROM deps AS builder
 
-COPY . .
+COPY src ./src
+COPY scripts ./scripts
+COPY tsconfig.json tsconfig.build.json ./
+RUN pnpm build:runtime && pnpm deploy --legacy --prod /opt/hedger
 
-# Drop root before running the bot. The `node` user ships with the base image.
+FROM ${NODE_IMAGE} AS runner
+
+ARG SOURCE_SHA
+ARG BUILD_VERSION=0.1.0-rc.1
+LABEL org.opencontainers.image.revision=$SOURCE_SHA \
+      org.opencontainers.image.version=$BUILD_VERSION
+RUN printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'
+
+ENV NODE_ENV=production \
+    HEDGER_BUILD_ID=$SOURCE_SHA \
+    HEDGER_STATE_DIR=/var/lib/hedger \
+    BOT_KEYSTORE_PATH=/run/secrets/bot-keystore \
+    BOT_KEYSTORE_PASSPHRASE_FILE=/run/secrets/bot-keystore-passphrase
+
+COPY --from=builder --chown=node:node /opt/hedger /opt/hedger
+COPY --from=builder --chown=node:node /app/dist /opt/hedger/dist
+RUN mkdir -p /var/lib/hedger && chown node:node /var/lib/hedger
+
+WORKDIR /opt/hedger
 USER node
-
-# TODO: instead of running with tsx, bundle and run the compiled main.js
-ENTRYPOINT ["pnpm", "start"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+  CMD ["node", "dist/scripts/health.js"]
+ENTRYPOINT ["node", "dist/src/main.js"]
 CMD []

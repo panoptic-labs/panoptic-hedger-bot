@@ -1,5 +1,6 @@
 import type { Account, Chain, PublicClient, Transport, WalletClient } from 'viem'
 
+import { assertBotIsNotSafeOwner, readSafeOwners } from '../../src/security/safeOwnerInvariant'
 import { type ConfigureCall, buildConfigureCalls, deployRolesModifier } from './deployCore'
 import type { Prompter } from './prompts'
 import type { SafeZodiacAddresses } from './safeZodiacRegistry'
@@ -26,26 +27,9 @@ const safeReadAbi = [
     inputs: [{ name: 'module', type: 'address' }],
     outputs: [{ type: 'bool' }],
   },
-  {
-    type: 'function',
-    name: 'getOwners',
-    stateMutability: 'view',
-    inputs: [],
-    outputs: [{ type: 'address[]' }],
-  },
 ] as const
 
-/** Read the Safe's current owners (throws if `safe` is not a Safe). */
-export async function readSafeOwners(
-  publicClient: PublicClient,
-  safe: `0x${string}`,
-): Promise<readonly `0x${string}`[]> {
-  return (await publicClient.readContract({
-    address: safe,
-    abi: safeReadAbi,
-    functionName: 'getOwners',
-  })) as readonly `0x${string}`[]
-}
+export { readSafeOwners }
 
 export async function isModuleEnabled(
   publicClient: PublicClient,
@@ -145,18 +129,20 @@ export async function configureExistingSafe(
   const { publicClient, walletClient, prompter, addresses, safeAddress } = params
   const log = params.log ?? console.log
 
+  await assertBotIsNotSafeOwner(publicClient, safeAddress, params.botAddress)
+
   // 1. Ensure a Roles modifier exists (bot deploys it; owner/avatar/target = Safe).
   let rolesModifierAddress = params.rolesModifierAddress
   if (!rolesModifierAddress) {
     log('→ deploying a Roles v2 modifier for your Safe (bot pays gas)…')
-    rolesModifierAddress = await deployRolesModifier({
+    ;({ rolesModifierAddress } = await deployRolesModifier({
       publicClient,
       walletClient,
       addresses,
       safeAddress,
       saltNonce: params.saltNonce,
       log,
-    })
+    }))
     log(`  Roles modifier: ${rolesModifierAddress}`)
     await params.onModifierDeployed?.(rolesModifierAddress)
   }
@@ -200,6 +186,7 @@ export async function configureExistingSafe(
       '  Press Enter once you have executed the transaction(s) in the Safe (I will re-check)',
     )
     if (await scopeReady(publicClient, readyArgs)) {
+      await assertBotIsNotSafeOwner(publicClient, safeAddress, params.botAddress)
       log('  ✓ detected on-chain: module enabled + loan-only scope live.')
       return { safeAddress, rolesModifierAddress }
     }

@@ -14,13 +14,21 @@ import {
 } from './stateFile'
 
 const base: RuntimeState = {
+  schemaVersion: 2,
+  instanceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
   pid: process.pid,
+  signer: '0x00000000000000000000000000000000000000cc',
   version: '1.2.3',
   startedAt: '2026-01-01T00:00:00Z',
+  updatedAt: '2026-01-01T00:00:00Z',
   dryRun: true,
   chainId: 1,
   safe: '0x00000000000000000000000000000000000000aa',
   pool: '0x00000000000000000000000000000000000000bb',
+  pollIntervalMs: 60_000,
+  lifecycle: 'starting',
+  ready: false,
+  initAttempts: 0,
 }
 
 describe('runtime state file', () => {
@@ -38,18 +46,22 @@ describe('runtime state file', () => {
     expect(readRuntimeState()).toEqual(base)
   })
 
-  it('patch merges into existing state and no-ops when none exists', () => {
-    patchRuntimeState({ lastPollTrigger: 'poll' }) // no file yet → no-op
-    expect(readRuntimeState()).toBeNull()
+  it('merges into existing state and throws when no state exists', () => {
+    expect(() => patchRuntimeState(base.instanceId, { lastPollTrigger: 'poll' })).toThrow(
+      /missing or invalid/,
+    )
     writeRuntimeState(base)
-    patchRuntimeState({ lastPollAt: '2026-01-01T00:01:00Z', lastPollTrigger: 'poll' })
+    patchRuntimeState(base.instanceId, {
+      lastPollAt: '2026-01-01T00:01:00Z',
+      lastPollTrigger: 'poll',
+    })
     expect(readRuntimeState()?.lastPollTrigger).toBe('poll')
     expect(readRuntimeState()?.version).toBe('1.2.3')
   })
 
   it('clear removes the file', () => {
     writeRuntimeState(base)
-    clearRuntimeState()
+    clearRuntimeState(base.instanceId)
     expect(readRuntimeState()).toBeNull()
   })
 })
@@ -82,8 +94,8 @@ describe('computeRunning', () => {
     expect(r.stalled).toBe(true)
   })
 
-  it('running (first poll pending) when alive with no lastPollAt', () => {
+  it('stalled when first poll never completes within the startup window', () => {
     const r = computeRunning({ ...base }, 60_000, nowMs)
-    expect(r.running).toBe(true)
+    expect(r.stalled).toBe(true)
   })
 })

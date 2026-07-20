@@ -4,15 +4,10 @@ import { describe, expect, it } from 'vitest'
 import { loanWidthFieldsMask } from './loanTokenIdMask'
 import {
   type ConditionFlat,
-  addressEqualCompValue,
-  buildDepositConditions,
   buildLoanOnlyDispatchConditions,
-  buildWithdrawConditions,
   Operator,
   ParameterType,
 } from './rolesScope'
-
-const SAFE = '0x1111111111111111111111111111111111111111' as const
 
 // ---------------------------------------------------------------------------
 // Replica of Roles v2 PermissionChecker._bitmask (zodiac-modifier-roles
@@ -136,12 +131,6 @@ describe('rolesScope — Roles v2 encoding correctness', () => {
 })
 
 describe('rolesScope', () => {
-  it('encodes an address as a 32-byte left-padded EqualTo compValue', () => {
-    const cv = addressEqualCompValue(SAFE)
-    expect(cv).toBe(`0x${'0'.repeat(24)}${SAFE.slice(2)}`)
-    expect(cv).toMatch(/^0x[0-9a-f]{64}$/)
-  })
-
   it('loan dispatch scope: bitmask on positionIdList elements, finalPositionIdList passes', () => {
     const c = buildLoanOnlyDispatchConditions()
     expect(c[1].operator).toBe(Operator.ArrayEvery) // positionIdList
@@ -150,23 +139,5 @@ describe('rolesScope', () => {
     expect(c[2].paramType).toBe(ParameterType.Array)
     // The element constraint lives under the ArrayEvery subtree as Bitmask node(s).
     expect(c.some((n) => n.operator === Operator.Bitmask)).toBe(true)
-  })
-
-  it('withdraw scope pins receiver and owner to the Safe', () => {
-    const c = buildWithdrawConditions(SAFE)
-    const safeEq = addressEqualCompValue(SAFE)
-    expect(c[1].operator).toBe(Operator.Pass) // assets
-    expect(c[2]).toMatchObject({ operator: Operator.EqualTo, compValue: safeEq }) // receiver
-    expect(c[3]).toMatchObject({ operator: Operator.EqualTo, compValue: safeEq }) // owner
-    expect(c[2].paramType).toBe(ParameterType.Static)
-  })
-
-  it('deposit scope pins receiver to the Safe', () => {
-    const c = buildDepositConditions(SAFE)
-    expect(c[1].operator).toBe(Operator.Pass) // assets
-    expect(c[2]).toMatchObject({
-      operator: Operator.EqualTo,
-      compValue: addressEqualCompValue(SAFE),
-    })
   })
 })

@@ -20,6 +20,7 @@ export interface EnvValues {
   // Hedging parameters
   ASSET_INDEX: 0 | 1
   DELTA_THRESHOLD_BPS?: number
+  DELTA_OFFSET_BPS?: number
   MAX_HEDGE_SLOTS?: number
   SLIPPAGE_BPS?: number
   // Price signal
@@ -85,6 +86,7 @@ export function renderEnvFile(values: EnvValues): string {
       lines: [
         { key: 'ASSET_INDEX', value: values.ASSET_INDEX },
         { key: 'DELTA_THRESHOLD_BPS', value: values.DELTA_THRESHOLD_BPS },
+        { key: 'DELTA_OFFSET_BPS', value: values.DELTA_OFFSET_BPS },
         { key: 'MAX_HEDGE_SLOTS', value: values.MAX_HEDGE_SLOTS },
         { key: 'SLIPPAGE_BPS', value: values.SLIPPAGE_BPS },
       ],
@@ -94,7 +96,7 @@ export function renderEnvFile(values: EnvValues): string {
       lines: [{ key: 'PRICE_SIGNAL_SOURCE', value: values.PRICE_SIGNAL_SOURCE }],
     },
     {
-      heading: 'Hedge venue: in-pool | cross-pool-uniswap',
+      heading: 'Hedge venue: in-pool',
       lines: [{ key: 'HEDGE_VENUE', value: values.HEDGE_VENUE }],
     },
     {

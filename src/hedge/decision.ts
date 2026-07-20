@@ -1,21 +1,15 @@
-import {
-  getAccountCollateral,
-  getCollateralAddresses,
-  getPool,
-  tickToSqrtPriceX96,
-} from '@panoptic-eng/sdk/v2'
-import type { Address, PublicClient } from 'viem'
+import { tickToSqrtPriceX96, toVaultFrameAtTick } from '@panoptic-eng/sdk/v2'
 
 import type { HedgeAction, HedgeIntent } from '../executor/types'
-import { asSdkClient } from '../utils/sdkClient'
 import {
+  type PortfolioDeltaBreakdown,
   type PositionSnapshot,
   buildUniqueLoan,
-  computePortfolioDelta,
+  computePortfolioDeltaDetailed,
   computePortfolioSizeInVaultAsset,
   toVaultFrameAtSqrtPriceX96,
-  toVaultFrameAtTick,
 } from './frame'
+import type { HedgeSnapshot } from './snapshot'
 
 /** A hedge loan position reduced to the fields the planner needs. `size` is a positive magnitude in vault-asset units. */
 export interface HedgeItem {
@@ -28,6 +22,9 @@ export interface HedgeItem {
 export interface PlanHedgeConfig {
   assetIndex: 0n | 1n
   deltaThresholdBps: bigint
+  // Signed target net delta the bot hedges toward, as bps of portfolio size
+  // (0 = neutral). The book is driven to `netDelta === targetDelta`, not 0.
+  deltaOffsetBps: bigint
   absoluteMaxHedgeCount: number
 }
 
@@ -73,14 +70,19 @@ export function planHedge(
   cfg: PlanHedgeConfig,
 ): PlanHedgeResult {
   const H = H_long - H_short
-  const Hstar = H - netDelta
   // Drift is measured against the option book normally; when all options are
   // closed but a hedge loan remains, fall back to the gross hedge book so a
-  // standalone hedge still gets unwound toward H* (delta-neutral) instead of
-  // being stranded with no trigger able to fire.
+  // standalone hedge still gets unwound toward H* instead of being stranded
+  // with no trigger able to fire.
   const hedgeGross = H_short + H_long
   const sizeBasis = portfolioSize > 0n ? portfolioSize : hedgeGross
-  const driftBps = sizeBasis > 0n ? (abs(netDelta) * 10_000n) / sizeBasis : 0n
+  // The bias shifts the target delta the book is driven to. `effectiveDelta` is
+  // the delta we actually neutralize; with deltaOffsetBps=0 it equals netDelta,
+  // so H* and drift reduce to the delta-neutral case unchanged.
+  const targetDelta = (sizeBasis * cfg.deltaOffsetBps) / 10_000n
+  const effectiveDelta = netDelta - targetDelta
+  const Hstar = H - effectiveDelta
+  const driftBps = sizeBasis > 0n ? (abs(effectiveDelta) * 10_000n) / sizeBasis : 0n
 
   const drift = driftBps > cfg.deltaThresholdBps
   const overCap = hedges.length > cfg.absoluteMaxHedgeCount
@@ -221,14 +223,13 @@ export function planHedge(
 // ---------------------------------------------------------------------------
 
 export interface ComputeHedgePlanDeps {
-  publicClient: PublicClient
-  poolAddress: Address
-  chainId: bigint
-  safeAddress: Address
-  /** Tick at which to mark deltas (from the price signal source). */
+  pool: HedgeSnapshot['pool']
+  collateral: HedgeSnapshot['collateral']
+  /** Reference tick used to choose a collision-free loan strike. */
   signalTick: bigint
   assetIndex: 0n | 1n
   deltaThresholdBps: bigint
+  deltaOffsetBps: bigint
   absoluteMaxHedgeCount: number
   slippageBps: bigint
   /** Open positions held by the Safe (from positionReader). */
@@ -237,10 +238,38 @@ export interface ComputeHedgePlanDeps {
   hedgePositions: PositionSnapshot[]
 }
 
+/** Itemized inputs to the delta calculation, for `inspect:hedge` / debugging. */
+export interface HedgeDeltaBreakdown {
+  /** Tick used to mark position/collateral deltas (median oracle / signal). */
+  signalTick: bigint
+  /** Live pool spot tick (used for swap tick limits, not delta marking). */
+  poolCurrentTick: bigint
+  assetIndex: 0n | 1n
+  /** Per-position, per-leg delta contributions (vault-asset frame). */
+  portfolio: PortfolioDeltaBreakdown
+  /** Σ portfolio.total — delta of ALL open positions incl. hedge loans. */
+  positionsDelta: bigint
+  /** Raw CT collateral assets on each side (smallest units). */
+  collateralToken0Assets: bigint
+  collateralToken1Assets: bigint
+  /** Asset-side collateral in the vault frame (the delta it adds). */
+  collateralDelta: bigint
+  /** positionsDelta + collateralDelta — the "true total" drift is measured on. */
+  netDelta: bigint
+  /** Hedge-book decomposition (vault-asset frame magnitudes). */
+  hedges: HedgeItem[]
+  H_short: bigint
+  H_long: bigint
+  /** H_long − H_short. */
+  H: bigint
+  portfolioSize: bigint
+}
+
 export interface HedgePlan extends PlanHedgeResult {
   intent: HedgeIntent
   netDelta: bigint
   portfolioSize: bigint
+  breakdown: HedgeDeltaBreakdown
 }
 
 /**
@@ -248,34 +277,26 @@ export interface HedgePlan extends PlanHedgeResult {
  * The caller supplies the already-read positions (so position discovery and
  * hedge classification live in positionReader).
  */
-export async function computeHedgePlan(deps: ComputeHedgePlanDeps): Promise<HedgePlan> {
-  const { publicClient, poolAddress, chainId, safeAddress, signalTick, assetIndex } = deps
-
-  const pool = await getPool({
-    client: asSdkClient<typeof getPool>(publicClient),
-    poolAddress,
-    chainId,
-  })
+export function computeHedgePlan(deps: ComputeHedgePlanDeps): HedgePlan {
+  const { pool, collateral, signalTick, assetIndex } = deps
   const tickSpacing = BigInt(pool.poolKey.tickSpacing)
   const poolId = pool.poolId
   const openIds = deps.positions.map((p) => p.tokenId)
-
-  const collateral = await getAccountCollateral({
-    client: asSdkClient<typeof getAccountCollateral>(publicClient),
-    poolAddress,
-    account: safeAddress,
-    collateralAddresses: getCollateralAddresses(pool),
-  })
+  const markTick = pool.currentTick
   const collateralAssetSide =
     assetIndex === 0n ? collateral.token0.assets : collateral.token1.assets
-  const collateralDelta = toVaultFrameAtTick(
-    collateralAssetSide,
-    assetIndex,
-    assetIndex,
-    signalTick,
-  )
+  // Delta is taken with respect to the vault asset, so the opposite collateral
+  // balance is numeraire. The selected balance is already in the vault asset
+  // frame; this identity conversion is therefore independent of markTick.
+  const collateralDelta = toVaultFrameAtTick(collateralAssetSide, assetIndex, assetIndex, markTick)
 
-  const positionsDelta = computePortfolioDelta(deps.positions, signalTick, tickSpacing, assetIndex)
+  const portfolioDelta = computePortfolioDeltaDetailed(
+    deps.positions,
+    markTick,
+    tickSpacing,
+    assetIndex,
+  )
+  const positionsDelta = portfolioDelta.total
   const netDelta = positionsDelta + collateralDelta
   const portfolioSize = computePortfolioSizeInVaultAsset(deps.positions, assetIndex)
 
@@ -316,6 +337,7 @@ export async function computeHedgePlan(deps: ComputeHedgePlanDeps): Promise<Hedg
   const plan = planHedge(netDelta, H_short, H_long, hedgeItems, portfolioSize, {
     assetIndex,
     deltaThresholdBps: deps.deltaThresholdBps,
+    deltaOffsetBps: deps.deltaOffsetBps,
     absoluteMaxHedgeCount: deps.absoluteMaxHedgeCount,
   })
 
@@ -327,16 +349,18 @@ export async function computeHedgePlan(deps: ComputeHedgePlanDeps): Promise<Hedg
   const roundedStrike = spacingQuotient * tickSpacing
   let openTokenId: bigint | null = null
   let openPositionSize: bigint | null = null
+  let skippedCollidingTokenIds: bigint[] = []
   if (plan.mints.length > 0) {
     const mint = plan.mints[0]
-    const { tokenId, adjustedSize } = buildUniqueLoan(
+    const built = buildUniqueLoan(
       poolId,
       { asset: assetIndex, tokenType: mint.tokenType, strike: roundedStrike },
       openIds,
       mint.size,
     )
-    openTokenId = tokenId
-    openPositionSize = adjustedSize
+    openTokenId = built.tokenId
+    openPositionSize = built.adjustedSize
+    skippedCollidingTokenIds = built.skippedCollidingTokenIds
   }
 
   const intent: HedgeIntent = {
@@ -346,9 +370,28 @@ export async function computeHedgePlan(deps: ComputeHedgePlanDeps): Promise<Hedg
     swapAtMint: plan.swapAtMint,
     closeTokenIds: plan.burns,
     existingPositionIds: openIds,
-    currentTick: signalTick,
+    skippedCollidingTokenIds,
+    // Execution limits are evaluated against pool spot, not the reference signal.
+    currentTick: pool.currentTick,
     slippageBps: deps.slippageBps,
   }
 
-  return { ...plan, intent, netDelta, portfolioSize }
+  const breakdown: HedgeDeltaBreakdown = {
+    signalTick,
+    poolCurrentTick: pool.currentTick,
+    assetIndex,
+    portfolio: portfolioDelta,
+    positionsDelta,
+    collateralToken0Assets: collateral.token0.assets,
+    collateralToken1Assets: collateral.token1.assets,
+    collateralDelta,
+    netDelta,
+    hedges: hedgeItems,
+    H_short,
+    H_long,
+    H: H_long - H_short,
+    portfolioSize,
+  }
+
+  return { ...plan, intent, netDelta, portfolioSize, breakdown }
 }

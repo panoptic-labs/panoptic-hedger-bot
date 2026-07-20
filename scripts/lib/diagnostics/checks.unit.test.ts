@@ -1,19 +1,44 @@
-import { privateKeyToAccount } from 'viem/accounts'
+import { createPublicClient, custom } from 'viem'
+import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import { describe, expect, it } from 'vitest'
 
-import type { HedgerBotConfig } from '../../../src/config'
+import { parseHedgerBotConfig } from '../../../src/config'
+import { defineBotChain } from '../../../src/utils/chain'
 import { runDoctorChecks } from './checks'
 import type { DiagnosticsContext } from './context'
 
-const account = privateKeyToAccount(`0x${'11'.repeat(32)}`)
+const account = privateKeyToAccount(generatePrivateKey())
+const config = parseHedgerBotConfig({
+  CHAIN_ID: '1',
+  RPC_URL: 'https://synthetic.invalid',
+  POOL_ADDRESS: '0x1111111111111111111111111111111111111111',
+  SAFE_ADDRESS: '0x2222222222222222222222222222222222222222',
+  ROLES_MODIFIER_ADDRESS: '0x3333333333333333333333333333333333333333',
+  ROLE_KEY: `0x${'44'.repeat(32)}`,
+  BOT_PRIVATE_KEY: generatePrivateKey(),
+  ASSET_INDEX: '1',
+  DRY_RUN: 'true',
+})
+const chain = defineBotChain(config.CHAIN_ID, config.RPC_URL)
+
+function client(chainId: number | Error) {
+  return createPublicClient({
+    chain,
+    transport: custom({
+      request: async ({ method }) => {
+        if (method !== 'eth_chainId') throw new Error(`unexpected method ${method}`)
+        if (chainId instanceof Error) throw chainId
+        return `0x${chainId.toString(16)}`
+      },
+    }),
+  })
+}
 
 function ctx(over: Partial<DiagnosticsContext>): DiagnosticsContext {
   return {
-    config: { CHAIN_ID: 1 } as unknown as HedgerBotConfig,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    chain: {} as any,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    publicClient: {} as any,
+    config,
+    chain,
+    publicClient: client(new Error('unconfigured test client')),
     ...over,
   }
 }
@@ -23,9 +48,8 @@ const byId = (rs: { id: string; status: string }[], id: string) => rs.find((r) =
 describe('runDoctorChecks (offline short-circuit)', () => {
   it('fails RPC + key and skips on-chain checks when the RPC is unreachable', async () => {
     const results = await runDoctorChecks(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       ctx({
-        publicClient: { getChainId: async () => Promise.reject(new Error('boom')) } as any,
+        publicClient: client(new Error('boom')),
         accountError: new Error('no key'),
       }),
     )
@@ -37,10 +61,7 @@ describe('runDoctorChecks (offline short-circuit)', () => {
   })
 
   it('fails RPC on a chain-id mismatch but passes the key check when the account resolved', async () => {
-    const results = await runDoctorChecks(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      ctx({ publicClient: { getChainId: async () => 8453 } as any, account }),
-    )
+    const results = await runDoctorChecks(ctx({ publicClient: client(8453), account }))
     expect(byId(results, 'rpc')?.status).toBe('fail')
     expect(byId(results, 'key')?.status).toBe('pass')
     expect(byId(results, 'contracts')?.status).toBe('skip')

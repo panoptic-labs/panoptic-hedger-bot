@@ -1,44 +1,177 @@
-import { readFileSync, unlinkSync, writeFileSync } from 'node:fs'
-import path from 'node:path'
+import { unlinkSync } from 'node:fs'
+
+import type { Address, Hex, PublicClient } from 'viem'
+import { getAddress, keccak256, toHex } from 'viem'
+import { z } from 'zod'
 
 import type { HedgerBotConfig } from '../config'
+import {
+  assertProductionEligibleConfig,
+  isProductionEligibleConfig,
+  PRODUCTION_ROLE_POLICY,
+} from '../security/productionProfile'
+import { runtimeDataPath } from './paths'
+import { readSecureJson, writeSecureJson } from './secureFile'
 import { botVersion } from './stateFile'
 
-/**
- * Live-trading activation marker. `pnpm start` runs live ONLY when a valid
- * marker exists; otherwise it forces dry-run regardless of DRY_RUN. `pnpm
- * activate` writes the marker after a passing preflight, making "go live" a
- * deliberate, auditable step separate from the DRY_RUN toggle.
- *
- * The marker is pinned to the Safe/pool/chain it was created for, so pointing
- * the bot at a different deployment (a new `.env`) invalidates it and the bot
- * falls back to dry-run until re-activated.
- */
+const ACTIVATION_SCHEMA_VERSION = 2 as const
+export const ACTIVATION_POLICY_VERSION = 'hedger-bot-policy-v3' as const
+const MAX_ACTIVATION_BYTES = 16 * 1024
+const REVIEWED_LOAN_ROLE_TREE_HASH =
+  '0x82a2514e569a1aa6aa09d62c2d3018e4977709e6ddb098d08a1bc3f87797785d' as const
 
-export interface ActivationMarker {
-  activatedAt: string
-  version: string
-  chainId: number
-  safe: `0x${string}`
-  pool: `0x${string}`
-  /** Whether preflight (`doctor`) passed at activation time — recorded for audit. */
-  doctorPassed: boolean
+const hex32Schema = z.string().regex(/^0x[0-9a-f]{64}$/)
+const addressSchema = z.string().regex(/^0x[0-9a-f]{40}$/)
+
+const activationMarkerSchema = z
+  .object({
+    schemaVersion: z.literal(ACTIVATION_SCHEMA_VERSION),
+    policyVersion: z.literal(ACTIVATION_POLICY_VERSION),
+    releaseVersion: z.string().min(1).max(128),
+    activatedAt: z.string().datetime(),
+    doctorPassed: z.literal(true),
+    botAddress: addressSchema,
+    safeAddress: addressSchema,
+    poolAddress: addressSchema,
+    policyFingerprint: hex32Schema,
+    codeIdentityFingerprint: hex32Schema,
+    permissionManifestFingerprint: hex32Schema,
+  })
+  .strict()
+
+export type ActivationMarker = z.infer<typeof activationMarkerSchema>
+
+export interface ActivationEvidence {
+  codeIdentityFingerprint: Hex
+  permissionManifestFingerprint: Hex
 }
 
-export function activationPath(): string {
-  return process.env.HEDGER_ACTIVATED_PATH ?? path.resolve(process.cwd(), '.hedger-activated.json')
+function canonicalAddress(address: Address): Address {
+  return getAddress(address).toLowerCase() as Address
 }
 
-export function readActivation(): ActivationMarker | null {
-  try {
-    return JSON.parse(readFileSync(activationPath(), 'utf8')) as ActivationMarker
-  } catch {
-    return null
+function hashCanonical(value: unknown): Hex {
+  return keccak256(toHex(JSON.stringify(value)))
+}
+
+/** The exact reviewed permission policy accepted for this release candidate. */
+export function expectedPermissionManifestFingerprint(): Hex {
+  return hashCanonical({
+    version: 2,
+    loanRoleTree: REVIEWED_LOAN_ROLE_TREE_HASH,
+    rolePolicy: PRODUCTION_ROLE_POLICY,
+    routerPermissions: 'none',
+    loanBounds: 'not-enforced-operator-deferred-phase-2.4',
+  })
+}
+
+function codeIdentityAddresses(config: HedgerBotConfig): readonly [string, Address][] {
+  const entries: [string, Address | undefined][] = [
+    ['safe', config.SAFE_ADDRESS],
+    ['pool', config.POOL_ADDRESS],
+    ['rolesModifier', config.ROLES_MODIFIER_ADDRESS],
+    ['uniswapV3SignalPool', config.UNISWAP_SIGNAL_POOL_ADDRESS],
+    ['uniswapV4StateView', config.UNISWAP_SIGNAL_STATE_VIEW_ADDRESS],
+  ]
+  return entries.flatMap(([name, address]) => (address ? [[name, address]] : []))
+}
+
+/** Bind activation to the actual runtime bytecode at every configured contract identity. */
+export async function readCodeIdentityFingerprint(
+  publicClient: PublicClient,
+  config: HedgerBotConfig,
+): Promise<Hex> {
+  const identities = await Promise.all(
+    codeIdentityAddresses(config).map(async ([name, address]) => {
+      const code = await publicClient.getCode({ address })
+      if (!code || code === '0x') throw new Error(`no bytecode at configured ${name} ${address}`)
+      return [name, canonicalAddress(address), keccak256(code)] as const
+    }),
+  )
+  return hashCanonical(identities)
+}
+
+export async function buildActivationEvidence(
+  publicClient: PublicClient,
+  config: HedgerBotConfig,
+): Promise<ActivationEvidence> {
+  return {
+    codeIdentityFingerprint: await readCodeIdentityFingerprint(publicClient, config),
+    permissionManifestFingerprint: expectedPermissionManifestFingerprint(),
   }
 }
 
+/** Canonical, secret-free policy input whose hash controls live eligibility. */
+export function buildActivationPolicy(
+  config: HedgerBotConfig,
+  botAddress: Address,
+  evidence: ActivationEvidence,
+): unknown {
+  return {
+    policyVersion: ACTIVATION_POLICY_VERSION,
+    releaseVersion: botVersion(),
+    chainId: config.CHAIN_ID,
+    rpcUrl: config.RPC_URL,
+    botAddress: canonicalAddress(botAddress),
+    safeAddress: canonicalAddress(config.SAFE_ADDRESS),
+    poolAddress: canonicalAddress(config.POOL_ADDRESS),
+    rolesModifierAddress: canonicalAddress(config.ROLES_MODIFIER_ADDRESS),
+    roleKey: config.ROLE_KEY.toLowerCase(),
+    supportedProfile: 'ethereum-mainnet-single-safe-single-pool',
+    hedgeVenue: config.HEDGE_VENUE,
+    assetIndex: config.ASSET_INDEX.toString(),
+    deltaThresholdBps: config.DELTA_THRESHOLD_BPS.toString(),
+    maxHedgeSlots: config.MAX_HEDGE_SLOTS,
+    slippageBps: config.SLIPPAGE_BPS,
+    minMarginReserveBps: config.MIN_MARGIN_RESERVE_BPS.toString(),
+    builderCode: config.PANOPTIC_BUILDER_CODE ?? null,
+    signal: {
+      source: config.PRICE_SIGNAL_SOURCE,
+      sanityMax: config.SIGNAL_TICK_SANITY_MAX,
+      maxBlockAgeSeconds: config.MAX_SIGNAL_BLOCK_AGE_SECONDS,
+      cexSymbol: config.CEX_SYMBOL,
+      cexStaleMs: config.CEX_STALE_MS,
+      cexMinFeeds: config.CEX_MIN_FEEDS,
+      uniswapVersion: config.UNISWAP_SIGNAL_POOL_VERSION,
+      uniswapPool: config.UNISWAP_SIGNAL_POOL_ADDRESS
+        ? canonicalAddress(config.UNISWAP_SIGNAL_POOL_ADDRESS)
+        : null,
+      uniswapStateView: config.UNISWAP_SIGNAL_STATE_VIEW_ADDRESS
+        ? canonicalAddress(config.UNISWAP_SIGNAL_STATE_VIEW_ADDRESS)
+        : null,
+      uniswapPoolId: config.UNISWAP_SIGNAL_POOL_ID?.toLowerCase() ?? null,
+    },
+    gasPolicy: {
+      maxFeeGwei: config.MAX_FEE_GWEI.toString(),
+      maxPriorityFeeGwei: config.MAX_PRIORITY_FEE_GWEI.toString(),
+      urgentPriorityFeeGwei: config.URGENT_PRIORITY_FEE_GWEI.toString(),
+      hedgeMaxBaseFeeGwei: config.HEDGE_MAX_BASE_FEE_GWEI.toString(),
+      urgentMaxBaseFeeGwei: config.URGENT_MAX_BASE_FEE_GWEI.toString(),
+      urgentDriftMultiplier: config.URGENT_DRIFT_MULTIPLIER,
+      minKeeperBalanceEth: config.MIN_KEEPER_BALANCE_ETH.toString(),
+      keeperBalanceWarnEth: config.KEEPER_BALANCE_WARN_ETH.toString(),
+      receiptTimeoutMs: config.TX_RECEIPT_TIMEOUT_MS,
+      bumpIntervalMs: config.TX_BUMP_INTERVAL_MS,
+    },
+    pollIntervalMs: config.POLL_INTERVAL_MS,
+    codeIdentityFingerprint: evidence.codeIdentityFingerprint,
+    permissionManifestFingerprint: evidence.permissionManifestFingerprint,
+  }
+}
+
+export function activationPath(): string {
+  return process.env.HEDGER_ACTIVATED_PATH ?? runtimeDataPath('.hedger-activated.json')
+}
+
+export function readActivation(): ActivationMarker | null {
+  return readSecureJson(activationPath(), activationMarkerSchema, {
+    maxBytes: MAX_ACTIVATION_BYTES,
+    invalid: 'null',
+  })
+}
+
 export function writeActivation(marker: ActivationMarker): void {
-  writeFileSync(activationPath(), `${JSON.stringify(marker, null, 2)}\n`, { mode: 0o600 })
+  writeSecureJson(activationPath(), activationMarkerSchema, marker)
 }
 
 export function clearActivation(): void {
@@ -49,32 +182,43 @@ export function clearActivation(): void {
   }
 }
 
-/** Build a marker for the current config (call after a passing preflight). */
 export function buildActivationMarker(
   config: HedgerBotConfig,
-  doctorPassed: boolean,
+  botAddress: Address,
+  evidence: ActivationEvidence,
+  doctorPassed: true,
   activatedAt: string,
 ): ActivationMarker {
+  assertProductionEligibleConfig(config)
   return {
+    schemaVersion: ACTIVATION_SCHEMA_VERSION,
+    policyVersion: ACTIVATION_POLICY_VERSION,
+    releaseVersion: botVersion(),
     activatedAt,
-    version: botVersion(),
-    chainId: config.CHAIN_ID,
-    safe: config.SAFE_ADDRESS,
-    pool: config.POOL_ADDRESS,
     doctorPassed,
+    botAddress: canonicalAddress(botAddress),
+    safeAddress: canonicalAddress(config.SAFE_ADDRESS),
+    poolAddress: canonicalAddress(config.POOL_ADDRESS),
+    policyFingerprint: hashCanonical(buildActivationPolicy(config, botAddress, evidence)),
+    codeIdentityFingerprint: evidence.codeIdentityFingerprint,
+    permissionManifestFingerprint: evidence.permissionManifestFingerprint,
   }
 }
 
-/**
- * True when a marker exists AND matches the current Safe/pool/chain. A mismatch
- * (re-onboarded to a different deployment) is treated as NOT activated.
- */
-export function isActivated(config: HedgerBotConfig): boolean {
-  const m = readActivation()
-  if (!m) return false
+export function isActivated(
+  config: HedgerBotConfig,
+  botAddress: Address | undefined,
+  evidence: ActivationEvidence | undefined,
+): boolean {
+  if (!botAddress || !evidence) return false
+  if (!isProductionEligibleConfig(config)) return false
+  const marker = readActivation()
+  if (!marker) return false
+  const expected = buildActivationMarker(config, botAddress, evidence, true, marker.activatedAt)
   return (
-    m.chainId === config.CHAIN_ID &&
-    m.safe.toLowerCase() === config.SAFE_ADDRESS.toLowerCase() &&
-    m.pool.toLowerCase() === config.POOL_ADDRESS.toLowerCase()
+    marker.policyFingerprint === expected.policyFingerprint &&
+    marker.codeIdentityFingerprint === expected.codeIdentityFingerprint &&
+    marker.permissionManifestFingerprint === expected.permissionManifestFingerprint &&
+    marker.releaseVersion === expected.releaseVersion
   )
 }

@@ -1,3 +1,4 @@
+import { parseGwei } from 'viem'
 import { describe, expect, it } from 'vitest'
 
 import { parseHedgerBotConfig } from './config'
@@ -20,7 +21,7 @@ describe('parseHedgerBotConfig', () => {
     expect(cfg.ASSET_INDEX).toBe(1n)
     expect(cfg.DELTA_THRESHOLD_BPS).toBe(200n)
     expect(cfg.MAX_HEDGE_SLOTS).toBe(4)
-    expect(cfg.SLIPPAGE_BPS).toBe(30)
+    expect(cfg.SLIPPAGE_BPS).toBe(100)
     expect(cfg.PRICE_SIGNAL_SOURCE).toBe('pool-tick')
     expect(cfg.POLL_INTERVAL_MS).toBe(60_000)
     expect(cfg.DRY_RUN).toBe(false)
@@ -38,10 +39,63 @@ describe('parseHedgerBotConfig', () => {
     expect(cfg.POLL_INTERVAL_MS).toBe(30_000)
   })
 
+  it('rejects removed cross-pool execution settings', () => {
+    expect(() =>
+      parseHedgerBotConfig({
+        ...BASE_ENV,
+        HEDGE_VENUE: 'cross-pool-uniswap',
+        HEDGE_POOLS: '[]',
+      }),
+    ).toThrow(/HEDGE_VENUE, HEDGE_POOLS: cross-pool execution was removed/)
+    expect(() => parseHedgerBotConfig({ ...BASE_ENV, HEDGE_POOLS: '[]' })).toThrow(
+      /cross-pool execution was removed/,
+    )
+    expect(() => parseHedgerBotConfig({ ...BASE_ENV, HEDGE_VENUE: 'unsupported' })).toThrow(
+      /HEDGE_VENUE/,
+    )
+  })
+
   it('rejects an invalid address', () => {
     expect(() => parseHedgerBotConfig({ ...BASE_ENV, POOL_ADDRESS: '0xnope' })).toThrow(
       /POOL_ADDRESS/,
     )
+  })
+
+  it('accepts lowercase addresses and rejects invalid mixed-case checksums', () => {
+    expect(() => parseHedgerBotConfig({ ...BASE_ENV })).not.toThrow()
+    expect(() =>
+      parseHedgerBotConfig({
+        ...BASE_ENV,
+        POOL_ADDRESS: '0x5AAeb6053F3E94C9b9A09f33669435E7Ef1BeAed',
+      }),
+    ).toThrow(/POOL_ADDRESS/)
+  })
+
+  it('requires encrypted remote RPC transport and forbids embedded credentials', () => {
+    expect(() => parseHedgerBotConfig({ ...BASE_ENV, RPC_URL: 'http://rpc.example' })).toThrow(
+      /RPC_URL/,
+    )
+    expect(() =>
+      parseHedgerBotConfig({
+        ...BASE_ENV,
+        RPC_URL: ['https://user', 'pass@rpc.example'].join(':'),
+      }),
+    ).toThrow(/RPC_URL/)
+    expect(() =>
+      parseHedgerBotConfig({ ...BASE_ENV, RPC_URL: 'http://127.0.0.1:8545' }),
+    ).not.toThrow()
+  })
+
+  it('allows at most one non-interactive keystore passphrase source', () => {
+    expect(() =>
+      parseHedgerBotConfig({
+        ...BASE_ENV,
+        BOT_PRIVATE_KEY: undefined,
+        BOT_KEYSTORE_PATH: './synthetic.keystore.json',
+        BOT_KEYSTORE_PASSPHRASE: 'synthetic',
+        BOT_KEYSTORE_PASSPHRASE_FILE: './synthetic-passphrase',
+      }),
+    ).toThrow(/BOT_KEYSTORE_PASSPHRASE_FILE/)
   })
 
   it('requires UNISWAP_SIGNAL_POOL_ADDRESS when source is uniswap-pool', () => {
@@ -65,6 +119,37 @@ describe('parseHedgerBotConfig', () => {
     expect(cfg.CEX_SYMBOL).toBe('ETH-USD')
   })
 
+  it('defaults the urgent tip floor and bump interval', () => {
+    const cfg = parseHedgerBotConfig({ ...BASE_ENV })
+    expect(cfg.URGENT_PRIORITY_FEE_GWEI).toBe(parseGwei('1'))
+    expect(cfg.TX_BUMP_INTERVAL_MS).toBe(45_000)
+  })
+
+  it('allows the urgent tip floor to exceed the routine tip ceiling', () => {
+    const cfg = parseHedgerBotConfig({
+      ...BASE_ENV,
+      MAX_PRIORITY_FEE_GWEI: '2',
+      URGENT_PRIORITY_FEE_GWEI: '5',
+    })
+    expect(cfg.URGENT_PRIORITY_FEE_GWEI).toBe(parseGwei('5'))
+  })
+
+  it('rejects an urgent tip floor above MAX_FEE_GWEI', () => {
+    expect(() =>
+      parseHedgerBotConfig({ ...BASE_ENV, MAX_FEE_GWEI: '300', URGENT_PRIORITY_FEE_GWEI: '301' }),
+    ).toThrow(/URGENT_PRIORITY_FEE_GWEI/)
+  })
+
+  it('rejects a bump interval longer than the receipt budget', () => {
+    expect(() =>
+      parseHedgerBotConfig({
+        ...BASE_ENV,
+        TX_RECEIPT_TIMEOUT_MS: '60000',
+        TX_BUMP_INTERVAL_MS: '90000',
+      }),
+    ).toThrow(/TX_BUMP_INTERVAL_MS/)
+  })
+
   it('requires TELEGRAM_CHAT_ID when a Telegram token is set', () => {
     expect(() => parseHedgerBotConfig({ ...BASE_ENV, TELEGRAM_BOT_TOKEN: '123:abc' })).toThrow(
       /TELEGRAM_CHAT_ID/,
@@ -79,5 +164,70 @@ describe('parseHedgerBotConfig', () => {
     })
     expect(cfg.TELEGRAM_BOT_TOKEN).toBe('123:abc')
     expect(cfg.TELEGRAM_CHAT_ID).toBe('-100123')
+  })
+
+  it.each([
+    ['SLIPPAGE_BPS', '0', '500', '-1', '501'],
+    ['POLL_INTERVAL_MS', '5000', '300000', '4999', '300001'],
+    ['CEX_STALE_MS', '1000', '60000', '999', '60001'],
+    ['SIGNAL_TICK_SANITY_MAX', '100', '10000', '99', '10001'],
+    ['MAX_HEDGE_SLOTS', '1', '16', '0', '17'],
+    ['DELTA_THRESHOLD_BPS', '1', '5000', '0', '5001'],
+    ['URGENT_DRIFT_MULTIPLIER', '1', '20', '0', '21'],
+    ['MIN_MARGIN_RESERVE_BPS', '500', '9000', '499', '9001'],
+    ['MAX_SIGNAL_BLOCK_AGE_SECONDS', '15', '120', '14', '121'],
+  ])('bounds %s at min/max and rejects adjacent values', (field, min, max, below, above) => {
+    expect(() => parseHedgerBotConfig({ ...BASE_ENV, [field]: min })).not.toThrow()
+    expect(() => parseHedgerBotConfig({ ...BASE_ENV, [field]: max })).not.toThrow()
+    expect(() => parseHedgerBotConfig({ ...BASE_ENV, [field]: below })).toThrow(field)
+    expect(() => parseHedgerBotConfig({ ...BASE_ENV, [field]: above })).toThrow(field)
+  })
+
+  it('bounds receipt timeout with a compatible bump interval', () => {
+    expect(() =>
+      parseHedgerBotConfig({
+        ...BASE_ENV,
+        TX_RECEIPT_TIMEOUT_MS: '30000',
+        TX_BUMP_INTERVAL_MS: '5000',
+      }),
+    ).not.toThrow()
+    expect(() =>
+      parseHedgerBotConfig({ ...BASE_ENV, TX_RECEIPT_TIMEOUT_MS: '900000' }),
+    ).not.toThrow()
+    expect(() => parseHedgerBotConfig({ ...BASE_ENV, TX_RECEIPT_TIMEOUT_MS: '29999' })).toThrow(
+      /TX_RECEIPT_TIMEOUT_MS/,
+    )
+    expect(() => parseHedgerBotConfig({ ...BASE_ENV, TX_RECEIPT_TIMEOUT_MS: '900001' })).toThrow(
+      /TX_RECEIPT_TIMEOUT_MS/,
+    )
+  })
+
+  it.each(['NaN', 'Infinity', '1e3', '1.5', '9007199254740993'])(
+    'rejects unsafe integer syntax/value %s',
+    (value) => {
+      expect(() => parseHedgerBotConfig({ ...BASE_ENV, POLL_INTERVAL_MS: value })).toThrow(
+        /POLL_INTERVAL_MS/,
+      )
+    },
+  )
+
+  it.each(['NaN', 'Infinity', '1e2', '-1'])('rejects unsafe decimal syntax/value %s', (value) => {
+    expect(() => parseHedgerBotConfig({ ...BASE_ENV, MAX_FEE_GWEI: value })).toThrow(/MAX_FEE_GWEI/)
+  })
+
+  it('requires a three-feed quorum for CEX production mode', () => {
+    expect(() =>
+      parseHedgerBotConfig({ ...BASE_ENV, PRICE_SIGNAL_SOURCE: 'cex', CEX_MIN_FEEDS: '2' }),
+    ).toThrow(/CEX_MIN_FEEDS/)
+  })
+
+  it('requires the keeper warning threshold below the target balance', () => {
+    expect(() =>
+      parseHedgerBotConfig({
+        ...BASE_ENV,
+        MIN_KEEPER_BALANCE_ETH: '0.05',
+        KEEPER_BALANCE_WARN_ETH: '0.05',
+      }),
+    ).toThrow(/KEEPER_BALANCE_WARN_ETH/)
   })
 })

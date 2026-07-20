@@ -8,8 +8,9 @@ import {
   timingSafeEqual,
 } from 'node:crypto'
 
-import { type Hex, keccak256 } from 'viem'
+import { type Hex, getAddress, keccak256, toHex } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
+import { z } from 'zod'
 
 /**
  * Web3 Secret Storage v3 (geth-style) passphrase-encrypted keystore for the bot
@@ -21,33 +22,56 @@ import { privateKeyToAccount } from 'viem/accounts'
  * scrypt and pbkdf2.
  */
 
-interface ScryptParams {
-  dklen: number
-  salt: string
-  n: number
-  r: number
-  p: number
+const hex = (bytes: number) => z.string().regex(new RegExp(`^[0-9a-fA-F]{${bytes * 2}}$`))
+const common = {
+  dklen: z.literal(32),
+  salt: hex(32),
 }
-
-interface Pbkdf2Params {
-  dklen: number
-  salt: string
-  c: number
-  prf: string
+const scryptParamsSchema = z
+  .object({
+    ...common,
+    n: z
+      .number()
+      .int()
+      .min(1 << 14)
+      .max(1 << 20)
+      .refine((value) => (value & (value - 1)) === 0, 'scrypt n must be a power of two'),
+    r: z.number().int().min(8).max(16),
+    p: z.number().int().min(1).max(4),
+  })
+  .strict()
+const pbkdf2ParamsSchema = z
+  .object({
+    ...common,
+    c: z.number().int().min(262_144).max(2_000_000),
+    prf: z.literal('hmac-sha256'),
+  })
+  .strict()
+const cryptoCommon = {
+  ciphertext: hex(32),
+  cipherparams: z.object({ iv: hex(16) }).strict(),
+  cipher: z.literal('aes-128-ctr'),
+  mac: hex(32),
 }
+export const keystoreV3Schema = z
+  .object({
+    version: z.literal(3),
+    id: z.string().uuid(),
+    address: hex(20),
+    crypto: z.discriminatedUnion('kdf', [
+      z
+        .object({ ...cryptoCommon, kdf: z.literal('scrypt'), kdfparams: scryptParamsSchema })
+        .strict(),
+      z
+        .object({ ...cryptoCommon, kdf: z.literal('pbkdf2'), kdfparams: pbkdf2ParamsSchema })
+        .strict(),
+    ]),
+  })
+  .strict()
+export type KeystoreV3 = z.infer<typeof keystoreV3Schema>
 
-export interface KeystoreV3 {
-  version: 3
-  id: string
-  address: string
-  crypto: {
-    ciphertext: string
-    cipherparams: { iv: string }
-    cipher: 'aes-128-ctr'
-    kdf: 'scrypt' | 'pbkdf2'
-    kdfparams: ScryptParams | Pbkdf2Params
-    mac: string
-  }
+export function parseKeystoreEnvelope(value: unknown): KeystoreV3 {
+  return keystoreV3Schema.parse(value)
 }
 
 // geth "standard" scrypt cost — strong, ~256MB transient memory.
@@ -62,23 +86,18 @@ const hexToBuf = (hex: string): Buffer => Buffer.from(hex.replace(/^0x/, ''), 'h
 const scryptMaxmem = (n: number, r: number): number => 256 * n * r + 1024 * 1024
 
 /** Derive the 32-byte key from the passphrase per the keystore's kdf params. */
-function deriveKey(passphrase: string, kdf: string, params: ScryptParams | Pbkdf2Params): Buffer {
-  const salt = hexToBuf(params.salt)
-  if (kdf === 'scrypt') {
-    const p = params as ScryptParams
-    return scryptSync(passphrase, salt, p.dklen, {
-      N: p.n,
-      r: p.r,
-      p: p.p,
-      maxmem: scryptMaxmem(p.n, p.r),
+function deriveKey(passphrase: string, crypto: KeystoreV3['crypto']): Buffer {
+  const salt = hexToBuf(crypto.kdfparams.salt)
+  if (crypto.kdf === 'scrypt') {
+    const params = crypto.kdfparams
+    return scryptSync(passphrase, salt, params.dklen, {
+      N: params.n,
+      r: params.r,
+      p: params.p,
+      maxmem: scryptMaxmem(params.n, params.r),
     })
   }
-  if (kdf === 'pbkdf2') {
-    const p = params as Pbkdf2Params
-    if (p.prf !== 'hmac-sha256') throw new Error(`unsupported pbkdf2 prf: ${p.prf}`)
-    return pbkdf2Sync(passphrase, salt, p.c, p.dklen, 'sha256')
-  }
-  throw new Error(`unsupported keystore kdf: ${kdf}`)
+  return pbkdf2Sync(passphrase, salt, crypto.kdfparams.c, crypto.kdfparams.dklen, 'sha256')
 }
 
 /** keccak256 MAC over derivedKey[16:32] ++ ciphertext (Web3 Secret Storage). */
@@ -129,12 +148,11 @@ export function encryptKeystore(privateKey: Hex, passphrase: string): KeystoreV3
 /** Decrypt a v3 keystore, returning the 0x-prefixed private key. Throws on a
  * wrong passphrase or tampered file (MAC mismatch). */
 export function decryptKeystore(keystore: KeystoreV3, passphrase: string): Hex {
-  if (keystore.version !== 3) throw new Error(`unsupported keystore version: ${keystore.version}`)
-  const { crypto } = keystore
-  if (crypto.cipher !== 'aes-128-ctr') throw new Error(`unsupported cipher: ${crypto.cipher}`)
+  const validated = parseKeystoreEnvelope(keystore)
+  const { crypto } = validated
 
   const ciphertext = hexToBuf(crypto.ciphertext)
-  const derivedKey = deriveKey(passphrase, crypto.kdf, crypto.kdfparams)
+  const derivedKey = deriveKey(passphrase, crypto)
 
   const expectedMac = hexToBuf(computeMac(derivedKey, ciphertext))
   const actualMac = hexToBuf(crypto.mac)
@@ -147,6 +165,16 @@ export function decryptKeystore(keystore: KeystoreV3, passphrase: string): Hex {
     derivedKey.subarray(0, 16),
     hexToBuf(crypto.cipherparams.iv),
   )
-  const privateKey = Buffer.concat([decipher.update(ciphertext), decipher.final()])
-  return `0x${privateKey.toString('hex')}`
+  const privateKey = toHex(Buffer.concat([decipher.update(ciphertext), decipher.final()]))
+  const actualAddress = privateKeyToAccount(privateKey).address
+  const envelopeAddress = getAddress(`0x${validated.address}`)
+  if (actualAddress !== envelopeAddress) {
+    throw new Error('keystore address does not match decrypted private key')
+  }
+  return privateKey
+}
+
+/** Only MAC mismatches are eligible for an interactive passphrase retry. */
+export function isKeystorePassphraseMismatch(error: unknown): boolean {
+  return error instanceof Error && error.message.includes('keystore MAC mismatch')
 }

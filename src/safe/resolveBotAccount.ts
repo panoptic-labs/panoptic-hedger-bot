@@ -1,4 +1,3 @@
-import { readFile } from 'node:fs/promises'
 import { createInterface } from 'node:readline/promises'
 import { Writable } from 'node:stream'
 
@@ -6,13 +5,16 @@ import { type Account, type Address, getAddress } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 
 import type { HedgerBotConfig } from '../config'
-import { type KeystoreV3, decryptKeystore } from '../utils/keystore'
+import { readSecureJson, readSecureText } from '../runtime/secureFile'
+import { type KeystoreV3, decryptKeystore, keystoreV3Schema } from '../utils/keystore'
 
 /** Read + parse the configured v3 keystore file. Callers guarantee the path is
  * set; a read/parse failure is rewrapped with the path for a clear message. */
 async function readKeystore(path: string): Promise<KeystoreV3> {
   try {
-    return JSON.parse(await readFile(path, 'utf8')) as KeystoreV3
+    const keystore = readSecureJson(path, keystoreV3Schema, { maxBytes: 16_384, invalid: 'throw' })
+    if (!keystore) throw new Error('keystore does not exist')
+    return keystore
   } catch (err) {
     throw new Error(
       `Could not read bot keystore at ${path}: ${err instanceof Error ? err.message : String(err)}`,
@@ -69,6 +71,9 @@ export async function resolveBotAccount(
   const keystore = await readKeystore(path)
 
   let passphrase = config.BOT_KEYSTORE_PASSPHRASE
+  if (passphrase === undefined && config.BOT_KEYSTORE_PASSPHRASE_FILE) {
+    passphrase = readSecureText(config.BOT_KEYSTORE_PASSPHRASE_FILE, 4_096).replace(/\r?\n$/, '')
+  }
   if (passphrase === undefined) {
     if (!interactive) {
       throw new Error(
@@ -94,11 +99,14 @@ async function promptPassphrase(path: string): Promise<string> {
   try {
     process.stdout.write(`Passphrase for bot keystore (${path}): `)
     muted = true
-    const answer = await rl.question('')
+    let answer = await rl.question('')
     muted = false
     process.stdout.write('\n')
-    return answer
+    const result = answer
+    answer = ''
+    return result
   } finally {
+    muted = false
     rl.close()
   }
 }

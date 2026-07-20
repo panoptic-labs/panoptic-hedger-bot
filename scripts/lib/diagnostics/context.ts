@@ -32,6 +32,9 @@ export interface DiagnosticsContext {
   accountError?: unknown
 }
 
+/** Read-only status fields after omitting the signing account and its resolution error. */
+export type StatusDiagnosticsContext = Omit<DiagnosticsContext, 'account' | 'accountError'>
+
 export async function buildDiagnosticsContext(
   config: HedgerBotConfig,
 ): Promise<DiagnosticsContext> {
@@ -55,4 +58,18 @@ export async function buildDiagnosticsContext(
   }
 
   return { config, chain, publicClient, botAddress, addressError, account, accountError }
+}
+
+/** Status has no signing account in its dependency graph. */
+export async function buildStatusDiagnosticsContext(
+  config: HedgerBotConfig,
+): Promise<StatusDiagnosticsContext> {
+  const chain = defineBotChain(config.CHAIN_ID, config.RPC_URL)
+  const publicClient = createPublicClient({ chain, transport: http(config.RPC_URL) })
+  try {
+    const botAddress = await resolveBotAddress(config)
+    return { config, chain, publicClient, botAddress }
+  } catch (addressError) {
+    return { config, chain, publicClient, addressError }
+  }
 }

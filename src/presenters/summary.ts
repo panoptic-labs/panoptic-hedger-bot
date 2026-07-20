@@ -2,6 +2,7 @@ import { formatUnits } from 'viem'
 
 import type { HedgeExecutionResult } from '../executor/types'
 import type { HedgePlan } from '../hedge/decision'
+import { sanitizeError, sanitizeText } from '../utils/sanitize'
 
 /** The sizing-token frame netDelta/H/H* are denominated in, for display. */
 export interface VaultAsset {
@@ -36,18 +37,17 @@ export function formatCycleSummary(
   ]
   if (result.openedTokenId !== null) lines.push(`🟩 opened: ${result.openedTokenId}`)
   if (result.closedTokenIds.length > 0) lines.push(`🟥 closed: ${result.closedTokenIds.join(', ')}`)
-  if (result.txHashes.length > 0) lines.push(`🔗 tx: ${result.txHashes.join(', ')}`)
+  if (result.transactionHash) lines.push(`🔗 tx: ${result.transactionHash}`)
   lines.push('━━━━━━━━━━━━━━━━━━━━━━━')
   return lines.join('\n')
 }
 
 /** Format a skipped cycle (unsafe / stale) into a Telegram message. */
 export function formatSkip(label: string, reasons: string[]): string {
-  return `⚠️ hedger-bot ${label} — skipped hedging: ${reasons.join('; ')}`
+  return sanitizeText(`⚠️ hedger-bot ${label} — skipped hedging: ${reasons.join('; ')}`)
 }
 
 /** Format an error into a Telegram message. */
 export function formatError(label: string, error: unknown): string {
-  const msg = error instanceof Error ? error.message : String(error)
-  return `❌ hedger-bot ${label} — cycle error: ${msg}`
+  return sanitizeText(`❌ hedger-bot ${label} — cycle error: ${sanitizeError(error)}`)
 }

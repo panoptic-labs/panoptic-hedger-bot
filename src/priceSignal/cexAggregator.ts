@@ -17,6 +17,7 @@
 import { EventEmitter } from 'node:events'
 
 import WebSocket from 'ws'
+import { z } from 'zod'
 
 import { botWarn } from '../utils/log'
 
@@ -40,20 +41,68 @@ export interface AggregatedPrice {
 
 const RECONNECT_DELAY_MS = 5_000
 const RECONNECT_MAX_DELAY_MS = 120_000
+export const CEX_MAX_PAYLOAD_BYTES = 64 * 1024
+export const CEX_MAX_SPREAD_BPS = 100
+export const CEX_MAX_DISPERSION_BPS = 200
+const CEX_MIN_PRICE = 10
+const CEX_MAX_PRICE = 10_000_000
 
-abstract class ExchangeFeed extends EventEmitter {
+const BINANCE_MESSAGE_SCHEMA = z.object({ b: z.string(), a: z.string() }).passthrough()
+const COINBASE_MESSAGE_SCHEMA = z
+  .object({
+    type: z.string(),
+    best_bid: z.string().optional(),
+    best_ask: z.string().optional(),
+  })
+  .passthrough()
+const KRAKEN_MESSAGE_SCHEMA = z
+  .tuple([
+    z.unknown(),
+    z.object({ b: z.array(z.string()).min(1), a: z.array(z.string()).min(1) }),
+    z.literal('ticker'),
+  ])
+  .rest(z.unknown())
+const BOOK_LEVEL_SCHEMA = z.tuple([z.string()]).rest(z.unknown())
+const OKX_MESSAGE_SCHEMA = z
+  .object({
+    data: z
+      .array(
+        z.object({
+          bids: z.array(BOOK_LEVEL_SCHEMA).min(1),
+          asks: z.array(BOOK_LEVEL_SCHEMA).min(1),
+        }),
+      )
+      .min(1),
+  })
+  .passthrough()
+const BYBIT_MESSAGE_SCHEMA = z
+  .object({
+    data: z.object({
+      b: z.array(BOOK_LEVEL_SCHEMA).min(1),
+      a: z.array(BOOK_LEVEL_SCHEMA).min(1),
+    }),
+  })
+  .passthrough()
+
+export abstract class ExchangeFeed extends EventEmitter {
   public readonly name: string
   protected ws: WebSocket | null = null
   private latest: Quote | null = null
   private stopped = false
   private reconnectTimer: NodeJS.Timeout | null = null
   private reconnectAttempts = 0
+  private connectedAt = 0
   /** Log a feed's connection failure only once, so reconnects don't spam. */
   private errorLogged = false
 
-  constructor(name: string) {
+  private readonly reconnectBaseMs: number
+  private readonly random: () => number
+
+  constructor(name: string, timing: { reconnectBaseMs?: number; random?: () => number } = {}) {
     super()
     this.name = name
+    this.reconnectBaseMs = timing.reconnectBaseMs ?? RECONNECT_DELAY_MS
+    this.random = timing.random ?? Math.random
   }
 
   abstract get url(): string
@@ -61,11 +110,17 @@ abstract class ExchangeFeed extends EventEmitter {
   abstract onMessage(raw: WebSocket.RawData): void
 
   connect(): void {
-    const ws = new WebSocket(this.url)
+    if (
+      this.stopped ||
+      this.ws?.readyState === WebSocket.CONNECTING ||
+      this.ws?.readyState === WebSocket.OPEN
+    ) {
+      return
+    }
+    const ws = new WebSocket(this.url, { maxPayload: CEX_MAX_PAYLOAD_BYTES })
     this.ws = ws
     ws.on('open', () => {
-      this.reconnectAttempts = 0 // reset backoff on a successful connect
-      this.errorLogged = false
+      this.connectedAt = Date.now()
       this.onOpen(ws)
     })
     // Surface a geo-block / handshake rejection (e.g. Binance HTTP 451) once, so
@@ -73,8 +128,12 @@ abstract class ExchangeFeed extends EventEmitter {
     ws.on('unexpected-response', (_req, res) => {
       if (!this.errorLogged) {
         this.errorLogged = true
-        botWarn(`[cex] ${this.name} feed rejected: HTTP ${res.statusCode} (${this.url})`)
+        botWarn(`[cex] ${this.name} feed rejected: HTTP ${res.statusCode}`)
       }
+      res.resume()
+      res.destroy()
+      ws.terminate()
+      this.scheduleReconnect()
     })
     ws.on('message', (data: WebSocket.RawData) => {
       try {
@@ -94,6 +153,8 @@ abstract class ExchangeFeed extends EventEmitter {
         botWarn(`[cex] ${this.name} feed error: ${err.message}`)
       }
       this.emit('error', { exchange: this.name, err })
+      ws.terminate()
+      this.scheduleReconnect()
     })
   }
 
@@ -101,7 +162,11 @@ abstract class ExchangeFeed extends EventEmitter {
     if (this.stopped || this.reconnectTimer) return
     // Exponential backoff (5s, 10s, 20s, …) capped so repeated failures don't
     // hammer the exchange. Reset to 5s on a successful reconnect (see 'open').
-    const delay = Math.min(RECONNECT_DELAY_MS * 2 ** this.reconnectAttempts, RECONNECT_MAX_DELAY_MS)
+    const baseDelay = Math.min(
+      this.reconnectBaseMs * 2 ** this.reconnectAttempts,
+      RECONNECT_MAX_DELAY_MS,
+    )
+    const delay = Math.round(baseDelay * (0.8 + this.random() * 0.4))
     this.reconnectAttempts += 1
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
@@ -111,12 +176,21 @@ abstract class ExchangeFeed extends EventEmitter {
   }
 
   protected setQuote(bid: number, ask: number): void {
-    const mid = (bid + ask) / 2
+    const mid = validateQuote(bid, ask)
+    if (mid === null) return
     this.latest = { exchange: this.name, bid, ask, mid, ts: Date.now() }
+    this.reconnectAttempts = 0
+    this.errorLogged = false
   }
 
   getQuote(): Quote | null {
     return this.latest
+  }
+
+  recycleIfSilent(now: number, staleMs: number): void {
+    if (this.latest && now - this.latest.ts <= staleMs * 2) return
+    if (!this.latest && now - this.connectedAt <= staleMs * 2) return
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.terminate()
   }
 
   close(): void {
@@ -142,8 +216,8 @@ class BinanceFeed extends ExchangeFeed {
   }
   onOpen(): void {}
   onMessage(raw: WebSocket.RawData): void {
-    const msg = JSON.parse(raw.toString())
-    if (msg.b && msg.a) this.setQuote(parseFloat(msg.b), parseFloat(msg.a))
+    const parsed = BINANCE_MESSAGE_SCHEMA.safeParse(JSON.parse(raw.toString()) as unknown)
+    if (parsed.success) this.setQuote(Number(parsed.data.b), Number(parsed.data.a))
   }
 }
 
@@ -163,9 +237,14 @@ class CoinbaseFeed extends ExchangeFeed {
     )
   }
   onMessage(raw: WebSocket.RawData): void {
-    const msg = JSON.parse(raw.toString())
-    if (msg.type === 'ticker' && msg.best_bid && msg.best_ask) {
-      this.setQuote(parseFloat(msg.best_bid), parseFloat(msg.best_ask))
+    const parsed = COINBASE_MESSAGE_SCHEMA.safeParse(JSON.parse(raw.toString()) as unknown)
+    if (
+      parsed.success &&
+      parsed.data.type === 'ticker' &&
+      parsed.data.best_bid &&
+      parsed.data.best_ask
+    ) {
+      this.setQuote(Number(parsed.data.best_bid), Number(parsed.data.best_ask))
     }
   }
 }
@@ -187,9 +266,9 @@ class KrakenFeed extends ExchangeFeed {
     )
   }
   onMessage(raw: WebSocket.RawData): void {
-    const msg = JSON.parse(raw.toString())
-    if (Array.isArray(msg) && msg[2] === 'ticker') {
-      this.setQuote(parseFloat(msg[1].b[0]), parseFloat(msg[1].a[0]))
+    const parsed = KRAKEN_MESSAGE_SCHEMA.safeParse(JSON.parse(raw.toString()) as unknown)
+    if (parsed.success) {
+      this.setQuote(Number(parsed.data[1].b[0]), Number(parsed.data[1].a[0]))
     }
   }
 }
@@ -205,10 +284,9 @@ class OkxFeed extends ExchangeFeed {
     ws.send(JSON.stringify({ op: 'subscribe', args: [{ channel: 'bbo-tbt', instId: 'ETH-USDT' }] }))
   }
   onMessage(raw: WebSocket.RawData): void {
-    const msg = JSON.parse(raw.toString())
-    const book = msg.data?.[0]
-    if (book?.bids?.[0] && book?.asks?.[0]) {
-      this.setQuote(parseFloat(book.bids[0][0]), parseFloat(book.asks[0][0]))
+    const parsed = OKX_MESSAGE_SCHEMA.safeParse(JSON.parse(raw.toString()) as unknown)
+    if (parsed.success) {
+      this.setQuote(Number(parsed.data.data[0].bids[0][0]), Number(parsed.data.data[0].asks[0][0]))
     }
   }
 }
@@ -224,9 +302,9 @@ class BybitFeed extends ExchangeFeed {
     ws.send(JSON.stringify({ op: 'subscribe', args: ['orderbook.1.ETHUSDT'] }))
   }
   onMessage(raw: WebSocket.RawData): void {
-    const data = JSON.parse(raw.toString()).data
-    if (data?.b?.[0] && data?.a?.[0]) {
-      this.setQuote(parseFloat(data.b[0][0]), parseFloat(data.a[0][0]))
+    const parsed = BYBIT_MESSAGE_SCHEMA.safeParse(JSON.parse(raw.toString()) as unknown)
+    if (parsed.success) {
+      this.setQuote(Number(parsed.data.data.b[0][0]), Number(parsed.data.data.a[0][0]))
     }
   }
 }
@@ -259,7 +337,7 @@ export class PriceAggregator extends EventEmitter implements LatestPriceProvider
     this.staleMs = opts.staleMs ?? 12_000
     this.method = opts.method ?? 'median'
     this.sampleIntervalMs = opts.sampleIntervalMs ?? 1_000
-    this.minFeeds = opts.minFeeds ?? 1
+    this.minFeeds = opts.minFeeds ?? 3
     this.feeds = [
       new BinanceFeed(),
       new CoinbaseFeed(),
@@ -270,6 +348,7 @@ export class PriceAggregator extends EventEmitter implements LatestPriceProvider
   }
 
   start(): void {
+    if (this.timer) return
     for (const feed of this.feeds) {
       feed.on('error', (e) => this.emit('feedError', e))
       feed.connect()
@@ -280,7 +359,10 @@ export class PriceAggregator extends EventEmitter implements LatestPriceProvider
   }
 
   stop(): void {
-    if (this.timer) clearInterval(this.timer)
+    if (this.timer) {
+      clearInterval(this.timer)
+      this.timer = null
+    }
     for (const feed of this.feeds) feed.close()
   }
 
@@ -296,26 +378,19 @@ export class PriceAggregator extends EventEmitter implements LatestPriceProvider
     for (const feed of this.feeds) {
       const q = feed.getQuote()
       if (q && now - q.ts <= this.staleMs) live.push(q)
-      else dropped.push(feed.name)
+      else {
+        dropped.push(feed.name)
+        feed.recycleIfSilent(now, this.staleMs)
+      }
     }
 
-    if (live.length < this.minFeeds) {
+    const aggregate = buildAggregate(live, dropped, this.minFeeds, this.method, now)
+    if (!aggregate) {
+      this.latest = null
       this.emit('insufficientData', { live: live.length, needed: this.minFeeds })
       return
     }
-
-    const mids = live.map((q) => q.mid).sort((a, b) => a - b)
-    const price =
-      this.method === 'median' ? median(mids) : mids.reduce((s, v) => s + v, 0) / mids.length
-
-    this.latest = {
-      price,
-      method: this.method,
-      ts: now,
-      contributingExchanges: live.map((q) => q.exchange),
-      droppedExchanges: dropped,
-      readings: live.map((q) => ({ exchange: q.exchange, mid: q.mid })),
-    }
+    this.latest = aggregate
     this.emit('price', this.latest)
   }
 }
@@ -324,4 +399,46 @@ function median(sorted: number[]): number {
   const n = sorted.length
   const mid = Math.floor(n / 2)
   return n % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
+}
+
+export function validateQuote(bid: number, ask: number): number | null {
+  if (!Number.isFinite(bid) || !Number.isFinite(ask)) return null
+  if (bid <= 0 || ask <= 0 || bid > ask) return null
+  const mid = (bid + ask) / 2
+  if (mid < CEX_MIN_PRICE || mid > CEX_MAX_PRICE) return null
+  if (((ask - bid) * 10_000) / mid > CEX_MAX_SPREAD_BPS) return null
+  return mid
+}
+
+export function rejectOutliers(quotes: Quote[], maxDispersionBps: number): Quote[] {
+  if (quotes.length === 0) return []
+  const center = median(quotes.map((quote) => quote.mid).sort((a, b) => a - b))
+  return quotes.filter(
+    (quote) => (Math.abs(quote.mid - center) * 10_000) / center <= maxDispersionBps,
+  )
+}
+
+export function buildAggregate(
+  live: Quote[],
+  dropped: string[],
+  minFeeds: number,
+  method: 'median' | 'mean',
+  now: number,
+): AggregatedPrice | null {
+  if (live.length < minFeeds) return null
+  const filtered = rejectOutliers(live, CEX_MAX_DISPERSION_BPS)
+  if (filtered.length < minFeeds) return null
+  const rejected = live.filter((quote) => !filtered.includes(quote)).map((quote) => quote.exchange)
+  const mids = filtered.map((quote) => quote.mid).sort((a, b) => a - b)
+  return {
+    price:
+      method === 'median'
+        ? median(mids)
+        : mids.reduce((sum, value) => sum + value, 0) / mids.length,
+    method,
+    ts: now,
+    contributingExchanges: filtered.map((quote) => quote.exchange),
+    droppedExchanges: [...new Set([...dropped, ...rejected])],
+    readings: filtered.map((quote) => ({ exchange: quote.exchange, mid: quote.mid })),
+  }
 }
