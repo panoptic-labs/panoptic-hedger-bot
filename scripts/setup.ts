@@ -743,6 +743,9 @@ async function finalizeDeployment(args: {
     rolesModifierAddress: `0x${string}`
     roleKey: `0x${string}`
     safeOwner: string
+    safeTxHash?: `0x${string}`
+    rolesTxHash?: `0x${string}`
+    configureTxHash?: `0x${string}`
   }
   if (state.safeMode === 'existing') {
     if (!state.safeAddress) throw new Error('existing-Safe resume state missing safeAddress')
@@ -845,6 +848,23 @@ async function finalizeDeployment(args: {
         `  ⚠️  Could not remove temporary recovery keystore ${KEYSTORE_PATH}: ` +
           sanitizeError(err),
       )
+    }
+  }
+
+  console.log(
+    '\n🎉 Setup complete — your loan-only hedger Safe is deployed, scoped, and verified. ✅',
+  )
+
+  const txs: [string, `0x${string}` | undefined][] = [
+    ['Safe deploy', result.safeTxHash],
+    ['Roles modifier deploy', result.rolesTxHash],
+    ['Configure (enable module + loan-only scope + ownership hand-off)', result.configureTxHash],
+  ]
+  const landedTxs = txs.filter((entry): entry is [string, `0x${string}`] => Boolean(entry[1]))
+  if (landedTxs.length > 0) {
+    console.log('\n  📝 Transactions:')
+    for (const [label, hash] of landedTxs) {
+      console.log(`     ✅ ${label}\n        ${hash}`)
     }
   }
 

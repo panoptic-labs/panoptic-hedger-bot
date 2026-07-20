@@ -270,7 +270,11 @@ export async function deployRolesModifier(params: {
   feeOptions?: FeeOptions
   timeoutMs?: number
   log?: (line: string) => void
-}): Promise<{ rolesModifierAddress: `0x${string}`; deploymentBlock: bigint }> {
+}): Promise<{
+  rolesModifierAddress: `0x${string}`
+  deploymentBlock: bigint
+  transactionHash: `0x${string}`
+}> {
   const { publicClient, walletClient, addresses, safeAddress, saltNonce } = params
   const log = params.log ?? console.log
   const rolesInit = encodeAbiParameters(
@@ -299,7 +303,11 @@ export async function deployRolesModifier(params: {
     'ModuleProxyCreation',
     'proxy',
   )
-  return { rolesModifierAddress, deploymentBlock: receipt.blockNumber }
+  return {
+    rolesModifierAddress,
+    deploymentBlock: receipt.blockNumber,
+    transactionHash: receipt.transactionHash,
+  }
 }
 
 /** One owner-authorized configuration call, with a human-readable summary. */
@@ -464,6 +472,12 @@ export interface DeploySafeAndRolesResult {
   safeDeploymentBlock?: bigint
   /** Block the Roles modifier proxy was deployed in. Undefined on resume. */
   rolesDeploymentBlock?: bigint
+  /** Tx hash of the Safe deploy. Undefined when the Safe was resumed/skipped. */
+  safeTxHash?: `0x${string}`
+  /** Tx hash of the Roles modifier deploy. Undefined on resume/skip. */
+  rolesTxHash?: `0x${string}`
+  /** Tx hash of the single configure (enable + scope + handoff). Undefined on resume/skip. */
+  configureTxHash?: `0x${string}`
 }
 
 /**
@@ -561,6 +575,7 @@ export async function deploySafeAndRoles(
   //    address from a prior run already has code.
   let safeAddress = known.safeAddress
   let safeDeploymentBlock: bigint | undefined
+  let safeTxHash: `0x${string}` | undefined
   if (safeAddress && (await hasCode(publicClient, safeAddress))) {
     log(`→ Safe already deployed (${safeAddress}) — skipping`)
   } else {
@@ -579,7 +594,9 @@ export async function deploySafeAndRoles(
       'proxy',
     )
     safeDeploymentBlock = safeReceipt.blockNumber
-    log(`  Safe: ${safeAddress}`)
+    safeTxHash = safeReceipt.transactionHash
+    log(`  ✓ Safe: ${safeAddress}`)
+    log(`    tx: ${safeTxHash}`)
     await params.onDeployed?.({ safeAddress })
   }
 
@@ -588,6 +605,7 @@ export async function deploySafeAndRoles(
   //    (step 3) and there is no separate transferOwnership tx to send.
   let rolesModifierAddress = known.rolesModifierAddress
   let rolesDeploymentBlock: bigint | undefined
+  let rolesTxHash: `0x${string}` | undefined
   if (
     rolesModifierAddress &&
     safeAddress &&
@@ -597,7 +615,11 @@ export async function deploySafeAndRoles(
     log(`→ Roles modifier already deployed (${rolesModifierAddress}) — skipping`)
   } else {
     log('→ deploy Roles modifier (owner = Safe)')
-    ;({ rolesModifierAddress, deploymentBlock: rolesDeploymentBlock } = await deployRolesModifier({
+    ;({
+      rolesModifierAddress,
+      deploymentBlock: rolesDeploymentBlock,
+      transactionHash: rolesTxHash,
+    } = await deployRolesModifier({
       publicClient,
       walletClient,
       addresses,
@@ -607,7 +629,8 @@ export async function deploySafeAndRoles(
       timeoutMs,
       log,
     }))
-    log(`  Roles: ${rolesModifierAddress}`)
+    log(`  ✓ Roles: ${rolesModifierAddress}`)
+    log(`    tx: ${rolesTxHash}`)
     await params.onDeployed?.({ rolesModifierAddress })
   }
 
@@ -627,6 +650,7 @@ export async function deploySafeAndRoles(
     functionName: 'isModuleEnabled',
     args: [rolesModifierAddress],
   })) as boolean
+  let configureTxHash: `0x${string}` | undefined
   if (enabled) {
     // The batch is atomic: if the module is enabled, the whole configure step
     // already landed (this is the resume path for a tx that confirmed after the
@@ -659,7 +683,7 @@ export async function deploySafeAndRoles(
         `${extraRoles.length ? ` (+${extraRoles.length} extra)` : ''}` +
         `${finalSafeOwner ? ' + hand off ownership' : ''}`,
     )
-    await execFromSoleOwner({
+    configureTxHash = await execFromSoleOwner({
       publicClient,
       walletClient,
       safeAddress,
@@ -671,6 +695,10 @@ export async function deploySafeAndRoles(
       simulate: true, // dry-run first so a bad scope reverts locally, not on-chain
       log,
     })
+    log(
+      `  ✓ configured Safe (module + loan-only scope${finalSafeOwner ? ' + ownership hand-off' : ''})`,
+    )
+    log(`    tx: ${configureTxHash}`)
   }
 
   await assertBotIsNotSafeOwner(publicClient, safeAddress, botAddress)
@@ -682,6 +710,9 @@ export async function deploySafeAndRoles(
     safeOwner: finalSafeOwner ?? deployer.address,
     safeDeploymentBlock,
     rolesDeploymentBlock,
+    safeTxHash,
+    rolesTxHash,
+    configureTxHash,
   }
 }
 
