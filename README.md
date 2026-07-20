@@ -1,4 +1,4 @@
-# @panoptic-eng/hedger-bot
+# ⚡ Panoptic Hedger Bot
 
 Autonomous delta-hedging bot for [Panoptic](https://panoptic.xyz) v2 pools. It
 watches the net delta of the option positions held in a Gnosis Safe and, when the
@@ -6,29 +6,51 @@ delta drifts past a threshold, mints/burns **hedge loans** to bring the portfoli
 back toward delta-neutral — all through a [Zodiac Roles v2](https://github.com/gnosisguild/zodiac-modifier-roles)
 modifier scoped so the bot can *only* touch loans, never the user's options.
 
-```text
-Bot EOA ──execTransactionWithRole──▶ Zodiac Roles v2 ──(enabled module)──▶ Safe ──▶ PanopticPool.dispatch
-                                       (scoped: loan-only)                  (holds options + hedge loans)
+The bot is **stateless** — it re-derives all hedge state from on-chain positions
+on every startup — so it is safe to restart or kill at any time.
 
-User EOA ──▶ Safe (owner)  — buys options, full control, everything else
-```
+## What it does
 
-The bot is **stateless** (it re-derives all hedge state from on-chain positions
-on every startup), so it is safe to restart or kill at any time.
+Every cycle the bot:
 
-**Supported in v1:** loan-only hedging · in-pool venue · Ethereum mainnet ·
-pool-tick or CEX price signal · a single Safe + pool per instance. The
-`uniswap-pool` signal and extra Zodiac keeper roles exist but are **experimental**
-(labelled below and in `.env.advanced.example`) — their
-setup, monitoring, and recovery paths are not as hardened as the core.
+1. Reads a price signal (the pool tick, a CEX mid, or an external Uniswap pool).
+2. Computes the net delta of the Safe's Panoptic positions.
+3. If the delta has drifted past `DELTA_THRESHOLD_BPS`, plans a hedge: mint or
+   burn the loan legs needed to return toward delta-neutral, consolidating
+   fragmented hedge slots when they exceed `MAX_HEDGE_SLOTS`.
+4. Submits that plan to `PanopticPool.dispatch` **through the Zodiac Roles
+   modifier**, which permits loan-only actions and rejects anything else.
 
-## Quick start: `pnpm onboard`
+Live trading is gated behind an explicit activation step (see below), and the
+loop refuses to send anything until then.
+
+## Key features
+
+**Supported and hardened:** loan-only hedging · in-pool execution venue ·
+Ethereum mainnet · `pool-tick` or CEX price signal · a single Safe + pool per
+instance · passphrase-encrypted keystore · Telegram monitoring via
+[@panopticMonitorBot](https://t.me/panopticMonitorBot) · durable transaction
+journal + single-writer lease.
+
+**Experimental** (labelled below and in `.env.advanced.example`, not as hardened
+as the core): the `uniswap-pool` price signal and the extra à-la-carte Zodiac
+keeper roles (`deleverager`, `maintenance`, `roller`, `size-adjuster`).
+
+## Requirements
+
+- Node.js `>=20 <23`
+- pnpm (via Corepack: `corepack enable`)
+- An RPC URL for the target chain (HTTPS required for remote endpoints; plain
+  HTTP is accepted only for a loopback development fork)
+
+## Getting started
+
+### Quick start: `pnpm onboard`
 
 The turnkey path. `pnpm onboard` is an interactive wizard that prompts for only
 the essentials (RPC, pool, deployer key, bot key), **auto-derives** everything
 else, **deploys a fresh Safe + Roles modifier**, **verifies the loan-only
-security boundary on-chain**, and writes a complete `.env`. You need Node.js
-`>=20 <23`, pnpm (via Corepack), and an RPC URL.
+security boundary on-chain**, and writes a complete `.env`.
 
 ```bash
 # From the repo root
@@ -62,51 +84,23 @@ The wizard asks for:
     additive, so adding a pool never un-scopes the others.
 - **Bot signer** — generate a fresh key, import one, or reuse an existing
   owner-only `bot-keystore.json` without entering the plaintext key or rewriting
-  the file. Generation uses the OS
-  CSPRNG (`randomBytes`), which is sufficient on its own; you can optionally fold
-  in your own extra entropy (mixed via keccak256, so it can only add to the RNG).
-  New or imported keys can be stored in a **passphrase-encrypted keystore**
-  (recommended — no plaintext at rest) or plaintext in `.env`.
+  the file. Generation uses the OS CSPRNG (`randomBytes`), which is sufficient on
+  its own; you can optionally fold in your own extra entropy (mixed via
+  keccak256, so it can only add to the RNG). New or imported keys can be stored
+  in a **passphrase-encrypted keystore** (recommended — no plaintext at rest) or
+  plaintext in `.env`.
 - Optional: rehedge threshold and `DRY_RUN`.
-- **Telegram alerts** are optional and configured out-of-band (not in the
-  wizard): create a bot via @BotFather, then set `TELEGRAM_BOT_TOKEN` and
-  `TELEGRAM_CHAT_ID` in `.env`. `pnpm preflight --telegram-test` verifies delivery.
 - Optional: **vanity Safe address** — the Safe is a CREATE2 proxy whose address
   is fixed by the deploy salt, so the wizard can search salts locally (no chain
   writes) for an address starting with a hex prefix you choose. Each extra hex
   character makes the search ~16× slower; 3–5 characters is near-instant.
-The wizard deploys a **width-zero loan-only** bot. It cannot dispatch
-width-positive options, but the current role does not enforce loan size, tick,
-spread, premia-collateral, or builder-code bounds. A stolen bot key can therefore
-cause severe economic loss, including collateral exhaustion or liquidation. This
-profile remains **NO-GO for live funds**: loan-shape/size/tick bounds were
-explicitly deferred. Experimental swap executors are not part of the v1 runtime.
 
-**Advanced / EXPERIMENTAL: extra keeper roles.** The SDK also defines à-la-carte
-roles beyond loan-only — `deleverager` (burn-only close), `maintenance` (force-exercise /
-settle / liquidate third-party accounts — high privilege), `roller`, and
-`size-adjuster`. This bot's runtime does **not** exercise them, so `pnpm onboard`
-does not scope them. If you run a separate keeper that uses these capabilities,
-scope one onto an existing modifier with `pnpm manage-role` (below).
-Any extra role/member makes the modifier differ from the exact production
-manifest, so `doctor` warns about the experimental permission graph. Re-onboard
-with a fresh modifier to restore the exact manifest when that is desired.
-
-**Changing role membership later.** Setup transfers the Roles modifier's
-ownership to the Safe, so role membership is changed by the **Safe**, not the
-bot host. `pnpm manage-role` emits unsigned Safe Transaction Builder JSON:
-
-```bash
-ROLE=deleverager MEMBER=0x… ENABLED=true \
-SAFE_ADDRESS=0x… ROLES_MODIFIER_ADDRESS=0x… \
-CHAIN_ID=… pnpm manage-role > role-proposal.json
-```
-
-`ROLE` is a canonical name (`deleverager`/`maintenance`/`roller`/`size-adjuster`)
-or a bytes32 role key (e.g. the bot's `ROLE_KEY` from `.env`); `ENABLED=false`
-revokes. No Safe-owner key variable is accepted. Import the JSON into the Safe
-UI, inspect/simulate the batch, and
-collect the Safe's configured threshold approvals.
+**Telegram notifications** are optional and set up out of the wizard. The
+recommended path is the standalone **[@panopticMonitorBot](https://t.me/panopticMonitorBot)**
+(the read-only monitor in `apps/panoptic-monitor-bot`): open a chat with it and
+send `/monitor <SAFE_ADDRESS>` to follow your hedger's Safe — you'll get alerts
+on its confirmed on-chain activity, plus `/positions` and `/greeks` on demand. No
+bot token or `.env` change is needed on the hedger side.
 
 Nothing is written to `.env` until the Safe + Roles are deployed **and** the
 loan-only scope is verified (bot can dispatch a width=0 loan, cannot dispatch a
@@ -116,7 +110,7 @@ width>0 option). Re-run with `pnpm onboard --force` to overwrite an existing
 > First run against an **anvil/Tenderly fork** to rehearse end-to-end with no
 > real transactions.
 
-### Then run the bot (two-stage go-live)
+### Run the bot (two-stage go-live)
 
 Live trading is deliberately gated: `pnpm start` **forces dry-run** until you
 `pnpm activate`, so nobody goes live by flipping one env var.
@@ -140,8 +134,8 @@ because `doctor` is also a built-in pnpm command.)
 Prefer to wire everything yourself, or targeting a chain the wizard doesn't
 list? Copy `.env.example` to `.env` and fill it in (minimum for a dry run:
 `CHAIN_ID, RPC_URL, POOL_ADDRESS, SAFE_ADDRESS, ROLES_MODIFIER_ADDRESS,
-ROLE_KEY, BOT_PRIVATE_KEY`), deploying the Safe + Roles out-of-band first — see
-[Deployment](#deployment-safe--roles) below.
+ROLE_KEY, BOT_PRIVATE_KEY`), deploying the Safe + Roles out of the wizard first —
+see [Deployment](#deployment-safe--roles) below.
 
 ### Development
 
@@ -165,7 +159,7 @@ it writes (and for the manual path). The full annotated list lives in
 | `CHAIN_ID` | ✅ | Target chain id (e.g. `1` for mainnet) |
 | `RPC_URL` | ✅ | RPC endpoint for reads, gas estimation, and dispatch |
 | `POOL_ADDRESS` | ✅ | Panoptic pool holding the options + hedge loans |
-| `SAFE_ADDRESS` | ✅ | Gnosis Safe (deployed out-of-band) |
+| `SAFE_ADDRESS` | ✅ | Gnosis Safe (deployed via the wizard or `deploy:safe-roles`) |
 | `ROLES_MODIFIER_ADDRESS` | ✅ | Zodiac Roles v2 modifier enabled on the Safe |
 | `ROLE_KEY` | ✅ | bytes32 role key assigned to the bot EOA |
 | `BOT_PRIVATE_KEY` | ✅¹ | Bot signer key (raw hex) — **the only runtime secret** |
@@ -176,30 +170,196 @@ it writes (and for the manual path). The full annotated list lives in
 | `DELTA_THRESHOLD_BPS` | | Rehedge trigger, default `200` (2%) |
 | `MAX_HEDGE_SLOTS` | | Consolidate hedge loans above this count, default `4` |
 | `SLIPPAGE_BPS` | | Hedge swap slippage tolerance, default `100` (±100 ticks for in-pool loans) |
-| `PRICE_SIGNAL_SOURCE` | | `pool-tick` \| `cex` (v1); `uniswap-pool` (experimental) |
+| `PRICE_SIGNAL_SOURCE` | | `pool-tick` \| `cex` (supported); `uniswap-pool` (experimental) |
 | `HEDGE_VENUE` | | `in-pool` (the only supported execution venue) |
 | `POLL_INTERVAL_MS` | | Loop interval, default `60000` |
 | `DRY_RUN` | | `true` simulates via `eth_call`; live also requires `pnpm activate` |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | | Optional alerting (set both to enable) |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | | Legacy built-in alerting (set both to enable). Prefer [@panopticMonitorBot](https://t.me/panopticMonitorBot) instead — see Getting started. |
 
 ¹ Provide **exactly one** bot key source: `BOT_PRIVATE_KEY` (raw hex, plaintext
 at rest) **or** `BOT_KEYSTORE_PATH` (a geth-style passphrase-encrypted keystore,
 decrypted at startup — no plaintext at rest). `pnpm onboard` can generate the
 keystore for you. If a keystore is used and neither non-interactive passphrase
-source is set, the bot prompts at startup. Remote RPC endpoints must use HTTPS;
-plain HTTP is accepted only for a loopback development fork.
+source is set, the bot prompts at startup.
 
 The CEX signal variables (`CEX_*`) are core. The experimental `uniswap-pool`
 signal variables (`UNISWAP_SIGNAL_*`) live in `.env.advanced.example`.
+
+## 🔒 Security model
+
+Two trust boundaries meet at the Safe. The bot's hot key is scoped to loans; the
+owner keeps everything else.
+
+```text
+    ┌──────────────┐   execTransactionWithRole   ┌───────────────────┐
+    │   Bot EOA    │ ──────────────────────────▶ │  Zodiac Roles v2  │
+    │  (hot key)   │      scoped: loan-only      │      modifier     │
+    └──────────────┘                             └─────────┬─────────┘
+                                                           │ enabled module
+                                                           ▼
+    ┌──────────────┐                             ┌───────────────────┐   dispatch   ┌───────────────┐
+    │   User EOA   │ ──────── owner ───────────▶ │    Gnosis Safe    │ ───────────▶ │  PanopticPool │
+    │ (hardware /  │  buy options · burn ·       │  holds options +  │              └───────────────┘
+    │   multisig)  │  withdraw · full control    │    hedge loans    │
+    └──────────────┘                             └───────────────────┘
+
+    ── loan-only path (bot can ONLY mint/burn hedge loans, never touch options)
+    ── owner path     (user keeps full control: options, withdrawals, redeploy)
+```
+
+The deploy flow creates the Roles modifier owned by the deployer, scopes it, then
+transfers its ownership to the Safe — so no standing EOA-only admin remains, and
+role membership is thereafter changed by the **Safe**, not the bot host.
+
+### How the Zodiac module works
+
+The scope the bot deploys is defined in the SDK, not here: see
+[`panoptic-sdk/src/zodiac`](https://github.com/panoptic-labs/panoptic-sdk/tree/main/src/zodiac)
+(the loan-only policy lives in
+[`roles/loanHedger.ts`](https://github.com/panoptic-labs/panoptic-sdk/blob/main/src/zodiac/roles/loanHedger.ts)).
+
+The [Zodiac Roles Modifier v2](https://github.com/gnosisguild/zodiac-modifier-roles)
+is a contract **enabled as a module on the Safe**. Once enabled, a module can ask
+the Safe to execute arbitrary transactions — so the whole security story is: the
+bot is *not* a Safe owner and *cannot* call the Safe directly; it can only ask the
+Roles modifier, and the modifier only relays calls that match a **scope** attached
+to the bot's role.
+
+**1. The bot's only entry point.** The bot signs exactly one kind of transaction —
+a call to the modifier's `execTransactionWithRole`:
+
+```solidity
+execTransactionWithRole(
+  address to,          // must be the PanopticPool (target is scoped)
+  uint256 value,       // 0
+  bytes   data,        // abi.encodeWithSelector(dispatch.selector, ...)
+  uint8   operation,   // 0 = CALL (DelegateCall is not permitted)
+  bytes32 roleKey,     // the bot's ROLE_KEY
+  bool    shouldRevert // bot always passes true, so a scope failure reverts loudly
+)
+```
+
+The modifier looks up `roleKey`, checks `data` against that role's scope for
+`(to, selector)`, and — only if every condition passes — calls the Safe's
+`execTransactionFromModule`, which performs the actual `PanopticPool.dispatch`.
+If anything fails the scope, the whole thing reverts and nothing reaches the Safe.
+
+**2. What "loan-only" actually constrains.** `dispatch` takes six arguments:
+
+```solidity
+dispatch(
+  uint256[]   positionIdList,       // arg0: the tokenIds actually minted/burned  ← CONSTRAINED
+  uint256[]   finalPositionIdList,  // arg1: the account's resulting position set ← free
+  uint128[]   positionSizes,        // arg2                                        ← free
+  int24[3][]  tickAndSpreadLimits,  // arg3                                        ← free
+  bool        usePremiaAsCollateral,// arg4                                        ← free
+  uint32      builderCode           // arg5                                        ← free
+)
+```
+
+The scope pins only **arg0**: *every* element of `positionIdList` must be a **pure
+loan** — a Panoptic tokenId whose four per-leg `width` fields are all zero. A
+`width == 0` leg is a loan/credit leg; any `width > 0` leg is an actual option.
+So the bot can mint and burn loan legs but can never open or close an option.
+`finalPositionIdList` is deliberately left unconstrained because it legitimately
+lists the user's still-open options.
+
+**3. How the width check is encoded.** A Panoptic tokenId packs four 48-bit legs
+above a 64-bit pool id; each leg's 12-bit `width` sits at leg-offset 36
+([`tokenIdMask.ts`](https://github.com/panoptic-labs/panoptic-sdk/blob/main/src/zodiac/tokenIdMask.ts)).
+"All widths zero" is the bitmask:
+
+```
+tokenId & 0x…  (1-bits over all four width fields)  ==  0
+```
+
+Roles v2 expresses this with `Operator.Bitmask` conditions. One wrinkle: the four
+width fields span tokenId bits 100–255, wider than a single 15-byte Bitmask
+window, so the scope AND-s **two** windows (byte shifts `0` and `17`) that together
+cover all four legs. The scope is a flat `ConditionFlat[]` tree (BFS order) built
+by [`buildLoanOnlyDispatchConditions()`](https://github.com/panoptic-labs/panoptic-sdk/blob/main/src/zodiac/roles/loanHedger.ts)
+in `@panoptic-eng/sdk/zodiac`:
+
+```
+Calldata(dispatch)                       // root
+├─ arg0 positionIdList   ArrayEvery      // for EVERY element…
+│   └─ element (tokenId) And
+│       ├─ Bitmask window @shift 0   → widths in legs 1,2,3 == 0
+│       └─ Bitmask window @shift 17  → width in leg 0       == 0
+├─ arg1 finalPositionIdList  Pass        // unconstrained
+├─ arg2 positionSizes        Pass
+├─ arg3 tickAndSpreadLimits  Pass
+├─ arg4 usePremiaAsCollateral Pass
+└─ arg5 builderCode          Pass
+```
+
+**4. Worked example.** Say the bot wants to burn one loan leg and mint a larger
+one to re-hedge. It builds `positionIdList = [oldLoanId, newLoanId]` where both
+ids have `width = 0` on every leg, encodes `dispatch(...)`, wraps it in
+`execTransactionWithRole(pool, 0, data, 0, ROLE_KEY, true)`, and signs. The
+modifier walks arg0, confirms `oldLoanId & widthMask == 0` and
+`newLoanId & widthMask == 0`, and relays it. If a stolen key instead tried to
+sneak a `width = 5` option leg into `positionIdList`, the `Bitmask` condition on
+that element is non-zero → the modifier reverts → the Safe never sees the call.
+
+> Verify, don't trust the prose: the fork test `scripts/setup.fork.test.ts`
+> asserts the live modifier **can** dispatch a width-0 loan and **cannot**
+> dispatch anything with `width > 0`, and `pnpm onboard` re-runs that check
+> before writing `.env`.
+
+**5. Cross-pool hedges (MultiSend).** When a hedge needs collateral moved between
+pools, the bot batches `[CT.withdraw, router.execute, CT.deposit]` through Safe
+**MultiSend**, with a MultiSend unwrapper registered on the modifier so each inner
+call is re-checked individually. Those inner scopes are tighter still — e.g.
+`CT.withdraw` is pinned to `receiver == owner == Safe` so a compromised key cannot
+pull collateral to an attacker address
+([`buildWithdrawConditions` / `buildDepositConditions`](https://github.com/panoptic-labs/panoptic-sdk/blob/main/src/zodiac/roles/loanHedger.ts)
+in the SDK).
+
+> ⚠️ The wizard deploys a **width-zero loan-only** bot. It cannot dispatch
+> width-positive options, but the current role does **not** enforce loan size,
+> tick, spread, premia-collateral, or builder-code bounds. A stolen bot key can
+> therefore cause severe economic loss, including collateral exhaustion or
+> liquidation. Treat this profile as **unsuitable for live funds** until
+> loan-shape/size/tick bounds are enforced by the role. Experimental swap
+> executors are not part of the supported runtime.
+
+### Extra keeper roles (experimental)
+
+The SDK also defines à-la-carte roles beyond loan-only — `deleverager` (burn-only
+close), `maintenance` (force-exercise / settle / liquidate third-party accounts —
+high privilege), `roller`, and `size-adjuster`. This bot's runtime does **not**
+exercise them, so `pnpm onboard` does not scope them. If you run a separate keeper
+that uses these capabilities, scope one onto an existing modifier with
+`pnpm manage-role` (below). Any extra role/member makes the modifier differ from
+the exact production manifest, so `doctor` warns about the experimental permission
+graph. Re-onboard with a fresh modifier to restore the exact manifest.
+
+### Changing role membership later
+
+Because the Roles modifier's ownership is transferred to the Safe, role
+membership is changed by the **Safe**, not the bot host. `pnpm manage-role` emits
+unsigned Safe Transaction Builder JSON:
+
+```bash
+ROLE=deleverager MEMBER=0x… ENABLED=true \
+SAFE_ADDRESS=0x… ROLES_MODIFIER_ADDRESS=0x… \
+CHAIN_ID=… pnpm manage-role > role-proposal.json
+```
+
+`ROLE` is a canonical name (`deleverager`/`maintenance`/`roller`/`size-adjuster`)
+or a bytes32 role key (e.g. the bot's `ROLE_KEY` from `.env`); `ENABLED=false`
+revokes. No Safe-owner key variable is accepted. Import the JSON into the Safe
+UI, inspect/simulate the batch, and collect the Safe's configured threshold
+approvals.
 
 ## Deployment: Safe + Roles
 
 `pnpm onboard` (above) is the recommended way to stand up the Safe + Roles — it
 deploys a fresh Safe and scopes the bot. The commands below are the
 non-interactive, fully env-driven equivalents. The bot runtime never deploys
-anything — it only preflights and uses on-chain infrastructure you stand up once,
-out-of-band. [`runbook.md`](./runbook.md) is the authoritative guide; the short
-version:
+anything — it only preflights and uses on-chain infrastructure you stand up once.
+[`runbook.md`](./runbook.md) is the authoritative guide; the short version:
 
 ```bash
 # Deploy Safe + Roles modifier and scope the bot EOA (loan-only dispatch).
@@ -215,9 +375,6 @@ pnpm deploy:safe-roles
 pnpm scope:bot-role
 ```
 
-The deploy flow creates the Roles modifier owned by the deployer, scopes it, then
-transfers its ownership to the Safe — so no standing EOA-only admin remains.
-
 > ⚠️ The deploy/scope scripts are ops tooling. `deploy:safe-roles` and the
 > `pnpm onboard` wizard share the same deploy core, which is covered by a mainnet
 > **fork test** (`scripts/setup.fork.test.ts`) asserting the end state (module
@@ -226,7 +383,7 @@ transfers its ownership to the Safe — so no standing EOA-only admin remains.
 > before writing `.env`. Still run against a fork first for real deployments.
 > See runbook Step 0.
 
-## Running in Production
+## Running in production
 
 The bot ships with a multi-stage `Dockerfile` and a `docker-compose.yml`
 (`restart: unless-stopped`, log rotation). It is self-contained —
@@ -258,6 +415,20 @@ Operational notes:
 - **RPC** is a single endpoint with retry/backoff but no failover; front it with
   a resilient RPC gateway for production.
 
+## Troubleshooting
+
+| Symptom | First check |
+|---------|-------------|
+| Something looks mis-wired (scope, keys, gas, signal) | `pnpm run doctor` — read-only, sends nothing and prints what fails |
+| Bot won't trade even after `pnpm start` | It stays in dry-run until `pnpm activate`; run activate (which re-preflights) and unset `DRY_RUN` |
+| Not sure what the bot is doing | `pnpm status` for a live snapshot; `pnpm health` for machine-readable readiness |
+| Need to stop trading immediately | `pnpm deactivate` writes a local kill marker; a restart cannot trade until you re-activate |
+| Startup fails on RPC | Remote RPC endpoints must be HTTPS; plain HTTP is only accepted for a loopback fork |
+| Keystore start hangs / prompts | Set `BOT_KEYSTORE_PASSPHRASE_FILE` (owner-only) for unattended restart |
+| Activation "invalidated" after a rebuild | `HEDGER_BUILD_ID` changed; set `SOURCE_SHA` to the reviewed commit and re-activate |
+| `doctor` warns about the permission graph | Extra keeper roles/members were scoped; re-onboard with a fresh modifier to restore the exact manifest |
+| No Telegram notifications | Message [@panopticMonitorBot](https://t.me/panopticMonitorBot) `/monitor <SAFE_ADDRESS>`, then `/status` to confirm it's following the Safe |
+
 ## Scripts
 
 | Script | Description |
@@ -276,7 +447,7 @@ Operational notes:
 | `pnpm manage-role` | Add/remove a role member on an existing Safe (routed via the Safe owner) |
 | `typecheck` / `lint` / `test` | Development helpers |
 
-## Project Structure
+## Project structure
 
 ```text
 ./
@@ -293,7 +464,7 @@ Operational notes:
 │   ├── constants/ · utils/
 ├── scripts/             # setup (wizard), deploySafeAndRoles, scopeBotRole, inspectHedge
 │   └── lib/             # deployCore, verifyScope, safeZodiacRegistry, renderEnv, prompts, rolesScope
-
+│
 ├── runbook.md           # Deployment & operations runbook
 ├── Dockerfile · docker-compose.yml
 └── .env.example         # Annotated configuration template

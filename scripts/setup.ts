@@ -870,16 +870,22 @@ async function finalizeDeployment(args: {
 
   console.log('\nNext steps:')
   console.log(`  Safe ${result.safeAddress} is owned by ${result.safeOwner}.`)
-  console.log(`  1. Keep the bot EOA (${botAccount.address}) topped up with gas.`)
   console.log(
-    `  2. As the Safe owner (${result.safeOwner}), buy options into the Safe + deposit collateral.`,
+    `  1. (optional) Monitor this Safe on Telegram — open @panopticMonitorBot\n` +
+      `     (https://t.me/panopticMonitorBot) and send:  /monitor ${result.safeAddress}\n` +
+      `     You'll get alerts on the Safe's on-chain activity, plus /positions and /greeks.\n` +
+      `     Read-only; no bot token or .env change needed.`,
   )
-  console.log('  3. pnpm preflight          # read-only release checks')
-  console.log('  4. pnpm inspect:hedge      # dry-run one cycle')
-  console.log('  5. DRY_RUN=true pnpm start # full loop, simulated')
-  console.log('  6. pnpm activate           # bind approval to policy + artifact')
-  console.log('  7. pnpm start              # live only after activation')
-  console.log('  8. pnpm status && pnpm health')
+  console.log(`  2. Keep the bot EOA (${botAccount.address}) topped up with gas.`)
+  console.log(
+    `  3. As the Safe owner (${result.safeOwner}), buy options into the Safe + deposit collateral.`,
+  )
+  console.log('  4. pnpm preflight          # read-only release checks')
+  console.log('  5. pnpm inspect:hedge      # dry-run one cycle')
+  console.log('  6. DRY_RUN=true pnpm start # full loop, simulated')
+  console.log('  7. pnpm activate           # bind approval to policy + artifact')
+  console.log('  8. pnpm start              # live only after activation')
+  console.log('  9. pnpm status && pnpm health')
   if (state.storage === 'keystore') {
     console.log(
       '\n  The bot key is stored encrypted; you will be prompted for the keystore\n' +
