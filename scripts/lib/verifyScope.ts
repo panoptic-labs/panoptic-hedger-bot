@@ -55,6 +55,25 @@ function buildDispatchData(tokenId: bigint): `0x${string}` {
   })
 }
 
+/**
+ * Build `dispatch(...)` calldata with one entry per size — the deleverager
+ * scope gates ONLY arg2 (positionSizes), so probes vary the sizes array.
+ */
+function buildDispatchDataWithSizes(tokenIds: bigint[], sizes: bigint[]): `0x${string}` {
+  return encodeFunctionData({
+    abi: panopticPoolV2Abi,
+    functionName: 'dispatch',
+    args: [
+      tokenIds,
+      tokenIds,
+      sizes,
+      tokenIds.map(() => [MIN_TICK, MAX_TICK, 0] as readonly [number, number, number]),
+      false,
+      0n,
+    ],
+  })
+}
+
 /** Wrap a pool call in `execTransactionWithRole` calldata (shouldRevert=true). */
 function wrapWithRole(
   poolAddress: `0x${string}`,
@@ -183,4 +202,76 @@ export async function verifyLoanOnlyScope(params: VerifyScopeParams): Promise<vo
     )
   }
   log('  ✓ option dispatch was blocked by the Roles modifier (ConditionViolation)')
+}
+
+/**
+ * The deleverager-role security assertion: with the bot EOA as caller through
+ * the DELEVERAGER role key, the Roles modifier must LET THROUGH a `dispatch`
+ * whose positionSizes are ALL zero (burn-or-revert — a zero size can never
+ * mint) and must BLOCK any dispatch carrying a non-zero size, including a
+ * non-zero entry hidden inside an otherwise-zero array (ArrayEvery).
+ *
+ * Like verifyLoanOnlyScope, classification is by revert LAYER: an all-zero
+ * dispatch legitimately reverts downstream when nothing is held — only a
+ * Roles-layer ConditionViolation counts as "blocked by scope".
+ */
+export async function verifyDeleveragerScope(params: VerifyScopeParams): Promise<void> {
+  const { publicClient, rolesModifierAddress, botAddress, roleKey, poolAddress, poolId } = params
+  const log = params.log ?? console.log
+
+  // The deleverager scope leaves tokenIds unconstrained — an option tokenId is
+  // the adversarial probe content (the loan role would block it; this role
+  // gates only the sizes).
+  const optionTokenId = createTokenIdBuilder(poolId)
+    .addCall({ strike: 0n, width: 10n, optionRatio: 1n, isLong: false })
+    .build()
+
+  // 1. All-zero sizes must NOT be blocked by the Roles scope.
+  const zeroErr = await callAsBot(
+    publicClient,
+    rolesModifierAddress,
+    botAddress,
+    wrapWithRole(poolAddress, roleKey, buildDispatchDataWithSizes([optionTokenId], [0n])),
+  )
+  if (zeroErr && isConditionViolation(zeroErr)) {
+    throw new Error(
+      'Deleverager scope too STRICT: an all-zero-sizes dispatch was rejected by the Roles ' +
+        'modifier (ConditionViolation). The burn-only condition tree is wrong — the bot ' +
+        'cannot deleverage.',
+    )
+  }
+  log(
+    zeroErr
+      ? '  ✓ zero-sizes dispatch passed the Roles gate (reverted downstream, as expected when nothing is held)'
+      : '  ✓ zero-sizes dispatch passed the Roles gate',
+  )
+
+  // 2. A non-zero size MUST be blocked with a ConditionViolation — both alone
+  // and hidden among zero entries (the ArrayEvery must inspect every element).
+  const probes: [label: string, tokenIds: bigint[], sizes: bigint[]][] = [
+    ['non-zero size', [optionTokenId], [1n]],
+    ['mixed zero/non-zero sizes', [optionTokenId, optionTokenId], [0n, 1n]],
+  ]
+  for (const [label, tokenIds, sizes] of probes) {
+    const err = await callAsBot(
+      publicClient,
+      rolesModifierAddress,
+      botAddress,
+      wrapWithRole(poolAddress, roleKey, buildDispatchDataWithSizes(tokenIds, sizes)),
+    )
+    if (!err) {
+      throw new Error(
+        `Deleverager scope too LOOSE: a ${label} dispatch was NOT reverted. The role could ` +
+          'MINT with user collateral — do NOT use this deployment.',
+      )
+    }
+    if (!isConditionViolation(err)) {
+      throw new Error(
+        `Deleverager scope check inconclusive: the ${label} dispatch reverted, but NOT with ` +
+          'a Roles ConditionViolation — it may have passed the scope gate and reverted ' +
+          `downstream. Do NOT trust this deployment. Revert: ${sanitizeError(err)}`,
+      )
+    }
+    log(`  ✓ ${label} dispatch was blocked by the Roles modifier (ConditionViolation)`)
+  }
 }

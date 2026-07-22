@@ -1,10 +1,16 @@
+import { DELEVERAGER_ROLE_KEY } from '@panoptic-eng/sdk/zodiac'
 import type { Account, Chain, PublicClient, Transport, WalletClient } from 'viem'
 
 import { assertBotIsNotSafeOwner, readSafeOwners } from '../../src/security/safeOwnerInvariant'
-import { type ConfigureCall, buildConfigureCalls, deployRolesModifier } from './deployCore'
+import {
+  type ConfigureCall,
+  type ExtraRoleSpec,
+  buildConfigureCalls,
+  deployRolesModifier,
+} from './deployCore'
 import type { Prompter } from './prompts'
 import type { SafeZodiacAddresses } from './safeZodiacRegistry'
-import { verifyLoanOnlyScope } from './verifyScope'
+import { verifyDeleveragerScope, verifyLoanOnlyScope } from './verifyScope'
 
 /**
  * Existing-Safe onboarding: wire a Roles v2 modifier + loan-only scope onto a
@@ -59,6 +65,7 @@ async function scopeReady(
     roleKey: `0x${string}`
     poolAddress: `0x${string}`
     poolId: bigint
+    extraRoles: ExtraRoleSpec[]
   },
 ): Promise<boolean> {
   if (!(await isModuleEnabled(publicClient, args.safeAddress, args.rolesModifierAddress))) {
@@ -74,6 +81,20 @@ async function scopeReady(
       poolId: args.poolId,
       log: () => {},
     })
+    // A requested deleverager role must also be live before setup can finish —
+    // otherwise an add-role re-run would report "already scoped" and skip it.
+    for (const spec of args.extraRoles) {
+      if (spec.kind !== 'deleverager') continue
+      await verifyDeleveragerScope({
+        publicClient,
+        rolesModifierAddress: args.rolesModifierAddress,
+        botAddress: spec.member,
+        roleKey: DELEVERAGER_ROLE_KEY,
+        poolAddress: args.poolAddress,
+        poolId: args.poolId,
+        log: () => {},
+      })
+    }
     return true
   } catch {
     return false
@@ -111,6 +132,8 @@ export interface ConfigureExistingSafeParams {
   roleKey: `0x${string}`
   poolAddress: `0x${string}`
   poolId: bigint
+  /** Additional à-la-carte roles to scope (owner executes; verified in the poll). */
+  extraRoles?: ExtraRoleSpec[]
   /** Salt for the modifier proxy deploy (only used when deploying a new one). */
   saltNonce: bigint
   /** Persist the modifier address as soon as it lands, for a clean resume. */
@@ -154,6 +177,7 @@ export async function configureExistingSafe(
     roleKey: params.roleKey,
     poolAddress: params.poolAddress,
     poolId: params.poolId,
+    extraRoles: params.extraRoles ?? [],
   }
 
   // 2. Idempotent: if the module is already enabled and this pool is scoped
@@ -175,6 +199,7 @@ export async function configureExistingSafe(
     botAddress: params.botAddress,
     roleKey: params.roleKey,
     poolAddress: params.poolAddress,
+    extraRoles: params.extraRoles,
     includeEnableModule,
   })
   printOwnerCalls(safeAddress, calls, log)

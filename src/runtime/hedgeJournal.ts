@@ -15,7 +15,16 @@ const journalIntentSchema = z
   .object({
     id: z.string().uuid(),
     createdAt: z.string().datetime(),
-    action: z.enum(['open', 'close_all', 'grow', 'shrink', 'flip', 'consolidate']),
+    action: z.enum([
+      'open',
+      'close_all',
+      'grow',
+      'shrink',
+      'flip',
+      'consolidate',
+      'deleverage_loans',
+      'deleverage_options',
+    ]),
     sender: addressSchema.nullable(),
     nonce: z.number().int().nonnegative().nullable(),
     target: addressSchema.nullable(),

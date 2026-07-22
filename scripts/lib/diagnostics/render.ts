@@ -58,6 +58,7 @@ export function renderStatus(s: StatusSnapshot): void {
   row('price signal', s.priceSignal)
   row('last poll', s.lastPoll)
   row('last hedge', s.lastHedge)
+  row('deleverager', s.deleverager)
   for (const note of s.notes) console.log(paint(33, `  note: ${note}`))
   console.log('')
 }

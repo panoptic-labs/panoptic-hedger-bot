@@ -27,7 +27,9 @@ export interface SamePoolLoanExecutorDeps {
 
 /** Convert price basis points to the smallest conservative Uniswap tick distance. */
 export function slippageBpsToTickDistance(slippageBps: bigint): bigint {
-  if (slippageBps < 0n || slippageBps > 500n) throw new Error('slippage bps out of bounds')
+  // Upper bound raised to 1000 so emergency deleverage burns (DELEVERAGE_SLIPPAGE_BPS,
+  // wider than the routine SLIPPAGE_BPS ≤500) can center a swap band.
+  if (slippageBps < 0n || slippageBps > 1000n) throw new Error('slippage bps out of bounds')
   if (slippageBps === 0n) return 0n
   let numerator = 1n
   let denominator = 1n

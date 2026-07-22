@@ -96,6 +96,17 @@ describe('HedgeJournal', () => {
     await target.recover(client(new Map([[HASH_A, 'success']]), BLOCK_HASH, [HASH_A]))
   })
 
+  it('journals the new deleverage stage actions', async () => {
+    for (const action of ['deleverage_loans', 'deleverage_options'] as const) {
+      const target = journal()
+      target.begin(action)
+      observe(target, [HASH_A])
+      const restarted = journal()
+      await restarted.recover(client(new Map([[HASH_A, 'success']])))
+      expect(restarted.checkpoint()).toEqual({ transactionHash: HASH_A, fromBlock: 100n })
+    }
+  })
+
   it('rejects replacement identity drift before it is persisted', () => {
     const target = journal()
     target.begin('open')

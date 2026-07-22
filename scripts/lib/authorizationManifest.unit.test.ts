@@ -1,4 +1,8 @@
-import { buildLoanOnlyDispatchConditions } from '@panoptic-eng/sdk/zodiac'
+import {
+  buildDeleveragerDispatchConditions,
+  buildLoanOnlyDispatchConditions,
+  DELEVERAGER_ROLE_KEY,
+} from '@panoptic-eng/sdk/zodiac'
 import type { Address, Hex, PublicClient } from 'viem'
 import { encodeAbiParameters, encodeEventTopics, parseAbiItem } from 'viem'
 import { describe, expect, it, vi } from 'vitest'
@@ -93,6 +97,37 @@ function scopeFunction() {
   )
 }
 
+function scopeTargetFor(role: Hex, target = POOL) {
+  return log(
+    encodeEventTopics({ abi: [scopeTargetEvent], eventName: 'ScopeTarget' }),
+    encodeAbiParameters([{ type: 'bytes32' }, { type: 'address' }], [role, target]),
+  )
+}
+
+function deleveragerScopeFunction() {
+  return log(
+    encodeEventTopics({ abi: [scopeFunctionEvent], eventName: 'ScopeFunction' }),
+    encodeAbiParameters(
+      [
+        { type: 'bytes32' },
+        { type: 'address' },
+        { type: 'bytes4' },
+        {
+          type: 'tuple[]',
+          components: [
+            { name: 'parent', type: 'uint8' },
+            { name: 'paramType', type: 'uint8' },
+            { name: 'operator', type: 'uint8' },
+            { name: 'compValue', type: 'bytes' },
+          ],
+        },
+        { type: 'uint8' },
+      ],
+      [DELEVERAGER_ROLE_KEY, POOL, DISPATCH, buildDeleveragerDispatchConditions(), 0],
+    ),
+  )
+}
+
 function client(logs: ReturnType<typeof log>[]): PublicClient {
   return {
     getBlockNumber: vi.fn().mockResolvedValue(100n),
@@ -139,5 +174,37 @@ describe('exact authorization manifest', () => {
     await expect(verify([...reviewed, scopeTarget(EXTRA)])).rejects.toThrow(
       /does not exactly match/,
     )
+  })
+
+  const deleveragerBundle = () => [
+    assign(BOT, DELEVERAGER_ROLE_KEY),
+    scopeTargetFor(DELEVERAGER_ROLE_KEY),
+    deleveragerScopeFunction(),
+  ]
+  const verifyWithDeleverager = (logs: ReturnType<typeof log>[]) =>
+    verifyExactAuthorizationManifest({
+      publicClient: client(logs),
+      rolesModifierAddress: MODIFIER,
+      botAddress: BOT,
+      roleKey: ROLE,
+      poolAddress: POOL,
+      deploymentBlock: 10n,
+      deleverager: { member: BOT, roleKey: DELEVERAGER_ROLE_KEY },
+    })
+
+  it('accepts loan + burn-only deleverager when the deleverager arg is passed', async () => {
+    await expect(
+      verifyWithDeleverager([...reviewed, ...deleveragerBundle()]),
+    ).resolves.toBeUndefined()
+  })
+
+  it('rejects the deleverager role on-chain when it was not expected', async () => {
+    await expect(verify([...reviewed, ...deleveragerBundle()])).rejects.toThrow(
+      /does not exactly match/,
+    )
+  })
+
+  it('rejects when the deleverager was expected but is absent on-chain', async () => {
+    await expect(verifyWithDeleverager(reviewed)).rejects.toThrow(/does not exactly match/)
   })
 })

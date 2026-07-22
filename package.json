@@ -24,6 +24,7 @@
     "deploy:safe-roles": "tsx scripts/deploySafeAndRoles.ts",
     "scope:bot-role": "tsx scripts/scopeBotRole.ts",
     "manage-role": "tsx scripts/manageRole.ts",
+    "generate:idea": "tsx scripts/generateIdea.ts",
     "typecheck": "tsc --noEmit -p tsconfig.build.json",
     "lint": "eslint . --ext .ts,.tsx --ignore-pattern 'dist/**' --max-warnings=0",
     "lint:fix": "pnpm lint --fix",

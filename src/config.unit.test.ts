@@ -1,7 +1,8 @@
+import { DELEVERAGER_ROLE_KEY as SDK_DELEVERAGER_ROLE_KEY } from '@panoptic-eng/sdk/zodiac'
 import { parseGwei } from 'viem'
 import { describe, expect, it } from 'vitest'
 
-import { parseHedgerBotConfig } from './config'
+import { deleveragerRoleKey, parseHedgerBotConfig } from './config'
 
 const BASE_ENV = {
   CHAIN_ID: '1',
@@ -37,6 +38,81 @@ describe('parseHedgerBotConfig', () => {
     expect(cfg.DRY_RUN).toBe(true)
     expect(cfg.DELTA_THRESHOLD_BPS).toBe(150n)
     expect(cfg.POLL_INTERVAL_MS).toBe(30_000)
+  })
+
+  it('defaults the deleverager off with sane tunables', () => {
+    const cfg = parseHedgerBotConfig({ ...BASE_ENV })
+    expect(cfg.DELEVERAGER_ENABLED).toBe(false)
+    expect(cfg.DELEVERAGE_TRIGGER_MARGIN_BPS).toBe(500n)
+    expect(cfg.DELEVERAGE_TARGET_MARGIN_BPS).toBe(1_500n)
+    expect(cfg.DELEVERAGE_SLIPPAGE_BPS).toBe(300)
+    expect(cfg.DELEVERAGE_COOLDOWN_MS).toBe(300_000)
+  })
+
+  it('deleveragerRoleKey falls back to the SDK canonical key when unset', () => {
+    expect(deleveragerRoleKey({ DELEVERAGER_ROLE_KEY: undefined })).toBe(SDK_DELEVERAGER_ROLE_KEY)
+  })
+
+  it('deleveragerRoleKey returns a configured override unchanged', () => {
+    const override = ('0x' + 'cd'.repeat(32)) as `0x${string}`
+    expect(deleveragerRoleKey({ DELEVERAGER_ROLE_KEY: override })).toBe(override)
+  })
+
+  it('accepts an enabled deleverager with valid tunables', () => {
+    const cfg = parseHedgerBotConfig({ ...BASE_ENV, DELEVERAGER_ENABLED: 'true' })
+    expect(cfg.DELEVERAGER_ENABLED).toBe(true)
+  })
+
+  it('rejects a deleverager role key that equals ROLE_KEY', () => {
+    expect(() =>
+      parseHedgerBotConfig({
+        ...BASE_ENV,
+        DELEVERAGER_ENABLED: 'true',
+        DELEVERAGER_ROLE_KEY: BASE_ENV.ROLE_KEY,
+      }),
+    ).toThrow(/must differ from ROLE_KEY/)
+  })
+
+  it('rejects a deleverager role key set while disabled', () => {
+    expect(() =>
+      parseHedgerBotConfig({
+        ...BASE_ENV,
+        DELEVERAGER_ROLE_KEY: '0x' + 'ab'.repeat(32),
+      }),
+    ).toThrow(/DELEVERAGER_ENABLED is false/)
+  })
+
+  it('rejects a trigger at or above the target when enabled', () => {
+    expect(() =>
+      parseHedgerBotConfig({
+        ...BASE_ENV,
+        DELEVERAGER_ENABLED: 'true',
+        DELEVERAGE_TRIGGER_MARGIN_BPS: '1500',
+        DELEVERAGE_TARGET_MARGIN_BPS: '1500',
+      }),
+    ).toThrow(/below DELEVERAGE_TARGET_MARGIN_BPS/)
+  })
+
+  it('rejects a trigger at or above MIN_MARGIN_RESERVE_BPS when enabled', () => {
+    expect(() =>
+      parseHedgerBotConfig({
+        ...BASE_ENV,
+        DELEVERAGER_ENABLED: 'true',
+        DELEVERAGE_TRIGGER_MARGIN_BPS: '2000',
+        MIN_MARGIN_RESERVE_BPS: '2000',
+        DELEVERAGE_TARGET_MARGIN_BPS: '3000',
+      }),
+    ).toThrow(/below MIN_MARGIN_RESERVE_BPS/)
+  })
+
+  it('does not enforce deleverage tuning relationships while disabled', () => {
+    // trigger >= target would be rejected only when enabled.
+    const cfg = parseHedgerBotConfig({
+      ...BASE_ENV,
+      DELEVERAGE_TRIGGER_MARGIN_BPS: '4000',
+      DELEVERAGE_TARGET_MARGIN_BPS: '1500',
+    })
+    expect(cfg.DELEVERAGER_ENABLED).toBe(false)
   })
 
   it('rejects removed cross-pool execution settings', () => {

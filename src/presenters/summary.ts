@@ -42,6 +42,50 @@ export function formatCycleSummary(
   return lines.join('\n')
 }
 
+/** Format a deleverage stage result for the console + Telegram (identical). */
+export function formatDeleverageSummary(params: {
+  label: string
+  stage: 'loans' | 'options' | 'rehedge'
+  dryRun: boolean
+  bufferBps: bigint
+  triggerMarginBps: bigint
+  burnedTokenIds: bigint[]
+  transactionHash?: string | null
+  projectedBufferBps?: bigint | null
+  burnedAll?: boolean
+}): string {
+  const tag = params.dryRun ? '🟡 DELEVERAGE (dry-run — would burn)' : '🟥 DELEVERAGE EXECUTED'
+  const stageLabel =
+    params.stage === 'loans'
+      ? 'hedge loans'
+      : params.stage === 'rehedge'
+        ? 're-hedge (loan role)'
+        : 'options'
+  const lines = [
+    `━━━━━━ ${tag} ━━━━━━`,
+    `🚨 ${params.label} · stage: ${stageLabel}`,
+    `margin buffer ${params.bufferBps}bps (trigger ${params.triggerMarginBps}bps)`,
+    `🟥 ${params.stage === 'rehedge' ? 'adjusting' : 'burning'}: ${
+      params.burnedTokenIds.length ? params.burnedTokenIds.join(', ') : 'none'
+    }`,
+  ]
+  if (params.projectedBufferBps !== undefined && params.projectedBufferBps !== null) {
+    lines.push(`   projected margin buffer after close+rehedge: ${params.projectedBufferBps}bps`)
+  }
+  if (params.burnedAll) lines.push('   ⚠️ no subset reached target — burning ALL options')
+  if (params.transactionHash) lines.push(`🔗 tx: ${params.transactionHash}`)
+  lines.push('━━━━━━━━━━━━━━━━━━━━━━━')
+  return sanitizeText(lines.join('\n'))
+}
+
+/** CRITICAL page: still at risk after all deleverage stages. */
+export function formatDeleverageExhausted(label: string, bufferBps: bigint): string {
+  return sanitizeText(
+    `🆘 CRITICAL hedger-bot ${label} — account STILL at risk after deleveraging ` +
+      `(margin buffer ${bufferBps}bps). Manual intervention required.`,
+  )
+}
+
 /** Format a skipped cycle (unsafe / stale) into a Telegram message. */
 export function formatSkip(label: string, reasons: string[]): string {
   return sanitizeText(`⚠️ hedger-bot ${label} — skipped hedging: ${reasons.join('; ')}`)

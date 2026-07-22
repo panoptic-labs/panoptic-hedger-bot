@@ -192,17 +192,23 @@ export interface ExtraRoleSpec {
   member: `0x${string}`
   /** roller / size-adjuster only: reopen size cap (0n = uncapped). */
   sizeCap?: bigint
+  /**
+   * deleverager only: role key to scope. Defaults to the SDK canonical key.
+   * Set to the operator's `DELEVERAGER_ROLE_KEY` override so provisioning and
+   * the doctor/manifest checks agree on the same on-chain key.
+   */
+  roleKey?: `0x${string}`
 }
 
 /** Build the Roles scope steps for an extra role, given the deployed Safe. */
-function buildExtraRoleSteps(
+export function buildExtraRoleSteps(
   spec: ExtraRoleSpec,
   pool: `0x${string}`,
   safe: `0x${string}`,
 ): ScopeStep[] {
   switch (spec.kind) {
     case 'deleverager':
-      return buildDeleveragerRoleSteps({ member: spec.member, pool })
+      return buildDeleveragerRoleSteps({ member: spec.member, pool, roleKey: spec.roleKey })
     case 'maintenance':
       return buildMaintenanceRoleSteps({ member: spec.member, pool, safe })
     case 'roller':

@@ -11,6 +11,7 @@
  * This suite never skips. Missing/unreachable fork configuration is a failure.
  */
 
+import { DELEVERAGER_ROLE_KEY } from '@panoptic-eng/sdk/zodiac'
 import {
   type PublicClient,
   createPublicClient,
@@ -37,7 +38,7 @@ import { renderEnvFile } from './lib/renderEnv'
 import { execFromSoleOwner } from './lib/safeExec'
 import { getSafeZodiacAddresses, verifySafeAndRolesProxyIdentities } from './lib/safeZodiacRegistry'
 import { fetchProxyCreationCode, makeSafeAddressPredictor } from './lib/vanitySafe'
-import { verifyLoanOnlyScope } from './lib/verifyScope'
+import { verifyDeleveragerScope, verifyLoanOnlyScope } from './lib/verifyScope'
 
 const RPC_URL = process.env.HEDGER_FORK_RPC_URL
 if (!RPC_URL) {
@@ -251,6 +252,81 @@ describe('hedger-bot setup core (mainnet fork)', () => {
       env[t.slice(0, eq)] = t.slice(eq + 1)
     }
     expect(() => parseHedgerBotConfig(env)).not.toThrow()
+  }, 120_000)
+
+  // Opt-in deleverager: deploy a fresh Safe scoping BOTH the loan role and the
+  // bot-held burn-only deleverager role, then prove the burn-only boundary on
+  // the real Roles v2.1 mastercopy (zero sizes pass, non-zero blocked) and that
+  // the exact manifest admits {loan + deleverager} and nothing else.
+  it('scopes and verifies the burn-only deleverager role alongside the loan role', async () => {
+    const addresses = getSafeZodiacAddresses(CHAIN_ID)
+    const walletClient = createWalletClient({
+      account: deployer,
+      chain: mainnet,
+      transport: http(RPC_URL),
+    })
+    const delevRoleKey = `0x${'12'.repeat(32)}` as `0x${string}`
+    const result = await deploySafeAndRoles({
+      publicClient,
+      walletClient,
+      botAddress: bot.address,
+      poolAddress: POOL_ADDRESS,
+      roleKey: delevRoleKey,
+      addresses,
+      saltNonce: 777001n,
+      extraRoles: [{ kind: 'deleverager', member: bot.address }],
+      finalSafeOwner: privateKeyToAccount(generatePrivateKey()).address,
+      log: () => {},
+    })
+    const rolesBlock = result.rolesDeploymentBlock
+    if (rolesBlock === undefined) throw new Error('expected rolesDeploymentBlock')
+
+    // Loan role still loan-only; deleverager role is burn-or-revert.
+    await expect(
+      verifyLoanOnlyScope({
+        publicClient,
+        rolesModifierAddress: result.rolesModifierAddress,
+        botAddress: bot.address,
+        roleKey: delevRoleKey,
+        poolAddress: POOL_ADDRESS,
+        poolId: SYNTHETIC_POOL_ID,
+        log: () => {},
+      }),
+    ).resolves.toBeUndefined()
+    await expect(
+      verifyDeleveragerScope({
+        publicClient,
+        rolesModifierAddress: result.rolesModifierAddress,
+        botAddress: bot.address,
+        roleKey: DELEVERAGER_ROLE_KEY,
+        poolAddress: POOL_ADDRESS,
+        poolId: SYNTHETIC_POOL_ID,
+        log: () => {},
+      }),
+    ).resolves.toBeUndefined()
+
+    // Exact manifest passes WITH the deleverager arg, and fails without it.
+    await expect(
+      verifyExactAuthorizationManifest({
+        publicClient,
+        rolesModifierAddress: result.rolesModifierAddress,
+        botAddress: bot.address,
+        roleKey: delevRoleKey,
+        poolAddress: POOL_ADDRESS,
+        deploymentBlock: rolesBlock,
+        deleverager: { member: bot.address, roleKey: DELEVERAGER_ROLE_KEY },
+      }),
+    ).resolves.toBeUndefined()
+    await expect(
+      verifyExactAuthorizationManifest({
+        publicClient,
+        rolesModifierAddress: result.rolesModifierAddress,
+        botAddress: bot.address,
+        roleKey: delevRoleKey,
+        poolAddress: POOL_ADDRESS,
+        deploymentBlock: rolesBlock,
+      }),
+    ).rejects.toThrow(/does not exactly match/)
   }, 120_000)
 
   // Existing-Safe path: deploy a clean 1-of-1 Safe the "user" owns, then run the

@@ -157,3 +157,55 @@ Cross-pool and asynchronous swap executors are intentionally outside the v1
 runtime. Their earlier prototypes were removed so the shipped configuration,
 recovery journal, and Roles proposal describe one execution model: in-pool,
 loan-only dispatch.
+
+## Emergency deleverager (optional)
+
+When `DELEVERAGER_ENABLED=true`, the bot force-closes positions instead of only
+alerting once the account is liquidatable or its **margin buffer** — the SDK
+liquidation distance `(currentMargin − requiredMargin) / requiredMargin`,
+account-level and cross-collateral — drops below `DELEVERAGE_TRIGGER_MARGIN_BPS`.
+It closes **options first** through the burn-only deleverager role, because
+options are the risk/margin driver. Candidates are ranked by the **simulated
+health impact of closing the option AND rehedging the freed delta** (largest
+|delta| tried first, since closing a big-delta option unwinds the most hedge
+loans); the freed delta is then **re-hedged in-cycle** via the loan role, so the
+oversized loans shrink immediately rather than next poll. Only as a last resort
+(no options left, still at risk) does it burn its own hedge loans outright.
+
+This runs **even while the pool is paused**: a paused (safe-mode) Panoptic pool
+is burn/close-only — mints revert but burns land — so deleveraging works exactly
+when it's needed most. The only thing suppressed while paused is a rehedge that
+would *mint* a loan (a hedge *grow*); pure loan-shrinking burns still proceed.
+Everything runs urgent and bypasses the basefee deferral gate — a liquidation
+penalty dwarfs any gas spike.
+
+**Provision on an existing deployment** (owner executes; the bot holds the role):
+
+```bash
+ROLE=deleverager MEMBER=<bot-eoa> ACTION=provision \
+POOL_ADDRESS=0x… SAFE_ADDRESS=0x… ROLES_MODIFIER_ADDRESS=0x… \
+CHAIN_ID=1 pnpm manage-role > deleverager-proposal.json
+# execute in the Safe UI, then set DELEVERAGER_ENABLED=true in .env and re-run `pnpm activate`.
+```
+
+Enabling it bumps the activation policy version, so **existing activation markers
+are invalidated** — you must re-run `pnpm activate` after turning it on.
+
+**Alerts.** Telegram (never rate-limited) fires when the trigger is detected, on
+each stage result (with the burned tokenIds and tx hash), and — critically — if
+the account is STILL at risk after all stages (`🆘 CRITICAL … manual intervention
+required`). Treat that CRITICAL alert as a page: inspect the Safe positions,
+add collateral, or close positions manually.
+
+**Verify what was burned.** `pnpm status` shows the deleverager line (last stage,
+margin buffer, and whether an incident is active). The burned tokenIds are in the
+Telegram/console stage summary and on-chain in the dispatch tx.
+
+**Disable it.** Set `DELEVERAGER_ENABLED=false` and restart (the bot reverts to
+skip-and-alert). To also remove the on-chain capability, revoke the member:
+`ROLE=deleverager MEMBER=<bot-eoa> ACTION=revoke … pnpm manage-role`.
+`pnpm deactivate` also halts deleveraging (it shares the send kill switch).
+
+The deleverager role can **only burn** (every `positionSizes` entry must be 0):
+it cannot mint, move funds, or settle premium. `pnpm run doctor` fails (not
+warns) if it is enabled but the burn-only scope is not live on-chain.

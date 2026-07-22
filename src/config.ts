@@ -1,3 +1,4 @@
+import { DELEVERAGER_ROLE_KEY as SDK_DELEVERAGER_ROLE_KEY } from '@panoptic-eng/sdk/zodiac'
 import { getAddress, isAddress, isHex, parseEther, parseUnits, size } from 'viem'
 import { z } from 'zod'
 
@@ -122,6 +123,17 @@ const boundedEth = (min: string, max: string, defaultValue: string) =>
   boundedAmount(parseEther, min, max, defaultValue)
 
 export const PRICE_SIGNAL_SOURCES = ['pool-tick', 'uniswap-pool', 'cex'] as const
+
+/**
+ * Schema defaults for the emergency deleverager tunables. Single source of
+ * truth so the `.env` renderer and docs never drift from the parser.
+ */
+export const DELEVERAGE_DEFAULTS = {
+  TRIGGER_MARGIN_BPS: 500n,
+  TARGET_MARGIN_BPS: 1_500n,
+  SLIPPAGE_BPS: 300,
+  COOLDOWN_MS: 300_000,
+} as const
 export type PriceSignalSourceKind = (typeof PRICE_SIGNAL_SOURCES)[number]
 
 const rawEnvSchema = z
@@ -157,6 +169,40 @@ const rawEnvSchema = z
     // 100 bps maps conservatively to a ±100 tick execution band for in-pool loans.
     SLIPPAGE_BPS: boundedInteger(0, 500, 100),
     MIN_MARGIN_RESERVE_BPS: boundedBigint(500n, 9_000n, 2_000n),
+
+    // Emergency deleverager (optional, opt-in; see README). When enabled the bot
+    // EOA holds a second, burn-only role key on the same Roles modifier and
+    // force-closes positions when the account is liquidatable or its margin
+    // buffer (distance to liquidation) falls below the trigger — options first
+    // (ranked by the simulated close+rehedge health impact), rehedging the freed
+    // delta in-cycle. Runs even while the pool is paused (safe-mode is close-only).
+    DELEVERAGER_ENABLED: booleanSchema.default('false'),
+    // Defaults to the SDK's canonical deleverager role key; set only when the
+    // modifier was scoped with a custom key.
+    DELEVERAGER_ROLE_KEY: bytes32Schema.optional(),
+    // Deleverage when the margin buffer — the SDK liquidation "distance"
+    // (currentMargin − requiredMargin) / requiredMargin, cross-collateral,
+    // account-level — drops below this (bps). Deliberately far below
+    // MIN_MARGIN_RESERVE_BPS (which gates NEW mints) so routine hedging never
+    // trips it.
+    DELEVERAGE_TRIGGER_MARGIN_BPS: boundedBigint(
+      50n,
+      5_000n,
+      DELEVERAGE_DEFAULTS.TRIGGER_MARGIN_BPS,
+    ),
+    // Hysteresis clear line: a deleverage incident ends (and burning stops) once
+    // the margin buffer recovers to this (bps).
+    DELEVERAGE_TARGET_MARGIN_BPS: boundedBigint(
+      100n,
+      9_000n,
+      DELEVERAGE_DEFAULTS.TARGET_MARGIN_BPS,
+    ),
+    // Emergency burn tick band — wider than SLIPPAGE_BPS on purpose: ITM burns
+    // swap in-pool, and a band revert here means staying at liquidation risk.
+    DELEVERAGE_SLIPPAGE_BPS: boundedInteger(0, 1_000, DELEVERAGE_DEFAULTS.SLIPPAGE_BPS),
+    // Per-stage re-fire throttle while an incident is open, so a burn whose
+    // effect has not landed yet does not re-fire every poll.
+    DELEVERAGE_COOLDOWN_MS: boundedInteger(60_000, 3_600_000, DELEVERAGE_DEFAULTS.COOLDOWN_MS),
 
     // Price signal source
     PRICE_SIGNAL_SOURCE: z.enum(PRICE_SIGNAL_SOURCES).default('pool-tick'),
@@ -318,6 +364,42 @@ const rawEnvSchema = z
         message: 'production CEX mode requires all three independent feeds',
       })
     }
+    if (cfg.DELEVERAGER_ROLE_KEY !== undefined && !cfg.DELEVERAGER_ENABLED) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['DELEVERAGER_ROLE_KEY'],
+        message:
+          'is set but DELEVERAGER_ENABLED is false — enable the deleverager or remove the key',
+      })
+    }
+    if (cfg.DELEVERAGER_ENABLED) {
+      const effectiveKey = (cfg.DELEVERAGER_ROLE_KEY ?? SDK_DELEVERAGER_ROLE_KEY).toLowerCase()
+      if (effectiveKey === cfg.ROLE_KEY.toLowerCase()) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['DELEVERAGER_ROLE_KEY'],
+          message: 'must differ from ROLE_KEY (the burn-only key must not be the loan-hedger key)',
+        })
+      }
+    }
+    // The deleverage tuning relationships only bind when the feature is enabled.
+    if (cfg.DELEVERAGER_ENABLED) {
+      if (cfg.DELEVERAGE_TRIGGER_MARGIN_BPS >= cfg.DELEVERAGE_TARGET_MARGIN_BPS) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['DELEVERAGE_TRIGGER_MARGIN_BPS'],
+          message: 'must be below DELEVERAGE_TARGET_MARGIN_BPS (hysteresis needs a gap)',
+        })
+      }
+      if (cfg.DELEVERAGE_TRIGGER_MARGIN_BPS >= cfg.MIN_MARGIN_RESERVE_BPS) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['DELEVERAGE_TRIGGER_MARGIN_BPS'],
+          message:
+            'must be below MIN_MARGIN_RESERVE_BPS (emergency burns must trigger only below the mint gate)',
+        })
+      }
+    }
     const hasTgToken = Boolean(cfg.TELEGRAM_BOT_TOKEN)
     const hasTgChat = Boolean(cfg.TELEGRAM_CHAT_ID)
     if (hasTgToken !== hasTgChat) {
@@ -330,6 +412,17 @@ const rawEnvSchema = z
   })
 
 export type HedgerBotConfig = z.infer<typeof rawEnvSchema>
+
+/**
+ * Effective deleverager role key: the explicit override when set, otherwise the
+ * SDK's canonical `roleKey('deleverager')`. Only meaningful when
+ * DELEVERAGER_ENABLED (validation rejects an override while disabled).
+ */
+export function deleveragerRoleKey(
+  config: Pick<HedgerBotConfig, 'DELEVERAGER_ROLE_KEY'>,
+): `0x${string}` {
+  return config.DELEVERAGER_ROLE_KEY ?? SDK_DELEVERAGER_ROLE_KEY
+}
 
 const REMOVED_CROSS_POOL_KEYS = [
   'HEDGE_VENUE',

@@ -1,4 +1,7 @@
-import { buildLoanOnlyDispatchConditions } from '@panoptic-eng/sdk/zodiac'
+import {
+  buildDeleveragerDispatchConditions,
+  buildLoanOnlyDispatchConditions,
+} from '@panoptic-eng/sdk/zodiac'
 import type { Address, Hex, PublicClient } from 'viem'
 import { decodeEventLog, getAddress, zeroAddress } from 'viem'
 
@@ -287,7 +290,12 @@ function comparable(state: ManifestState) {
   }
 }
 
-function expectedManifest(botAddress: Address, roleKey: Hex, poolAddress: Address): ManifestState {
+function expectedManifest(
+  botAddress: Address,
+  roleKey: Hex,
+  poolAddress: Address,
+  deleverager?: { member: Address; roleKey: Hex },
+): ManifestState {
   const expected = emptyState()
   expected.members.set(`${roleKey.toLowerCase()}:${address(botAddress)}`, true)
   expected.enabledModules.add(address(botAddress))
@@ -296,6 +304,21 @@ function expectedManifest(botAddress: Address, roleKey: Hex, poolAddress: Addres
     options: 0,
     conditions: normalizeConditions(buildLoanOnlyDispatchConditions()),
   })
+  if (deleverager) {
+    expected.members.set(
+      `${deleverager.roleKey.toLowerCase()}:${address(deleverager.member)}`,
+      true,
+    )
+    expected.enabledModules.add(address(deleverager.member))
+    expected.targets.set(roleTarget(deleverager.roleKey, poolAddress), {
+      clearance: 'function',
+      options: 0,
+    })
+    expected.functions.set(roleFunction(deleverager.roleKey, poolAddress, DISPATCH_SELECTOR), {
+      options: 0,
+      conditions: normalizeConditions(buildDeleveragerDispatchConditions()),
+    })
+  }
   return expected
 }
 
@@ -307,6 +330,9 @@ export async function verifyExactAuthorizationManifest(params: {
   roleKey: Hex
   poolAddress: Address
   deploymentBlock: bigint
+  // When set, the reviewed manifest additionally admits the burn-only
+  // deleverager role for this member (and nothing else).
+  deleverager?: { member: Address; roleKey: Hex }
 }): Promise<void> {
   const actual = comparable(
     await reconstructManifest(
@@ -316,12 +342,13 @@ export async function verifyExactAuthorizationManifest(params: {
     ),
   )
   const expected = comparable(
-    expectedManifest(params.botAddress, params.roleKey, params.poolAddress),
+    expectedManifest(params.botAddress, params.roleKey, params.poolAddress, params.deleverager),
   )
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     throw new Error(
       `deployed Roles permission graph does not exactly match the reviewed single-member, ` +
-        `single-pool, loan-only manifest; re-onboard with a fresh role/modifier`,
+        `single-pool manifest (loan-only${params.deleverager ? ' + burn-only deleverager' : ''}); ` +
+        `re-onboard with a fresh role/modifier`,
     )
   }
 }

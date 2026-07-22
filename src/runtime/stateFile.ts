@@ -36,6 +36,17 @@ const runtimeStateSchema = z
       .string()
       .regex(/^0x[0-9a-fA-F]+$/)
       .optional(),
+    lastDeleverageAt: iso.optional(),
+    lastDeleverageStage: z.enum(['loans', 'options']).optional(),
+    lastDeleverageTx: z
+      .string()
+      .regex(/^0x[0-9a-fA-F]+$/)
+      .optional(),
+    // Last observed margin buffer (bps). `lastMinReserveBps` is the pre-v2
+    // name kept optional so an older heartbeat file still parses (read-compat).
+    lastBufferBps: z.string().regex(/^\d+$/).optional(),
+    lastMinReserveBps: z.string().regex(/^\d+$/).optional(),
+    deleverageIncidentActive: z.boolean().optional(),
     notificationLastSuccessAt: iso.optional(),
     notificationLastFailureAt: iso.optional(),
     notificationConsecutiveFailures: z.number().int().nonnegative().optional(),

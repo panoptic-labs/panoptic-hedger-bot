@@ -324,16 +324,70 @@ in the SDK).
 > loan-shape/size/tick bounds are enforced by the role. Experimental swap
 > executors are not part of the supported runtime.
 
-### Extra keeper roles (experimental)
+### Emergency deleverager (optional)
 
-The SDK also defines à-la-carte roles beyond loan-only — `deleverager` (burn-only
-close), `maintenance` (force-exercise / settle / liquidate third-party accounts —
-high privilege), `roller`, and `size-adjuster`. This bot's runtime does **not**
-exercise them, so `pnpm onboard` does not scope them. If you run a separate keeper
-that uses these capabilities, scope one onto an existing modifier with
-`pnpm manage-role` (below). Any extra role/member makes the modifier differ from
-the exact production manifest, so `doctor` warns about the experimental permission
-graph. Re-onboard with a fresh modifier to restore the exact manifest.
+By default, when the account is liquidatable the bot **skips and alerts** — it
+cannot de-risk on its own. Enabling the deleverager lets the bot actively
+force-close positions when the account is liquidatable or its **margin buffer** —
+the SDK liquidation distance `(currentMargin − requiredMargin) / requiredMargin`,
+account-level and cross-collateral — falls below a trigger:
+
+1. **Stage 1** closes options first — through a second, **burn-only** role key
+   held by the same bot EOA. Options are the risk/margin driver, so closing them
+   is what actually de-risks. Candidates are ranked by the **simulated health
+   impact of closing the option *and* rehedging the freed delta** (biggest-|delta|
+   first — closing a large-delta option unwinds the most hedge loans), and the
+   freed delta is **re-hedged in the same cycle** via the loan role so the
+   now-oversized loans shrink immediately. Burning the loans first would instead
+   strip the hedge and leave the book *more* exposed.
+2. **Fallback:** if there are no options left to close and the account is still
+   at risk, the bot burns its own hedge loans (loan role) to relieve margin.
+
+This works **even while the pool is paused**: a paused (safe-mode) Panoptic pool
+is burn/close-only, so the emergency force-close still lands. Only a rehedge that
+would *mint* a loan is deferred while paused; loan-shrinking burns proceed.
+
+The deleverager role can **only burn** (every `positionSizes` entry must be 0 —
+a zero size can never mint, and the whole dispatch reverts otherwise). It
+**cannot mint, cannot move funds, and cannot settle premium**. Funds always stay
+in the Safe. It is disabled by default; enable it with `DELEVERAGER_ENABLED=true`.
+
+Provision it:
+
+- **New deployment:** `pnpm onboard` asks whether to provision it (default no).
+- **Existing deployment:** scope it onto your modifier and enable it in `.env`:
+  ```bash
+  ROLE=deleverager MEMBER=<bot-eoa> ACTION=provision \
+  POOL_ADDRESS=0x… SAFE_ADDRESS=0x… ROLES_MODIFIER_ADDRESS=0x… \
+  CHAIN_ID=1 pnpm manage-role > deleverager-proposal.json
+  # import into the Safe UI, execute, then set DELEVERAGER_ENABLED=true and re-run `pnpm activate`
+  ```
+
+Tunables (schema defaults): `DELEVERAGE_TRIGGER_MARGIN_BPS=500` (act below a 5%
+margin buffer — far below the `MIN_MARGIN_RESERVE_BPS` mint gate),
+`DELEVERAGE_TARGET_MARGIN_BPS=1500` (hysteresis clear line),
+`DELEVERAGE_SLIPPAGE_BPS=300` (wider burn band for ITM), `DELEVERAGE_COOLDOWN_MS=300000`.
+`doctor`/`activate` verify the burn-only boundary on-chain when it is enabled.
+
+> **Threat model note:** enabling the deleverager widens the bot key's blast
+> radius from "mint/burn loans" to "burn any position." A compromised key could
+> grief you by force-closing positions, but funds remain in the Safe (the role
+> cannot withdraw or mint). Disable it (`DELEVERAGER_ENABLED=false`, and
+> optionally revoke on-chain) if that trade-off isn't worth it for you.
+
+### Other extra keeper roles (experimental)
+
+The SDK also defines à-la-carte roles beyond loan-only and the deleverager —
+`maintenance` (force-exercise / settle / liquidate third-party accounts — high
+privilege), `roller`, and `size-adjuster`. This bot's runtime does **not**
+exercise them, so `pnpm onboard` does not scope them and `pnpm manage-role
+ACTION=provision` deliberately refuses them (only the reviewed burn-only
+`deleverager` may be provisioned). If you run a separate keeper that uses these
+capabilities, scope it out-of-band with your own tooling. Any extra role/member
+beyond the reviewed {loan} or {loan + deleverager} manifest makes the modifier
+differ from the exact production manifest, so `doctor` warns about the
+experimental permission graph. Re-onboard with a fresh modifier to restore the
+exact manifest.
 
 ### Changing role membership later
 
@@ -342,14 +396,17 @@ membership is changed by the **Safe**, not the bot host. `pnpm manage-role` emit
 unsigned Safe Transaction Builder JSON:
 
 ```bash
-ROLE=deleverager MEMBER=0x… ENABLED=true \
+ROLE=deleverager MEMBER=0x… ACTION=assign \
 SAFE_ADDRESS=0x… ROLES_MODIFIER_ADDRESS=0x… \
 CHAIN_ID=… pnpm manage-role > role-proposal.json
 ```
 
 `ROLE` is a canonical name (`deleverager`/`maintenance`/`roller`/`size-adjuster`)
-or a bytes32 role key (e.g. the bot's `ROLE_KEY` from `.env`); `ENABLED=false`
-revokes. No Safe-owner key variable is accepted. Import the JSON into the Safe
+or a bytes32 role key (e.g. the bot's `ROLE_KEY` from `.env`). `ACTION` selects
+`assign` (default — add the member), `revoke` (remove the member), or `provision`
+(the full assign + scopeTarget + scopeFunction batch for a named role on
+`POOL_ADDRESS` — the existing-deployment path for the deleverager). No Safe-owner
+key variable is accepted. Import the JSON into the Safe
 UI, inspect/simulate the batch, and collect the Safe's configured threshold
 approvals.
 

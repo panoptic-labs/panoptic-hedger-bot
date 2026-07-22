@@ -35,6 +35,7 @@ export interface StatusSnapshot {
   priceSignal?: string
   lastPoll?: string
   lastHedge?: string
+  deleverager?: string
   notes: string[]
 }
 
@@ -85,6 +86,17 @@ export async function gatherStatus(ctx: StatusDiagnosticsContext): Promise<Statu
     lastHedge: state?.lastHedgeAt
       ? `${fmtAgo(state.lastHedgeAt)} (${state.lastHedgeAction ?? '?'}${state.lastHedgeTx ? ` ${state.lastHedgeTx}` : ''})`
       : 'never',
+    deleverager: !config.DELEVERAGER_ENABLED
+      ? 'disabled'
+      : stateIdentityMatches && state?.lastDeleverageAt
+        ? `enabled — last ${fmtAgo(state.lastDeleverageAt)} (${state.lastDeleverageStage ?? '?'}` +
+          `${
+            (state.lastBufferBps ?? state.lastMinReserveBps) !== undefined
+              ? `, buffer ${state.lastBufferBps ?? state.lastMinReserveBps}bps`
+              : ''
+          }` +
+          `${state.deleverageIncidentActive ? ', INCIDENT ACTIVE' : ''})`
+        : 'enabled — no incidents',
     notes,
   }
   if (!activated && !config.DRY_RUN)

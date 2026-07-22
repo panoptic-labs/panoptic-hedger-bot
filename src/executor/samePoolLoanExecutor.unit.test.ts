@@ -69,7 +69,8 @@ describe('slippageBpsToTickDistance', () => {
 
   it('rejects values outside the configuration policy', () => {
     expect(() => slippageBpsToTickDistance(-1n)).toThrow(/out of bounds/)
-    expect(() => slippageBpsToTickDistance(501n)).toThrow(/out of bounds/)
+    // 1000 is the raised ceiling (emergency deleverage band); 1001 is out.
+    expect(() => slippageBpsToTickDistance(1001n)).toThrow(/out of bounds/)
   })
 })
 

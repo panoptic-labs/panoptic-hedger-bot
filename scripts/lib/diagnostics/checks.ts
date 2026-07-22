@@ -1,6 +1,7 @@
 import { getPool, getPoolMetadata } from '@panoptic-eng/sdk/v2'
 import { formatEther } from 'viem'
 
+import { deleveragerRoleKey } from '../../../src/config'
 import { validateBotToken } from '../../../src/notify/telegramOnboard'
 import { createPriceSignalSource, PriceSignalUnavailableError } from '../../../src/priceSignal'
 import { rolesModifierV2Abi } from '../../../src/safe/rolesAbi'
@@ -18,7 +19,7 @@ import {
   verifySafeAndRolesProxyIdentities,
 } from '../safeZodiacRegistry'
 import { hasCode } from '../txWait'
-import { verifyLoanOnlyScope } from '../verifyScope'
+import { verifyDeleveragerScope, verifyLoanOnlyScope } from '../verifyScope'
 import type { DiagnosticsContext } from './context'
 
 export type CheckStatus = 'pass' | 'warn' | 'fail' | 'skip'
@@ -317,6 +318,48 @@ export async function runDoctorChecks(
     push(skip('scope', 'Loan-only scope', 'pool metadata or bot key unavailable'))
   }
 
+  // 7b. Deleverager scope (only when enabled): zero sizes pass, non-zero blocked.
+  // A failure here BLOCKS activation — an enabled deleverager whose burn-only
+  // boundary cannot be proven on-chain must not go live.
+  if (config.DELEVERAGER_ENABLED) {
+    if (poolId !== undefined && botAddress) {
+      try {
+        await verifyDeleveragerScope({
+          publicClient,
+          rolesModifierAddress: config.ROLES_MODIFIER_ADDRESS,
+          botAddress,
+          roleKey: deleveragerRoleKey(config),
+          poolAddress: config.POOL_ADDRESS,
+          poolId,
+          log: () => {},
+        })
+        push({
+          id: 'deleverager-scope',
+          title: 'Deleverager burn-only scope',
+          status: 'pass',
+          detail: 'zero sizes allowed, non-zero sizes blocked',
+        })
+      } catch (err) {
+        push({
+          id: 'deleverager-scope',
+          title: 'Deleverager burn-only scope',
+          status: 'fail',
+          detail: msg(err),
+          remedy:
+            'Provision the burn-only deleverager role for the bot EOA (pnpm manage-role, ROLE=deleverager ACTION=provision) or set DELEVERAGER_ENABLED=false.',
+        })
+      }
+    } else {
+      push(
+        skip(
+          'deleverager-scope',
+          'Deleverager burn-only scope',
+          'pool metadata or bot key unavailable',
+        ),
+      )
+    }
+  }
+
   if (botAddress && supportedProfile) {
     try {
       await verifyExactAuthorizationManifest({
@@ -329,12 +372,17 @@ export async function runDoctorChecks(
           publicClient,
           config.ROLES_MODIFIER_ADDRESS,
         ),
+        deleverager: config.DELEVERAGER_ENABLED
+          ? { member: botAddress, roleKey: deleveragerRoleKey(config) }
+          : undefined,
       })
       push({
         id: 'permission-manifest',
         title: 'Complete Roles permission manifest',
         status: 'pass',
-        detail: 'exactly one member, role, pool target, and reviewed loan-only function scope',
+        detail: config.DELEVERAGER_ENABLED
+          ? 'exactly one member with the reviewed loan-only + burn-only deleverager function scopes'
+          : 'exactly one member, role, pool target, and reviewed loan-only function scope',
       })
     } catch (err) {
       push({

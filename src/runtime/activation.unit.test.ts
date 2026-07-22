@@ -95,6 +95,7 @@ describe('activation marker', () => {
       { ...config, KEEPER_BALANCE_WARN_ETH: config.KEEPER_BALANCE_WARN_ETH + 1n },
       { ...config, TX_RECEIPT_TIMEOUT_MS: config.TX_RECEIPT_TIMEOUT_MS + 1 },
       { ...config, TX_BUMP_INTERVAL_MS: config.TX_BUMP_INTERVAL_MS + 1 },
+      { ...config, DELEVERAGER_ENABLED: true },
     ]
     for (const changed of mutations) expect(isActivated(changed, BOT, evidence)).toBe(false)
     expect(isActivated(config, SAFE, evidence)).toBe(false)

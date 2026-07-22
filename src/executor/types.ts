@@ -2,8 +2,21 @@ import type { Hex, TransactionReceipt } from 'viem'
 
 import type { MarginSnapshot } from '../hedge/marginReserve'
 
-/** The classified hedge action for a cycle. `consolidate` is the capacity overlay. */
-export type HedgeAction = 'none' | 'open' | 'close_all' | 'grow' | 'shrink' | 'flip' | 'consolidate'
+/**
+ * The classified hedge action for a cycle. `consolidate` is the capacity
+ * overlay. `deleverage_loans` / `deleverage_options` are the emergency
+ * force-close stages (see hedge/deleverage.ts) — burn-only, never mint.
+ */
+export type HedgeAction =
+  | 'none'
+  | 'open'
+  | 'close_all'
+  | 'grow'
+  | 'shrink'
+  | 'flip'
+  | 'consolidate'
+  | 'deleverage_loans'
+  | 'deleverage_options'
 
 /**
  * The concrete on-chain plan for a cycle: at most one loan mint plus zero or

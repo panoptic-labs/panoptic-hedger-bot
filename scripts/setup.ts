@@ -5,6 +5,7 @@ import { existsSync } from 'node:fs'
 import path from 'node:path'
 
 import { getChainDeployment, getPoolMetadata, isSupportedChain } from '@panoptic-eng/sdk/v2'
+import { DELEVERAGER_ROLE_KEY } from '@panoptic-eng/sdk/zodiac'
 import {
   type PublicClient,
   createPublicClient,
@@ -36,6 +37,7 @@ import {
 } from '../src/utils/keystore'
 import { sanitizeError } from '../src/utils/sanitize'
 import { asSdkClient } from '../src/utils/sdkClient'
+import { runGenerateIdea } from './generateIdea'
 import {
   type ExtraRoleKind,
   type ExtraRoleSpec,
@@ -58,7 +60,7 @@ import {
   normalizeVanityPrefix,
   validateVanityPrefix,
 } from './lib/vanitySafe'
-import { verifyLoanOnlyScope } from './lib/verifyScope'
+import { verifyDeleveragerScope, verifyLoanOnlyScope } from './lib/verifyScope'
 
 /**
  * Turnkey interactive setup: prompt for essentials → auto-derive the rest →
@@ -412,12 +414,21 @@ async function main(): Promise<void> {
     // Telegram alerts are optional and configured out-of-band: set TELEGRAM_BOT_TOKEN
     // and TELEGRAM_CHAT_ID in .env after onboarding (see README). The wizard no
     // longer walks through BotFather so it stays focused on the on-chain setup.
-    // The onboard wizard deploys a strictly loan-only bot (minimal privilege).
-    // The à-la-carte keeper roles (deleverager / maintenance / roller /
-    // size-adjuster) have no consumer in this bot's runtime, so they are not
-    // offered here. Advanced operators can still scope them onto an existing
-    // modifier later with `pnpm manage-role` (see README).
-    const extraRoles: ExtraRoleSpec[] = []
+    // The onboard wizard deploys a loan-only bot plus, opt-in, the bot-held
+    // burn-only deleverager role (every positionSizes entry must be 0 —
+    // burn-or-revert; it can never mint or move funds). The other à-la-carte
+    // keeper roles (maintenance / roller / size-adjuster) have no consumer in
+    // this bot's runtime, so they are not offered here. Advanced operators can
+    // still scope them onto an existing modifier later with `pnpm manage-role`
+    // (see README).
+    const withDeleverager = await p.confirm(
+      'Provision the emergency deleverager role? (burn-only: lets the bot force-close ' +
+        'positions when the account nears liquidation, instead of only alerting)',
+      false,
+    )
+    const extraRoles: ExtraRoleSpec[] = withDeleverager
+      ? [{ kind: 'deleverager', member: botAccount.address }]
+      : []
 
     // Optional: mine a vanity Safe address. The Safe is a CREATE2 proxy whose
     // address is fixed by the saltNonce (given this deployer + chain), so salts
@@ -760,6 +771,7 @@ async function finalizeDeployment(args: {
       roleKey: state.roleKey,
       poolAddress: state.poolAddress,
       poolId,
+      extraRoles: toExtraRoleSpecs(state),
       saltNonce: BigInt(state.saltNonce),
       // Persist the modifier address as soon as it lands, for a clean resume.
       onModifierDeployed: async (rolesModifierAddress) => {
@@ -804,6 +816,19 @@ async function finalizeDeployment(args: {
     poolId,
   })
 
+  const deleveragerSpec = state.extraRoles.find((r) => r.kind === 'deleverager')
+  if (deleveragerSpec) {
+    console.log(' Verifying deleverager burn-only scope on-chain…')
+    await verifyDeleveragerScope({
+      publicClient: publicClient as PublicClient,
+      rolesModifierAddress: result.rolesModifierAddress,
+      botAddress: deleveragerSpec.member,
+      roleKey: DELEVERAGER_ROLE_KEY,
+      poolAddress: state.poolAddress,
+      poolId,
+    })
+  }
+
   // ---- Write .env, then drop the resume state ------------------------------
   const values: EnvValues = {
     CHAIN_ID: state.chainId,
@@ -820,6 +845,7 @@ async function finalizeDeployment(args: {
     PRICE_SIGNAL_SOURCE: 'pool-tick',
     HEDGE_VENUE: 'in-pool',
     DRY_RUN: state.dryRun,
+    DELEVERAGER_ENABLED: deleveragerSpec ? true : undefined,
   }
   const body = renderEnvFile(values)
 
@@ -892,6 +918,31 @@ async function finalizeDeployment(args: {
         '  passphrase at startup. For unattended restarts, prefer the owner-only\n' +
         '  BOT_KEYSTORE_PASSPHRASE_FILE secret.',
     )
+  }
+
+  // Opt-in: help the operator pick a first position now that the Safe is live.
+  try {
+    if (await prompter.confirm('\nNeed help choosing your first position?', false)) {
+      const deployment = getChainDeployment(state.chainId)
+      const subgraphUrl = deployment?.subgraphs.panoptic
+      const queryAddress = deployment?.panoptic.v2.panopticQuery
+      if (!subgraphUrl || !queryAddress) {
+        console.log(`  (skipped: no Panoptic subgraph/query address for chain ${state.chainId})`)
+      } else {
+        await runGenerateIdea(prompter, {
+          client: publicClient as PublicClient,
+          chainId: state.chainId,
+          poolAddress: state.poolAddress,
+          safeAddress: result.safeAddress,
+          assetIndex: BigInt(state.assetIndex),
+          subgraphUrl,
+          queryAddress,
+        })
+      }
+    }
+  } catch (err) {
+    // Idea generation is a convenience — never let it fail a completed setup.
+    console.warn(`  ⚠️  Could not generate a first-position idea: ${sanitizeError(err)}`)
   }
 }
 

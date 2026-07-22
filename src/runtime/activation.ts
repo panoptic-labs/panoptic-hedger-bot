@@ -5,20 +5,28 @@ import { getAddress, keccak256, toHex } from 'viem'
 import { z } from 'zod'
 
 import type { HedgerBotConfig } from '../config'
+import { deleveragerRoleKey } from '../config'
 import {
   assertProductionEligibleConfig,
   isProductionEligibleConfig,
-  PRODUCTION_ROLE_POLICY,
+  resolveRolePolicy,
 } from '../security/productionProfile'
 import { runtimeDataPath } from './paths'
 import { readSecureJson, writeSecureJson } from './secureFile'
 import { botVersion } from './stateFile'
 
 const ACTIVATION_SCHEMA_VERSION = 2 as const
-export const ACTIVATION_POLICY_VERSION = 'hedger-bot-policy-v3' as const
+// v4: adds the optional bot-held burn-only deleverager role to the reviewed
+// profile. Bumping this invalidates existing activation markers on purpose —
+// operators re-review and re-run `pnpm activate` after upgrading.
+export const ACTIVATION_POLICY_VERSION = 'hedger-bot-policy-v4' as const
 const MAX_ACTIVATION_BYTES = 16 * 1024
+// keccak256(toHex(JSON.stringify(build<Role>DispatchConditions()))) of the
+// reviewed SDK condition trees — recompute and re-review on any builder change.
 const REVIEWED_LOAN_ROLE_TREE_HASH =
   '0x82a2514e569a1aa6aa09d62c2d3018e4977709e6ddb098d08a1bc3f87797785d' as const
+const REVIEWED_DELEVERAGER_ROLE_TREE_HASH =
+  '0x22fae33e81329375ba466b4b679de47f3dc8945cc8ede6f965f417a9640f6ea4' as const
 
 const hex32Schema = z.string().regex(/^0x[0-9a-f]{64}$/)
 const addressSchema = z.string().regex(/^0x[0-9a-f]{40}$/)
@@ -55,11 +63,14 @@ function hashCanonical(value: unknown): Hex {
 }
 
 /** The exact reviewed permission policy accepted for this release candidate. */
-export function expectedPermissionManifestFingerprint(): Hex {
+export function expectedPermissionManifestFingerprint(
+  config: Pick<HedgerBotConfig, 'DELEVERAGER_ENABLED'>,
+): Hex {
   return hashCanonical({
-    version: 2,
+    version: 3,
     loanRoleTree: REVIEWED_LOAN_ROLE_TREE_HASH,
-    rolePolicy: PRODUCTION_ROLE_POLICY,
+    deleveragerRoleTree: config.DELEVERAGER_ENABLED ? REVIEWED_DELEVERAGER_ROLE_TREE_HASH : null,
+    rolePolicy: resolveRolePolicy(config),
     routerPermissions: 'none',
     loanBounds: 'not-enforced-operator-deferred-phase-2.4',
   })
@@ -97,7 +108,7 @@ export async function buildActivationEvidence(
 ): Promise<ActivationEvidence> {
   return {
     codeIdentityFingerprint: await readCodeIdentityFingerprint(publicClient, config),
-    permissionManifestFingerprint: expectedPermissionManifestFingerprint(),
+    permissionManifestFingerprint: expectedPermissionManifestFingerprint(config),
   }
 }
 
@@ -118,6 +129,16 @@ export function buildActivationPolicy(
     rolesModifierAddress: canonicalAddress(config.ROLES_MODIFIER_ADDRESS),
     roleKey: config.ROLE_KEY.toLowerCase(),
     supportedProfile: 'ethereum-mainnet-single-safe-single-pool',
+    rolePolicy: resolveRolePolicy(config),
+    deleverager: config.DELEVERAGER_ENABLED
+      ? {
+          roleKey: deleveragerRoleKey(config).toLowerCase(),
+          triggerMarginBps: config.DELEVERAGE_TRIGGER_MARGIN_BPS.toString(),
+          targetMarginBps: config.DELEVERAGE_TARGET_MARGIN_BPS.toString(),
+          slippageBps: config.DELEVERAGE_SLIPPAGE_BPS,
+          cooldownMs: config.DELEVERAGE_COOLDOWN_MS,
+        }
+      : null,
     hedgeVenue: config.HEDGE_VENUE,
     assetIndex: config.ASSET_INDEX.toString(),
     deltaThresholdBps: config.DELTA_THRESHOLD_BPS.toString(),

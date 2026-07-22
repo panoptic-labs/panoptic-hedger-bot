@@ -6,12 +6,27 @@ import type { HedgerBotConfig } from './config'
 import { protocolGenesisBlock } from './constants/genesis'
 import type { HedgeExecutor, HedgeIntent } from './executor/types'
 import type { GasPolicy } from './gas/gasPolicy'
-import { computeHedgePlan } from './hedge/decision'
+import { type HedgePlan, computeHedgePlan } from './hedge/decision'
+import {
+  type DeleverageStage,
+  type SelectOptionBurnsResult,
+  computeLiquidationBufferBps,
+  computeMarginBufferBps,
+  DeleverageIncident,
+  selectOptionBurns,
+} from './hedge/deleverage'
+import { computePortfolioDeltaDetailed } from './hedge/frame'
 import { type MarginReserveAssessment, assessMarginReserve } from './hedge/marginReserve'
 import { assessSafety } from './hedge/safety'
-import { readHedgeSnapshot } from './hedge/snapshot'
+import { type HedgeSnapshot, readHedgeSnapshot } from './hedge/snapshot'
 import type { Notifier } from './notify/telegram'
-import { formatCycleSummary, formatError, formatSkip } from './presenters/summary'
+import {
+  formatCycleSummary,
+  formatDeleverageExhausted,
+  formatDeleverageSummary,
+  formatError,
+  formatSkip,
+} from './presenters/summary'
 import { type PriceSignalSource, PriceSignalUnavailableError } from './priceSignal'
 import { type HedgeJournalPort, createHedgeRecoveryClient } from './runtime/hedgeJournal'
 import { type RolesExecutor, TxNotMinedError } from './safe/rolesExecutor'
@@ -25,6 +40,13 @@ export interface HedgerBotDeps {
   priceSource: PriceSignalSource
   executor: HedgeExecutor
   rolesExecutor: RolesExecutor
+  /**
+   * Burn-only executor routed through the deleverager role key. Present only
+   * when config.DELEVERAGER_ENABLED — used for Stage 1 (closing user options
+   * first). The in-cycle rehedge and the last-resort loan burn reuse the
+   * loan-scoped `executor`.
+   */
+  deleveragerExecutor?: HedgeExecutor
   notifier: Notifier
   gasPolicy: GasPolicy
   hedgeJournal: HedgeJournalPort
@@ -39,6 +61,12 @@ export interface HedgerBotDeps {
   /** Heartbeat hooks so a status command can see last poll / last hedge. */
   recordPoll?: (trigger: string) => void
   recordHedge?: (action: string, tx?: Hex) => void
+  recordDeleverage?: (
+    stage: DeleverageStage,
+    bufferBps: bigint,
+    tx: Hex | undefined,
+    incidentActive: boolean,
+  ) => void
 }
 
 export type CycleOutcome = 'complete' | 'signal-unavailable' | 'error' | 'in-flight'
@@ -65,9 +93,16 @@ export class HedgerBot {
   private readonly deps: HedgerBotDeps
   private isCycleInFlight = false
   private lastDispatchTxHash?: Hex
+  private readonly incident?: DeleverageIncident
 
   constructor(deps: HedgerBotDeps) {
     this.deps = deps
+    if (deps.config.DELEVERAGER_ENABLED) {
+      this.incident = new DeleverageIncident(
+        deps.config.DELEVERAGE_TARGET_MARGIN_BPS,
+        deps.config.DELEVERAGE_COOLDOWN_MS,
+      )
+    }
   }
 
   /** One-time startup: verify the Roles modifier is wired to the Safe. */
@@ -175,13 +210,29 @@ export class HedgerBot {
         `marginUsed=[${f0(bp.requiredCollateral0)}, ${f1(bp.requiredCollateral1)}]${oorNote}`,
     )
 
+    const bufferBps = computeLiquidationBufferBps(snapshot.liquidation)
     const safety = assessSafety({
       poolHealthStatus: pool.healthStatus,
       isLiquidatable: snapshot.liquidation.isLiquidatable,
+      deleverage: config.DELEVERAGER_ENABLED
+        ? {
+            enabled: true,
+            bufferBps,
+            triggerMarginBps: config.DELEVERAGE_TRIGGER_MARGIN_BPS,
+          }
+        : undefined,
     })
-    if (!safety.safe) {
+    if (safety.verdict === 'deleverage') {
+      await this.runDeleverage(trigger, snapshot, bufferBps, safety.paused)
+      return
+    }
+    if (safety.verdict === 'skip') {
+      const hint =
+        !config.DELEVERAGER_ENABLED && safety.isLiquidatable
+          ? [...safety.reasons, 'consider enabling the deleverager to force-close automatically']
+          : safety.reasons
       botWarn(`[hedger-bot] unsafe (${trigger}): ${safety.reasons.join('; ')}`)
-      await notifier.notify(formatSkip(trigger, safety.reasons))
+      await notifier.notify(formatSkip(trigger, hint))
       return
     }
 
@@ -322,5 +373,352 @@ export class HedgerBot {
     const summary = formatCycleSummary(plan, result, trigger, this.deps.vaultAsset)
     botLog(`\n${summary}`)
     await notifier.notify(summary)
+  }
+
+  /** Build a burn-only intent (no mint) for the current open position set. */
+  private buildBurnIntent(
+    action: 'deleverage_loans' | 'deleverage_options',
+    closeTokenIds: bigint[],
+    snapshot: HedgeSnapshot,
+  ): HedgeIntent {
+    return {
+      action,
+      openTokenId: null,
+      openPositionSize: null,
+      // Burning ITM options swaps in-pool, so use the (wider) deleverage band.
+      swapAtMint: true,
+      closeTokenIds,
+      existingPositionIds: snapshot.positions.map((p) => p.tokenId),
+      skippedCollidingTokenIds: [],
+      currentTick: snapshot.pool.currentTick,
+      slippageBps: BigInt(this.deps.config.DELEVERAGE_SLIPPAGE_BPS),
+    }
+  }
+
+  /**
+   * Execute a single burn-only stage through the given executor: journal +
+   * urgent send (no gas deferral gate), or simulate in dry-run. Returns the
+   * confirmed tx hash (undefined in dry-run) or throws.
+   */
+  private async executeBurnStage(
+    executor: HedgeExecutor,
+    intent: HedgeIntent,
+  ): Promise<Hex | undefined> {
+    const { config } = this.deps
+    if (config.DRY_RUN) {
+      await executor.execute(intent, { urgent: true })
+      return undefined
+    }
+    this.deps.hedgeJournal.begin(intent.action)
+    let result
+    try {
+      result = await executor.execute(intent, { urgent: true })
+    } catch (error) {
+      this.deps.hedgeJournal.fail()
+      if (error instanceof TxNotMinedError) this.lastDispatchTxHash = error.lastHash
+      throw error
+    }
+    const receipt = result.receipt
+    if (!receipt || !result.transactionHash) {
+      this.deps.hedgeJournal.fail()
+      throw new Error('live deleverage executor returned without a confirmed receipt')
+    }
+    this.lastDispatchTxHash = receipt.transactionHash
+    if (receipt.status !== 'success') {
+      this.deps.hedgeJournal.fail()
+      throw new Error(`deleverage dispatch reverted: ${receipt.transactionHash}`)
+    }
+    this.deps.hedgeJournal.confirm({
+      transactionHash: receipt.transactionHash,
+      blockNumber: receipt.blockNumber,
+      blockHash: receipt.blockHash,
+    })
+    return receipt.transactionHash
+  }
+
+  /** Re-read the account and re-observe the incident; returns fresh state. */
+  private async reassess(
+    trigger: string,
+  ): Promise<{ snapshot: HedgeSnapshot; bufferBps: bigint; stillTriggered: boolean }> {
+    const snapshot = await this.readSnapshot(trigger)
+    const bufferBps = computeLiquidationBufferBps(snapshot.liquidation)
+    const stillTriggered = this.incident
+      ? this.incident.observe({
+          isLiquidatable: snapshot.liquidation.isLiquidatable,
+          bufferBps,
+          triggerMarginBps: this.deps.config.DELEVERAGE_TRIGGER_MARGIN_BPS,
+        })
+      : false
+    return { snapshot, bufferBps, stillTriggered }
+  }
+
+  /** Option positions currently held (everything that isn't a bot hedge loan). */
+  private optionPositions(snapshot: HedgeSnapshot): HedgeSnapshot['positions'] {
+    return snapshot.positions.filter(
+      (p) => !snapshot.hedgePositions.some((h) => h.tokenId === p.tokenId),
+    )
+  }
+
+  /**
+   * Recompute the hedge plan on a reduced book (with `burnedOptionIds` removed).
+   * Marks delta at pool spot and uses the wider deleverage band. Pure w.r.t the
+   * chain — `computeHedgePlan` derives everything from the position list.
+   */
+  private computeRehedgePlan(snapshot: HedgeSnapshot, burnedOptionIds: bigint[]): HedgePlan {
+    const { config } = this.deps
+    const removed = new Set(burnedOptionIds)
+    return computeHedgePlan({
+      pool: snapshot.pool,
+      collateral: snapshot.collateral,
+      signalTick: snapshot.pool.currentTick,
+      assetIndex: config.ASSET_INDEX as 0n | 1n,
+      deltaThresholdBps: config.DELTA_THRESHOLD_BPS,
+      deltaOffsetBps: config.DELTA_OFFSET_BPS,
+      absoluteMaxHedgeCount: config.MAX_HEDGE_SLOTS,
+      slippageBps: BigInt(config.DELEVERAGE_SLIPPAGE_BPS),
+      positions: snapshot.positions.filter((p) => !removed.has(p.tokenId)),
+      hedgePositions: snapshot.hedgePositions.filter((p) => !removed.has(p.tokenId)),
+    })
+  }
+
+  /**
+   * One atomic intent that burns the candidate options AND applies the rehedge
+   * computed on the reduced book (burn now-oversized loans, mint the one new
+   * loan). `buildItems` orders burns before the mint, so freed margin covers the
+   * mint. Used to SIMULATE the true close+rehedge impact for ranking; execution
+   * still splits across the deleverager role (options) and the loan role
+   * (rehedge), since a single tx can't span both Zodiac role keys.
+   */
+  private buildCompositeCloseRehedgeIntent(
+    snapshot: HedgeSnapshot,
+    burnedOptionIds: bigint[],
+    rehedge: HedgePlan,
+  ): HedgeIntent {
+    return {
+      action: 'deleverage_options',
+      openTokenId: rehedge.intent.openTokenId,
+      openPositionSize: rehedge.intent.openPositionSize,
+      swapAtMint: true,
+      closeTokenIds: [...burnedOptionIds, ...rehedge.intent.closeTokenIds],
+      existingPositionIds: snapshot.positions.map((p) => p.tokenId),
+      skippedCollidingTokenIds: rehedge.intent.skippedCollidingTokenIds,
+      currentTick: snapshot.pool.currentTick,
+      slippageBps: BigInt(this.deps.config.DELEVERAGE_SLIPPAGE_BPS),
+    }
+  }
+
+  /**
+   * Rank + select the option burn subset for one deleverage iteration. The
+   * simulator models CLOSE + REHEDGE (not the bare option burn) so ranking
+   * reflects the true health impact — closing a large-|delta| option unwinds the
+   * most hedge loans. Candidates are pre-sorted by |delta| so the biggest-impact
+   * closes are tried first. Extracted so its closures don't capture loop state.
+   */
+  private selectOptionBurnsFor(
+    deleveragerExecutor: HedgeExecutor,
+    snapshot: HedgeSnapshot,
+  ): Promise<SelectOptionBurnsResult> {
+    const { config } = this.deps
+    const assetIndex = config.ASSET_INDEX as 0n | 1n
+    const breakdown = computePortfolioDeltaDetailed(
+      snapshot.positions,
+      snapshot.pool.currentTick,
+      BigInt(snapshot.pool.poolKey.tickSpacing),
+      assetIndex,
+    )
+    const absDeltaById = new Map<bigint, bigint>(
+      breakdown.positions.map((p) => [p.tokenId, p.total < 0n ? -p.total : p.total]),
+    )
+    const candidates = this.optionPositions(snapshot).map((p) => ({
+      tokenId: p.tokenId,
+      absDelta: absDeltaById.get(p.tokenId) ?? 0n,
+    }))
+    const blockNumber = snapshot.blockNumber
+    return selectOptionBurns({
+      candidates,
+      targetMarginBps: config.DELEVERAGE_TARGET_MARGIN_BPS,
+      simulate: async (tokenIds) => {
+        const rehedge = this.computeRehedgePlan(snapshot, tokenIds)
+        const composite = this.buildCompositeCloseRehedgeIntent(snapshot, tokenIds, rehedge)
+        const preview = await deleveragerExecutor.previewFinalState(composite, blockNumber)
+        return preview.success ? computeMarginBufferBps(preview.margin) : null
+      },
+    })
+  }
+
+  /**
+   * Emergency de-risking. Options are the risk/margin driver, so we close them
+   * FIRST (burn-only deleverager role) — burning the hedge loans first would
+   * strip the delta hedge and leave the book MORE exposed. Immediately after each
+   * option burn we RE-HEDGE the freed delta in-cycle (loan role) so the simulated
+   * post-rehedge health is actually realized this cycle. Burning the bot's own
+   * hedge loans outright is only a last-resort fallback when there are no options
+   * left to close and the account is still at risk. Everything runs urgent and
+   * skips the basefee deferral — a liquidation penalty dwarfs gas.
+   *
+   * Runs even while the pool is paused (safe-mode is burn/close-only, so burns
+   * land); only a rehedge that would MINT is skipped while paused.
+   */
+  private async runDeleverage(
+    trigger: string,
+    snapshot: HedgeSnapshot,
+    bufferBps: bigint,
+    paused: boolean,
+  ): Promise<void> {
+    const { config, executor, notifier } = this.deps
+    const nowMs = Date.now()
+    this.incident?.observe({
+      isLiquidatable: snapshot.liquidation.isLiquidatable,
+      bufferBps,
+      triggerMarginBps: config.DELEVERAGE_TRIGGER_MARGIN_BPS,
+    })
+    botWarn(
+      `[hedger-bot] DELEVERAGE triggered (${trigger}): buffer=${bufferBps}bps ` +
+        `trigger=${config.DELEVERAGE_TRIGGER_MARGIN_BPS}bps ` +
+        `liquidatable=${snapshot.liquidation.isLiquidatable} paused=${paused}`,
+    )
+
+    // ---- Stage 1 (primary): close options (deleverager role) + in-cycle rehedge
+    // (loan role). Loop: pick the close+rehedge-ranked subset, burn, rehedge,
+    // re-assess, and keep going while eligible options remain and the account is
+    // still at risk. Only when no eligible option burns are left do we fall
+    // through to burning the bot's own loans.
+    const deleveragerExecutor = this.deps.deleveragerExecutor
+    const canRunOptions = this.incident?.canRunStage('options', nowMs) ?? true
+    if (deleveragerExecutor && canRunOptions) {
+      let markedStage = false
+      // Guard against a non-progressing loop by requiring the option set to shrink.
+      let previousCount = Number.POSITIVE_INFINITY
+      while (true) {
+        const remaining = this.optionPositions(snapshot)
+        if (remaining.length === 0 || remaining.length >= previousCount) break
+        previousCount = remaining.length
+
+        const selection = await this.selectOptionBurnsFor(deleveragerExecutor, snapshot)
+        if (selection.tokenIds.length === 0) break
+
+        const burnIntent = this.buildBurnIntent('deleverage_options', selection.tokenIds, snapshot)
+        const tx = await this.executeBurnStage(deleveragerExecutor, burnIntent)
+        if (!markedStage) {
+          this.incident?.markStageRun('options', nowMs)
+          markedStage = true
+        }
+        this.deps.recordDeleverage?.('options', bufferBps, tx, this.incident?.active ?? false)
+        const msg = formatDeleverageSummary({
+          label: trigger,
+          stage: 'options',
+          dryRun: config.DRY_RUN,
+          bufferBps,
+          triggerMarginBps: config.DELEVERAGE_TRIGGER_MARGIN_BPS,
+          burnedTokenIds: selection.tokenIds,
+          transactionHash: tx ?? null,
+          projectedBufferBps: selection.projectedBufferBps,
+          burnedAll: selection.burnedAll,
+        })
+        botLog(`\n${msg}`)
+        await notifier.notify(msg)
+        if (config.DRY_RUN) return
+
+        // In-cycle rehedge: re-neutralize the delta freed by the option burn so
+        // the now-oversized loans shrink now, not next poll.
+        await this.runInCycleRehedge(trigger, paused)
+
+        const after = await this.reassess(trigger)
+        if (!after.stillTriggered) {
+          botLog(`[hedger-bot] deleverage: margin buffer recovered to ${after.bufferBps}bps`)
+          return
+        }
+        snapshot = after.snapshot
+        bufferBps = after.bufferBps
+      }
+    }
+
+    // ---- Stage 2 (fallback): relieve margin by burning the bot's own hedge ---
+    // loans via the loan role. Only reached when options couldn't clear the risk
+    // (none left, no deleverager role, or still at risk after closing them).
+    const loanIds = snapshot.hedgePositions.map((p) => p.tokenId)
+    if (loanIds.length > 0 && (this.incident?.canRunStage('loans', nowMs) ?? true)) {
+      const intent = this.buildBurnIntent('deleverage_loans', loanIds, snapshot)
+      const tx = await this.executeBurnStage(executor, intent)
+      this.incident?.markStageRun('loans', nowMs)
+      this.deps.recordDeleverage?.('loans', bufferBps, tx, this.incident?.active ?? false)
+      const msg = formatDeleverageSummary({
+        label: trigger,
+        stage: 'loans',
+        dryRun: config.DRY_RUN,
+        bufferBps,
+        triggerMarginBps: config.DELEVERAGE_TRIGGER_MARGIN_BPS,
+        burnedTokenIds: loanIds,
+        transactionHash: tx ?? null,
+      })
+      botLog(`\n${msg}`)
+      await notifier.notify(msg)
+      if (config.DRY_RUN) return
+      const after = await this.reassess(trigger)
+      if (after.stillTriggered) {
+        await notifier.notify(formatDeleverageExhausted(trigger, after.bufferBps))
+      }
+      return
+    }
+
+    // Nothing left to burn but still at risk.
+    await notifier.notify(formatDeleverageExhausted(trigger, bufferBps))
+  }
+
+  /**
+   * Re-neutralize delta on the current (post-option-burn) book via the loan role,
+   * urgent and un-gated. Skipped when the plan would MINT while the pool is paused
+   * (safe-mode blocks mints); pure loan-shrinking burns still proceed while paused.
+   */
+  private async runInCycleRehedge(trigger: string, paused: boolean): Promise<void> {
+    const { config, executor, notifier } = this.deps
+    const fresh = await this.readSnapshot(trigger)
+    const plan = this.computeRehedgePlan(fresh, [])
+    if (
+      plan.action === 'none' ||
+      (plan.intent.openTokenId === null && plan.intent.closeTokenIds.length === 0)
+    ) {
+      return
+    }
+    if (paused && plan.intent.openTokenId !== null) {
+      botWarn(
+        `[hedger-bot] deleverage rehedge deferred (${trigger}): pool paused — cannot mint a hedge loan`,
+      )
+      await notifier.notify(
+        formatSkip(trigger, ['pool paused (close-only): rehedge mint deferred until unpaused']),
+      )
+      return
+    }
+    const tx = await this.executeBurnStage(executor, plan.intent)
+    const adjusted = [
+      ...plan.intent.closeTokenIds,
+      ...(plan.intent.openTokenId !== null ? [plan.intent.openTokenId] : []),
+    ]
+    const msg = formatDeleverageSummary({
+      label: trigger,
+      stage: 'rehedge',
+      dryRun: config.DRY_RUN,
+      bufferBps: computeLiquidationBufferBps(fresh.liquidation),
+      triggerMarginBps: config.DELEVERAGE_TRIGGER_MARGIN_BPS,
+      burnedTokenIds: adjusted,
+      transactionHash: tx ?? null,
+    })
+    botLog(`\n${msg}`)
+    await notifier.notify(msg)
+  }
+
+  /** Read a fresh block-pinned snapshot (used for mid-deleverage re-assessment). */
+  private async readSnapshot(_trigger: string): Promise<HedgeSnapshot> {
+    const { config, publicClient } = this.deps
+    const blockNumber = await publicClient.getBlockNumber()
+    return readHedgeSnapshot({
+      publicClient,
+      poolAddress: config.POOL_ADDRESS,
+      chainId: BigInt(config.CHAIN_ID),
+      safeAddress: config.SAFE_ADDRESS,
+      storage: this.deps.storage,
+      fromBlock: config.SYNC_FROM_BLOCK ?? protocolGenesisBlock(config.CHAIN_ID),
+      blockNumber,
+    })
   }
 }

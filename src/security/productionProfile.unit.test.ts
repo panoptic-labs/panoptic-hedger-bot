@@ -3,7 +3,10 @@ import { describe, expect, it } from 'vitest'
 import {
   assertProductionEligibleConfig,
   isProductionEligibleConfig,
+  PRODUCTION_ROLE_POLICY,
+  PRODUCTION_ROLE_POLICY_WITH_DELEVERAGER,
   productionProfileViolations,
+  resolveRolePolicy,
 } from './productionProfile'
 
 const supported = {
@@ -18,6 +21,13 @@ describe('production eligibility profile', () => {
     expect(() => assertProductionEligibleConfig(supported)).not.toThrow()
     expect(isProductionEligibleConfig({ ...supported, PRICE_SIGNAL_SOURCE: 'pool-tick' })).toBe(
       true,
+    )
+  })
+
+  it('resolves the role policy by whether the deleverager is enabled', () => {
+    expect(resolveRolePolicy({ DELEVERAGER_ENABLED: false })).toBe(PRODUCTION_ROLE_POLICY)
+    expect(resolveRolePolicy({ DELEVERAGER_ENABLED: true })).toBe(
+      PRODUCTION_ROLE_POLICY_WITH_DELEVERAGER,
     )
   })
 

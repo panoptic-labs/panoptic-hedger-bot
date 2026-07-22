@@ -5,8 +5,8 @@ import { fileURLToPath } from 'node:url'
 import { createMemoryStorage, getPoolMetadata } from '@panoptic-eng/sdk/v2'
 import { createPublicClient, createWalletClient, http } from 'viem'
 
-import { parseHedgerBotConfig } from './config'
-import { createHedgeExecutor } from './executor'
+import { deleveragerRoleKey, parseHedgerBotConfig } from './config'
+import { createHedgeExecutor, createSamePoolLoanExecutor } from './executor'
 import { createGasPolicy } from './gas/gasPolicy'
 import { type CycleOutcome, HedgerBot } from './hedgerBot'
 import { createTelegramNotifier } from './notify/telegram'
@@ -156,6 +156,39 @@ async function main(): Promise<void> {
     builderCode: parseBuilderCode(config.PANOPTIC_BUILDER_CODE),
   })
 
+  // Optional burn-only executor routed through the deleverager role key — the
+  // same bot EOA, same journal/fees/kill-switch, a second scoped role. Used only
+  // for Stage 2 of an emergency deleverage (burning user options).
+  const deleveragerExecutor = config.DELEVERAGER_ENABLED
+    ? createSamePoolLoanExecutor({
+        poolAddress: config.POOL_ADDRESS,
+        publicClient,
+        safeAddress: config.SAFE_ADDRESS,
+        rolesExecutor: createRolesExecutor({
+          publicClient,
+          walletClient,
+          account,
+          rolesModifierAddress: config.ROLES_MODIFIER_ADDRESS,
+          roleKey: deleveragerRoleKey(config),
+          safeAddress: config.SAFE_ADDRESS,
+          chain,
+          fees: (opts) => gasPolicy.fees(opts),
+          bumpFees: (prev, opts) => gasPolicy.bumped(prev, opts),
+          txWait: {
+            timeoutMs: config.TX_RECEIPT_TIMEOUT_MS,
+            bumpIntervalMs: config.TX_BUMP_INTERVAL_MS,
+          },
+          observeTransaction: (update) => hedgeJournal.observeTransaction(update),
+          assertSendAllowed: () => {
+            assertTradingEnabled()
+            instanceLease.assertOwned()
+          },
+        }),
+        builderCode: parseBuilderCode(config.PANOPTIC_BUILDER_CODE),
+        dryRun: config.DRY_RUN,
+      })
+    : undefined
+
   // Pool token decimals (needed by the cex signal to convert USD price → tick).
   const metadata = await getPoolMetadata({
     client: asSdkClient<typeof getPoolMetadata>(publicClient),
@@ -205,6 +238,7 @@ async function main(): Promise<void> {
     priceSource,
     executor,
     rolesExecutor,
+    deleveragerExecutor,
     notifier,
     gasPolicy,
     hedgeJournal,
@@ -220,6 +254,14 @@ async function main(): Promise<void> {
         lastHedgeAt: new Date().toISOString(),
         lastHedgeAction: action,
         lastHedgeTx: tx,
+      }),
+    recordDeleverage: (stage, bufferBps, tx, incidentActive) =>
+      patchRuntimeState(instanceId, {
+        lastDeleverageAt: new Date().toISOString(),
+        lastDeleverageStage: stage,
+        lastDeleverageTx: tx,
+        lastBufferBps: bufferBps.toString(),
+        deleverageIncidentActive: incidentActive,
       }),
   })
 

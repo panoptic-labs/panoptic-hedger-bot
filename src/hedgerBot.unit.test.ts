@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { HedgerBotConfig } from './config'
 import type { HedgeExecutionResult, HedgeExecutor } from './executor/types'
 import { computeHedgePlan } from './hedge/decision'
+import { assessSafety } from './hedge/safety'
 import { readHedgeSnapshot } from './hedge/snapshot'
 import { HedgerBot } from './hedgerBot'
 import { type RolesExecutor, TxNotMinedError } from './safe/rolesExecutor'
@@ -42,6 +43,17 @@ vi.mock('./hedge/safety', () => ({
   assessSafety: vi.fn(() => ({ safe: true, reasons: [], isLiquidatable: false })),
 }))
 vi.mock('./hedge/decision', () => ({ computeHedgePlan: vi.fn() }))
+// Real greeks need fully-formed legs; the deleverage-path tests only care about
+// per-position |delta| for the pre-sort, so stub it deterministically.
+vi.mock('./hedge/frame', () => ({
+  computePortfolioDeltaDetailed: vi.fn(() => ({
+    positions: [
+      { tokenId: 5n, total: -100n },
+      { tokenId: 7n, total: 20n },
+    ],
+    total: -80n,
+  })),
+}))
 
 const CONFIG = {
   CHAIN_ID: 1,
@@ -56,6 +68,11 @@ const CONFIG = {
   TX_RECEIPT_TIMEOUT_MS: 180_000,
   SIGNAL_TICK_SANITY_MAX: 5_000,
   MIN_MARGIN_RESERVE_BPS: 2_000n,
+  DELTA_OFFSET_BPS: 0n,
+  DELEVERAGE_TRIGGER_MARGIN_BPS: 500n,
+  DELEVERAGE_TARGET_MARGIN_BPS: 1_500n,
+  DELEVERAGE_SLIPPAGE_BPS: 300,
+  DELEVERAGE_COOLDOWN_MS: 300_000,
 } as unknown as HedgerBotConfig
 
 /** A permissive gas policy stub: never defers, never alerts. */
@@ -98,6 +115,7 @@ const snapshot = (
     pool: {
       healthStatus: 'active',
       currentTick: 0n,
+      poolKey: { tickSpacing: 10 },
       metadata: {
         token0Decimals: 18n,
         token1Decimals: 6n,
@@ -107,7 +125,14 @@ const snapshot = (
     },
     buyingPower,
     collateral: { token0: { assets: 0n }, token1: { assets: 0n } },
-    liquidation: { isLiquidatable: false },
+    liquidation: {
+      isLiquidatable: false,
+      currentMargin0: 10_000n,
+      requiredMargin0: 5_000n,
+      currentMargin1: 10_000n,
+      requiredMargin1: 5_000n,
+      denominatedInToken: 1n,
+    },
   }) as never
 
 /** A plan that closes hedge 7n. */
@@ -165,7 +190,9 @@ type BotDeps = ConstructorParameters<typeof HedgerBot>[0]
 async function makeBot(
   executeResult: HedgeExecutionResult,
   receiptStatus: 'success' | 'reverted',
-  overrides: Partial<Pick<BotDeps, 'executor' | 'notifier' | 'gasPolicy' | 'hedgeJournal'>> = {},
+  overrides: Partial<
+    Pick<BotDeps, 'executor' | 'deleveragerExecutor' | 'notifier' | 'gasPolicy' | 'hedgeJournal'>
+  > = {},
 ) {
   const receipt = {
     status: receiptStatus,
@@ -198,6 +225,7 @@ async function makeBot(
     vaultAsset: { decimals: 6, symbol: 'USDC' },
     executor:
       overrides.executor ?? ({ kind: 'same-pool-loan', execute } as unknown as HedgeExecutor),
+    deleveragerExecutor: overrides.deleveragerExecutor,
     rolesExecutor: { preflight: vi.fn(async () => undefined) } as unknown as RolesExecutor,
     notifier,
     gasPolicy: overrides.gasPolicy ?? openGasPolicy,
@@ -222,6 +250,14 @@ beforeEach(() => {
   vi.mocked(readHedgeSnapshot).mockResolvedValue(snapshot())
   vi.mocked(computeHedgePlan).mockReset()
   vi.mocked(computeHedgePlan).mockReturnValue(closeSevenPlan)
+  vi.mocked(assessSafety).mockReset()
+  vi.mocked(assessSafety).mockReturnValue({
+    safe: true,
+    verdict: 'hedge',
+    reasons: [],
+    isLiquidatable: false,
+    paused: false,
+  })
 })
 
 describe('HedgerBot gas deferral gate', () => {
@@ -486,5 +522,103 @@ describe('HedgerBot hedge classification', () => {
     expect(vi.mocked(computeHedgePlan).mock.calls[1][0].hedgePositions).toEqual([
       positionsOnChain[1],
     ])
+  })
+})
+
+describe('HedgerBot deleverage path', () => {
+  const optionLeg = { width: 60n } as never
+  const optionPos = { tokenId: 5n, legs: [optionLeg], positionSize: 50n, tickAtMint: 0n }
+  const withOption = () => snapshot([optionPos, positionsOnChain[0]], [positionsOnChain[0]])
+
+  const okResult = {
+    transactionHash: '0x01',
+    receipt: {
+      status: 'success',
+      transactionHash: '0x01',
+      blockNumber: 123n,
+      blockHash: `0x${'ab'.repeat(32)}`,
+    },
+    openedTokenId: null,
+    closedTokenIds: [5n],
+    dryRun: false,
+  } as unknown as HedgeExecutionResult
+
+  /** previewFinalState → healthy post close+rehedge buffer (10000bps). */
+  const previewHealthy = vi.fn(async () => ({
+    success: true as const,
+    margin: {
+      collateralBalance0: 10_000n,
+      requiredCollateral0: 5_000n,
+      collateralBalance1: 10_000n,
+      requiredCollateral1: 5_000n,
+    },
+  }))
+
+  it('closes options via the deleverager role, then rehedges via the loan role', async () => {
+    vi.mocked(readHedgeSnapshot).mockResolvedValue(withOption())
+    vi.mocked(assessSafety).mockReturnValue({
+      safe: false,
+      verdict: 'deleverage',
+      reasons: ['account is liquidatable'],
+      isLiquidatable: true,
+      paused: false,
+    })
+    // Rehedge plan (used for the composite sim AND the in-cycle rehedge): burn loan 7n only.
+    vi.mocked(computeHedgePlan).mockReturnValue({
+      ...(closeSevenPlan as object),
+    } as never)
+
+    const deleveragerExecute = vi.fn(async () => okResult)
+    const { bot, execute: loanExecute } = await makeBot(okResult, 'success', {
+      deleveragerExecutor: {
+        kind: 'same-pool-loan',
+        previewFinalState: previewHealthy,
+        execute: deleveragerExecute,
+      } as unknown as HedgeExecutor,
+    })
+
+    await bot.runCycle('c1')
+
+    // Option burn went through the deleverager role...
+    expect(deleveragerExecute).toHaveBeenCalledTimes(1)
+    expect(deleveragerExecute.mock.calls[0][0]).toMatchObject({
+      action: 'deleverage_options',
+      closeTokenIds: [5n],
+    })
+    // ...and the freed delta was re-hedged in-cycle through the loan role.
+    expect(loanExecute).toHaveBeenCalledTimes(1)
+    expect(loanExecute.mock.calls[0][0]).toMatchObject({ closeTokenIds: [7n] })
+  })
+
+  it('defers the in-cycle rehedge mint while the pool is paused', async () => {
+    vi.mocked(readHedgeSnapshot).mockResolvedValue(withOption())
+    vi.mocked(assessSafety).mockReturnValue({
+      safe: false,
+      verdict: 'deleverage',
+      reasons: ['pool is paused (close-only)'],
+      isLiquidatable: true,
+      paused: true,
+    })
+    // Rehedge plan that would MINT (openTokenId set) — must be deferred while paused.
+    vi.mocked(computeHedgePlan).mockReturnValue({
+      ...(consolidatePlan as object),
+    } as never)
+
+    const deleveragerExecute = vi.fn(async () => okResult)
+    const notify = vi.fn(async () => undefined)
+    const { bot, execute: loanExecute } = await makeBot(okResult, 'success', {
+      notifier: { notify },
+      deleveragerExecutor: {
+        kind: 'same-pool-loan',
+        previewFinalState: previewHealthy,
+        execute: deleveragerExecute,
+      } as unknown as HedgeExecutor,
+    })
+
+    await bot.runCycle('c1')
+
+    expect(deleveragerExecute).toHaveBeenCalledTimes(1) // burn still lands while paused
+    expect(loanExecute).not.toHaveBeenCalled() // rehedge mint deferred
+    expect(notify.mock.calls.some((c) => String(c[0]).includes('paused'))).toBe(true)
   })
 })

@@ -5,6 +5,8 @@
  * supplies their defaults).
  */
 
+import { DELEVERAGE_DEFAULTS } from '../../src/config'
+
 export interface EnvValues {
   // Chain / RPC
   CHAIN_ID: number
@@ -27,6 +29,8 @@ export interface EnvValues {
   PRICE_SIGNAL_SOURCE?: string
   // Hedge venue
   HEDGE_VENUE?: string
+  // Emergency deleverager (burn-only role held by the bot)
+  DELEVERAGER_ENABLED?: boolean
   // Loop
   POLL_INTERVAL_MS?: number
   DRY_RUN?: boolean
@@ -98,6 +102,15 @@ export function renderEnvFile(values: EnvValues): string {
     {
       heading: 'Hedge venue: in-pool',
       lines: [{ key: 'HEDGE_VENUE', value: values.HEDGE_VENUE }],
+    },
+    {
+      heading:
+        'Emergency deleverager — burn-only role held by the bot. Tunables (schema ' +
+        `defaults): DELEVERAGE_TRIGGER_MARGIN_BPS=${DELEVERAGE_DEFAULTS.TRIGGER_MARGIN_BPS}, ` +
+        `DELEVERAGE_TARGET_MARGIN_BPS=${DELEVERAGE_DEFAULTS.TARGET_MARGIN_BPS}, ` +
+        `DELEVERAGE_SLIPPAGE_BPS=${DELEVERAGE_DEFAULTS.SLIPPAGE_BPS}, ` +
+        `DELEVERAGE_COOLDOWN_MS=${DELEVERAGE_DEFAULTS.COOLDOWN_MS}`,
+      lines: [{ key: 'DELEVERAGER_ENABLED', value: values.DELEVERAGER_ENABLED }],
     },
     {
       heading: 'Loop',
