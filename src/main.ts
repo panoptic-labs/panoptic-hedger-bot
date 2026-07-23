@@ -2,8 +2,8 @@ import 'dotenv/config'
 
 import { fileURLToPath } from 'node:url'
 
-import { createMemoryStorage, getPoolMetadata } from '@panoptic-eng/sdk/v2'
-import { createPublicClient, createWalletClient, http } from 'viem'
+import { createFileStorage, getPoolMetadata } from '@panoptic-eng/sdk/v2'
+import { createPublicClient, createWalletClient, fallback, http } from 'viem'
 
 import { deleveragerRoleKey, parseHedgerBotConfig } from './config'
 import { createHedgeExecutor, createSamePoolLoanExecutor } from './executor'
@@ -20,6 +20,7 @@ import {
   acquireInstanceLease,
   startInstanceLeaseHeartbeat,
 } from './runtime/instanceLease'
+import { runtimeDataPath } from './runtime/paths'
 import {
   botVersion,
   clearRuntimeState,
@@ -68,7 +69,20 @@ async function main(): Promise<void> {
 
   const chain = defineBotChain(parsed.CHAIN_ID, parsed.RPC_URL)
   const account = await resolveBotAccount(parsed)
-  const publicClient = createPublicClient({ chain, transport: http(parsed.RPC_URL) })
+  // batch:true coalesces concurrent JSON-RPC requests into one HTTP round-trip;
+  // client-level multicall batching folds concurrent eth_calls (same block) into
+  // one aggregate3 call. Both preserve per-call block pinning.
+  const makeTransport = () => {
+    const primary = http(parsed.RPC_URL, { batch: true })
+    return parsed.RPC_URL_FALLBACK
+      ? fallback([primary, http(parsed.RPC_URL_FALLBACK, { batch: true })], { rank: false })
+      : primary
+  }
+  const publicClient = createPublicClient({
+    chain,
+    transport: makeTransport(),
+    batch: { multicall: { wait: 16 } },
+  })
   const evidence = await (async () => {
     assertProductionEligibleConfig(parsed)
     return buildActivationEvidence(publicClient, parsed)
@@ -106,7 +120,7 @@ async function main(): Promise<void> {
   const instanceId = instanceLease.instanceId
   process.once('exit', () => instanceLease.release())
 
-  const walletClient = createWalletClient({ account, chain, transport: http(config.RPC_URL) })
+  const walletClient = createWalletClient({ account, chain, transport: makeTransport() })
 
   const notifier = createTelegramNotifier(config, fetch, (result) => {
     const state = readRuntimeState()
@@ -242,7 +256,11 @@ async function main(): Promise<void> {
     notifier,
     gasPolicy,
     hedgeJournal,
-    storage: createMemoryStorage(),
+    // Disk-backed sync checkpoints: a restart resumes the position-event scan
+    // incrementally instead of re-scanning from genesis. Safe across restarts —
+    // syncPositions detects reorgs against the stored checkpoint's block hash.
+    storage: createFileStorage(runtimeDataPath('.hedger-sync-cache')),
+    poolMetadata: metadata,
     vaultAsset,
     recordPoll: (trigger) =>
       patchRuntimeState(instanceId, {

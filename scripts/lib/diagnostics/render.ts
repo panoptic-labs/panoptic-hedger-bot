@@ -55,6 +55,7 @@ export function renderStatus(s: StatusSnapshot): void {
   row('loan-only scope', s.loanOnlyScope)
   row('positions', s.positions)
   row('net delta', s.netDelta)
+  if (s.lp !== undefined) row('uniswap lp', s.lp)
   row('price signal', s.priceSignal)
   row('last poll', s.lastPoll)
   row('last hedge', s.lastHedge)

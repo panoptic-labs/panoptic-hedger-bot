@@ -90,9 +90,21 @@ export function createGasPolicy(deps: GasPolicyDeps): GasPolicy {
   let lastSkipAlertAt = Number.NEGATIVE_INFINITY
   let lastBalanceAlertAt = Number.NEGATIVE_INFINITY
 
-  async function baseFee(): Promise<bigint | null> {
+  // Cached for ~3s (well under one slot): `assess()` and `fees()` both need the
+  // basefee within the same send path, and two getBlock calls milliseconds apart
+  // return the same block. The deferral gate (`assess`) always reads fresh and
+  // primes the cache; only `fees()` reuses it. Fee bumps happen >=5s apart, so
+  // a bump always re-reads a fresh basefee.
+  const BASE_FEE_TTL_MS = 3_000
+  let baseFeeCache: { at: number; value: bigint | null } | null = null
+  async function freshBaseFee(): Promise<bigint | null> {
     const block = await publicClient.getBlock({ blockTag: 'latest' })
-    return block.baseFeePerGas ?? null
+    baseFeeCache = { at: now(), value: block.baseFeePerGas ?? null }
+    return baseFeeCache.value
+  }
+  async function baseFee(): Promise<bigint | null> {
+    if (baseFeeCache && now() - baseFeeCache.at < BASE_FEE_TTL_MS) return baseFeeCache.value
+    return freshBaseFee()
   }
 
   // Lexical (not a method) so `bumped` can call it without relying on dynamic
@@ -130,7 +142,8 @@ export function createGasPolicy(deps: GasPolicyDeps): GasPolicy {
 
   return {
     async assess(urgent: boolean): Promise<GasAssessment> {
-      const base = await baseFee()
+      // The safety gate must see the live basefee — never the cached one.
+      const base = await freshBaseFee()
       const cap = urgent ? config.URGENT_MAX_BASE_FEE_GWEI : config.HEDGE_MAX_BASE_FEE_GWEI
       // No basefee (pre-1559 chain): the deferral gate can't apply.
       const proceed = base === null || base <= cap

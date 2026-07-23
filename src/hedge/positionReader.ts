@@ -1,4 +1,9 @@
-import { type StorageAdapter, getPosition, syncPositions } from '@panoptic-eng/sdk/v2'
+import {
+  type BlockMeta,
+  type StorageAdapter,
+  getPositions,
+  syncPositions,
+} from '@panoptic-eng/sdk/v2'
 import type { Address, PublicClient } from 'viem'
 
 import { asSdkClient } from '../utils/sdkClient'
@@ -12,14 +17,16 @@ export interface ReadSafePositionsDeps {
   safeAddress: Address
   /**
    * Persistence for the SDK position sync (checkpoint + cached list). The bot
-   * uses an in-memory adapter, so each process start does a full event scan and
-   * subsequent cycles sync incrementally within the run.
+   * uses a file-backed adapter, so restarts resume the event scan incrementally
+   * from the persisted checkpoint instead of re-scanning from genesis.
    */
   storage: StorageAdapter
   /** Block floor for the first (full) position-event scan. */
   fromBlock?: bigint
   /** Block at which every position read is pinned. */
   blockNumber?: bigint
+  /** Pre-fetched block metadata (skips the SDK's per-read getBlockMeta call). */
+  blockMeta?: BlockMeta
 }
 
 export interface SafePositions {
@@ -49,30 +56,23 @@ export async function readSafePositions(deps: ReadSafePositionsDeps): Promise<Sa
     toBlock: blockNumber,
   })
 
-  // Fan out the per-position reads in parallel — sequential awaits add a full
-  // RPC round-trip of latency per open id on every hedge cycle.
-  const fetched = await Promise.all(
-    openIds.map((tokenId) =>
-      getPosition({
-        client: asSdkClient<typeof getPosition>(publicClient),
-        poolAddress,
-        owner: safeAddress,
-        tokenId,
-        blockNumber,
-      }).then((pos) => ({ tokenId, pos })),
-    ),
-  )
+  // One batched getFullPositionsData read for the whole book (the SDK drops
+  // zero-size positions), instead of one eth_call per open id.
+  const fetched = await getPositions({
+    client: asSdkClient<typeof getPositions>(publicClient),
+    poolAddress,
+    owner: safeAddress,
+    tokenIds: openIds,
+    blockNumber,
+    _meta: deps.blockMeta,
+  })
 
-  const positions: PositionSnapshot[] = []
-  for (const { tokenId, pos } of fetched) {
-    if (pos.positionSize === 0n) continue
-    positions.push({
-      tokenId,
-      legs: pos.legs,
-      positionSize: pos.positionSize,
-      tickAtMint: pos.tickAtMint,
-    })
-  }
+  const positions: PositionSnapshot[] = fetched.positions.map((pos) => ({
+    tokenId: pos.tokenId,
+    legs: pos.legs,
+    positionSize: pos.positionSize,
+    tickAtMint: pos.tickAtMint,
+  }))
 
   const hedgePositions = positions.filter((position) => isLoanPosition(position.legs))
 

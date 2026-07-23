@@ -174,6 +174,10 @@ it writes (and for the manual path). The full annotated list lives in
 | `HEDGE_VENUE` | | `in-pool` (the only supported execution venue) |
 | `POLL_INTERVAL_MS` | | Loop interval, default `60000` |
 | `DRY_RUN` | | `true` simulates via `eth_call`; live also requires `pnpm activate` |
+| `UNISWAP_LP_OWNER` | | Extra address (besides the Safe) holding plain Uniswap v3/v4 LP positions on this pool's pair; scanned alongside the Safe — see [Hedging Uniswap LP positions](#hedging-uniswap-lp-positions). |
+| `HEDGE_INCLUDE_LP` | | `true` folds same-pair Uniswap LP delta into the hedge (only while the LP subgraph is fresh); default `false` = observe-only. |
+| `LP_SUBGRAPH_URL` | | LP-positions subgraph (defaults to the mainnet deployment). |
+| `LP_SUBGRAPH_MAX_LAG_BLOCKS` | | Max blocks the LP subgraph may lag chain head before LP delta is ignored, default `50`. |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | | Legacy built-in alerting (set both to enable). Prefer [@panopticMonitorBot](https://t.me/panopticMonitorBot) instead — see Getting started. |
 
 ¹ Provide **exactly one** bot key source: `BOT_PRIVATE_KEY` (raw hex, plaintext
@@ -184,6 +188,38 @@ source is set, the bot prompts at startup.
 
 The CEX signal variables (`CEX_*`) are core. The experimental `uniswap-pool`
 signal variables (`UNISWAP_SIGNAL_*`) live in `.env.advanced.example`.
+
+## Hedging Uniswap LP positions
+
+If you also run plain Uniswap v3/v4 LP positions on the **same token pair** as
+this Panoptic pool, that concentrated-liquidity delta is real directional
+exposure. The hedger can fold it into the delta it neutralizes each cycle, so it
+hedges the combined Panoptic + LP book.
+
+**Which positions:** every LP position on the Panoptic pool's exact token pair
+(any fee tier, v3 or v4) owned by the **Safe** and — if set — the extra
+`UNISWAP_LP_OWNER` address. Positions on other pairs are ignored (they can't be
+neutralized by an in-pool hedge). Each is priced at the pool's current tick via
+the SDK's concentrated-liquidity delta (`getLpGreeks`).
+
+**Data source:** LP positions are read from the Panoptic LP subgraph
+(`LP_SUBGRAPH_URL`) — one GraphQL query per owner per cycle, no extra RPC. The
+same data powers [@panopticMonitorBot](https://t.me/panopticMonitorBot)'s
+`/greeks` (send `/monitor <address>` there to eyeball Δ/Γ/value first).
+
+**Two safety gates (both must pass for LP delta to be applied):**
+
+1. **`HEDGE_INCLUDE_LP` (default `false`).** While off, the LP delta is computed
+   and logged (`lpDelta … observed, not applied`) but **not** added to `netDelta`
+   — hedge behaviour is identical to not tracking LPs. Verify the reported
+   `lpDelta` with `pnpm inspect:hedge` before turning it on.
+2. **Subgraph freshness.** Each cycle the bot compares the LP subgraph's indexed
+   head to chain head; if it lags by more than `LP_SUBGRAPH_MAX_LAG_BLOCKS`
+   (default `50`) — e.g. while it is still backfilling — LP delta is forced to
+   observe-only with a warning, so a stale index can't cause an over-hedge.
+
+Enable it only once the LP subgraph is fully synced **and** you've confirmed the
+`lpDelta` line in `pnpm inspect:hedge` matches your real LP exposure.
 
 ## 🔒 Security model
 
@@ -471,6 +507,37 @@ Operational notes:
   notification failures.
 - **RPC** is a single endpoint with retry/backoff but no failover; front it with
   a resilient RPC gateway for production.
+
+### Operating a running container
+
+The container runs the bot (`pnpm start`) as its single long-lived process — the
+terminal that launched it only shows the logs. To read logs or run the
+operator commands (`status`, `health`, `doctor`) you don't attach to that
+process; you ask Docker to run a **new** one-shot command *inside the same
+container* with `docker compose exec` (the service is named `hedger-bot`). Any
+terminal on the Docker host can do this while the container is up:
+
+```bash
+docker compose logs -f hedger-bot          # follow the live bot output
+docker compose exec hedger-bot pnpm status # operator snapshot (runs inside, then exits)
+docker compose exec hedger-bot pnpm health # machine-readable readiness (exit code)
+docker compose exec hedger-bot pnpm run doctor  # read-only preflight
+```
+
+These run against the **same** `.env`, RPC view, and `/var/lib/hedger` state
+volume as the live bot, so they report a consistent picture — the reason to use
+`exec` rather than running `pnpm status` on the host (which has neither the state
+volume nor the keystore). They are read-only and touch only `/tmp`, so the
+read-only root filesystem is not a problem.
+
+Notes:
+
+- In non-interactive contexts (cron, CI) add `-T` to disable the TTY:
+  `docker compose exec -T hedger-bot pnpm health`.
+- Inside the monorepo, point at the compose file from the repo root:
+  `docker compose -f ./docker-compose.yml exec hedger-bot pnpm status`.
+- Plain-Docker equivalent (no Compose): `docker ps` to find the container name,
+  then `docker exec -it <name> pnpm status`.
 
 ## Troubleshooting
 

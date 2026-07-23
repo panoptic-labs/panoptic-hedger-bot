@@ -5,7 +5,7 @@ import { readSafePositions } from './positionReader'
 
 const sdk = vi.hoisted(() => ({
   syncPositions: vi.fn(),
-  getPosition: vi.fn(),
+  getPositions: vi.fn(),
 }))
 
 vi.mock('@panoptic-eng/sdk/v2', () => sdk)
@@ -41,14 +41,24 @@ describe('readSafePositions', () => {
     for (const p of [option, loanA, loanB, settled]) byId[p.tokenId.toString()] = [p]
 
     sdk.syncPositions.mockResolvedValue({ positionIds: [1n, 2n, 3n, 4n] })
-    sdk.getPosition.mockImplementation(async ({ tokenId }: { tokenId: bigint }) => ({
-      legs: byId[tokenId.toString()][0].legs,
-      positionSize: byId[tokenId.toString()][0].positionSize,
-      tickAtMint: 0n,
+    // Mirrors the SDK's batched read: one call for all ids, zero-size dropped.
+    sdk.getPositions.mockImplementation(async ({ tokenIds }: { tokenIds: bigint[] }) => ({
+      positions: tokenIds
+        .map((tokenId) => ({
+          tokenId,
+          legs: byId[tokenId.toString()][0].legs,
+          positionSize: byId[tokenId.toString()][0].positionSize,
+          tickAtMint: 0n,
+        }))
+        .filter((position) => position.positionSize !== 0n),
+      _meta: { blockNumber: 100n },
     }))
 
     const { positions, hedgePositions } = await readSafePositions(deps())
 
+    // One batched read for the whole book.
+    expect(sdk.getPositions).toHaveBeenCalledTimes(1)
+    expect(sdk.getPositions.mock.calls[0][0]).toMatchObject({ tokenIds: [1n, 2n, 3n, 4n] })
     // Size-0 position filtered; all non-empty synced ids present.
     expect(positions.map((p) => p.tokenId)).toEqual([1n, 2n, 3n])
     // Only width-0 positions are hedge loans; the option is excluded.
@@ -58,6 +68,6 @@ describe('readSafePositions', () => {
   it('propagates a syncPositions failure (never proceeds on an unknown set)', async () => {
     sdk.syncPositions.mockRejectedValue(new Error('sync timeout'))
     await expect(readSafePositions(deps())).rejects.toThrow('sync timeout')
-    expect(sdk.getPosition).not.toHaveBeenCalled()
+    expect(sdk.getPositions).not.toHaveBeenCalled()
   })
 })

@@ -31,6 +31,13 @@ async function main(): Promise<void> {
     safeAddress: config.SAFE_ADDRESS,
     storage: createMemoryStorage(),
     fromBlock: config.SYNC_FROM_BLOCK ?? protocolGenesisBlock(config.CHAIN_ID),
+    lp: {
+      subgraphUrl: config.LP_SUBGRAPH_URL,
+      owners: config.UNISWAP_LP_OWNER
+        ? [config.SAFE_ADDRESS, config.UNISWAP_LP_OWNER]
+        : [config.SAFE_ADDRESS],
+      maxLagBlocks: config.LP_SUBGRAPH_MAX_LAG_BLOCKS,
+    },
   }
   let snapshot = await readHedgeSnapshot(snapshotDeps)
   const metadata = snapshot.pool.metadata
@@ -80,6 +87,8 @@ async function main(): Promise<void> {
     slippageBps: BigInt(config.SLIPPAGE_BPS),
     positions: snapshot.positions,
     hedgePositions: snapshot.hedgePositions,
+    lpPositions: snapshot.lp?.positions,
+    includeLp: config.HEDGE_INCLUDE_LP && (snapshot.lp?.fresh ?? false),
   })
 
   // ---- Step-by-step delta breakdown (vault-asset frame) --------------------
@@ -111,7 +120,21 @@ async function main(): Promise<void> {
     `collateral      token0.assets=${b.collateralToken0Assets}  token1.assets=${b.collateralToken1Assets}`,
   )
   console.log(`collateralDelta (asset-side, vault frame)            = ${h(b.collateralDelta)}`)
-  console.log(`netDelta        = positionsDelta + collateralDelta   = ${h(b.netDelta)}`)
+  const lpCount = snapshot.lp?.positions.length ?? 0
+  const lpFresh = snapshot.lp?.fresh ?? false
+  const lpNote = b.lpIncluded
+    ? 'applied'
+    : lpCount === 0
+      ? 'no same-pair LP positions'
+      : !lpFresh
+        ? `NOT applied — subgraph stale (head=${snapshot.lp?.headBlock})`
+        : 'observed, not applied (HEDGE_INCLUDE_LP=false)'
+  console.log(
+    `lpDelta         (Uniswap LP, vault frame) [${lpCount} pos]  = ${h(b.lpDelta)}  (${lpNote})`,
+  )
+  console.log(
+    `netDelta        = positionsDelta + collateralDelta${b.lpIncluded ? ' + lpDelta' : ''}  = ${h(b.netDelta)}`,
+  )
   console.log('\n-- hedge book (H) --')
   for (const item of b.hedges) {
     console.log(`    hedge ${item.tokenId}  tokenType=${item.tokenType}  size=${h(item.size)}`)

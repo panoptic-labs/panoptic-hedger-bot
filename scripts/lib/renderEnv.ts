@@ -35,6 +35,8 @@ export interface EnvValues {
   POLL_INTERVAL_MS?: number
   DRY_RUN?: boolean
   // Optional
+  UNISWAP_LP_OWNER?: `0x${string}`
+  HEDGE_INCLUDE_LP?: boolean
   TELEGRAM_BOT_TOKEN?: string
   TELEGRAM_CHAT_ID?: string
 }
@@ -119,6 +121,14 @@ export function renderEnvFile(values: EnvValues): string {
         // (falls back to the schema default when the wizard didn't set one).
         { key: 'POLL_INTERVAL_MS', value: values.POLL_INTERVAL_MS ?? 60_000 },
         { key: 'DRY_RUN', value: values.DRY_RUN },
+      ],
+    },
+    {
+      heading:
+        'Optional — Uniswap LP hedging. UNISWAP_LP_OWNER = extra LP-holding address (scanned with the Safe). HEDGE_INCLUDE_LP=true folds same-pair LP delta into the hedge (only when the LP subgraph is fresh); false = observe-only.',
+      lines: [
+        { key: 'UNISWAP_LP_OWNER', value: values.UNISWAP_LP_OWNER },
+        { key: 'HEDGE_INCLUDE_LP', value: values.HEDGE_INCLUDE_LP },
       ],
     },
     {

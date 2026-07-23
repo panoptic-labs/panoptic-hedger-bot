@@ -1,4 +1,9 @@
-import { type StorageAdapter, isNonceError, isRetryableRpcError } from '@panoptic-eng/sdk/v2'
+import {
+  type PoolMetadata,
+  type StorageAdapter,
+  isNonceError,
+  isRetryableRpcError,
+} from '@panoptic-eng/sdk/v2'
 import type { Account, Hex, PublicClient } from 'viem'
 import { formatUnits } from 'viem'
 
@@ -50,8 +55,14 @@ export interface HedgerBotDeps {
   notifier: Notifier
   gasPolicy: GasPolicy
   hedgeJournal: HedgeJournalPort
-  /** Persistence for the SDK position sync (in-memory; per-process cache). */
+  /** Persistence for the SDK position sync (file-backed; survives restarts). */
   storage: StorageAdapter
+  /**
+   * Immutable pool metadata fetched once at startup — when provided, getPool
+   * skips re-reading addresses/decimals/symbols every cycle. Optional (tests);
+   * absent just means the SDK refetches it per snapshot.
+   */
+  poolMetadata?: PoolMetadata
   /**
    * Decimals + symbol of the sizing (vault-asset) token — the frame that
    * netDelta/H/H* are denominated in (config.ASSET_INDEX). Used only to render
@@ -167,16 +178,31 @@ export class HedgerBot {
         (signal.detail ? ` ${signal.detail}` : ''),
     )
 
-    const snapshotBlock = signal.blockNumber ?? (await publicClient.getBlockNumber())
+    // Uniswap LP tracking is active when hedging is enabled or an extra LP owner
+    // is configured (so operators can observe LP delta before flipping the switch).
+    const lpTrackingEnabled = config.HEDGE_INCLUDE_LP || Boolean(config.UNISWAP_LP_OWNER)
+    const lpOwners = config.UNISWAP_LP_OWNER
+      ? [safeAddress, config.UNISWAP_LP_OWNER]
+      : [safeAddress]
 
+    // Pinned to the signal's block when it has one; otherwise readHedgeSnapshot
+    // resolves head itself (one shared getBlockMeta for all reads).
     const snapshot = await readHedgeSnapshot({
       publicClient,
       poolAddress,
       chainId,
       safeAddress,
+      poolMetadata: this.deps.poolMetadata,
       storage: this.deps.storage,
       fromBlock: config.SYNC_FROM_BLOCK ?? protocolGenesisBlock(config.CHAIN_ID),
-      blockNumber: snapshotBlock,
+      blockNumber: signal.blockNumber,
+      lp: lpTrackingEnabled
+        ? {
+            subgraphUrl: config.LP_SUBGRAPH_URL,
+            owners: lpOwners,
+            maxLagBlocks: config.LP_SUBGRAPH_MAX_LAG_BLOCKS,
+          }
+        : undefined,
     })
     const { pool, buyingPower: bp } = snapshot
     const legCount = snapshot.positions.reduce((n, position) => n + position.legs.length, 0)
@@ -261,13 +287,33 @@ export class HedgerBot {
       slippageBps: BigInt(config.SLIPPAGE_BPS),
       positions: snapshot.positions,
       hedgePositions: snapshot.hedgePositions,
+      lpPositions: snapshot.lp?.positions,
+      includeLp: config.HEDGE_INCLUDE_LP && (snapshot.lp?.fresh ?? false),
     })
+
+    // Surface the Uniswap LP delta contribution (observed vs applied).
+    if (snapshot.lp) {
+      const assetDecimals = config.ASSET_INDEX === 0n ? m.token0Decimals : m.token1Decimals
+      const assetSymbol = config.ASSET_INDEX === 0n ? m.token0Symbol : m.token1Symbol
+      const asset = (v: bigint) => `${formatUnits(v, Number(assetDecimals))} ${assetSymbol}`
+      const applied = plan.breakdown.lpIncluded
+      if (lpTrackingEnabled && config.HEDGE_INCLUDE_LP && !snapshot.lp.fresh) {
+        botWarn(
+          `[hedger-bot] Uniswap LP delta NOT applied — subgraph stale ` +
+            `(head=${snapshot.lp.headBlock}, chain=${snapshot.blockNumber}); treating LP as observe-only`,
+        )
+      }
+      botLog(
+        `[hedger-bot] uniswapLp positions=${snapshot.lp.positions.length} ` +
+          `lpDelta=${asset(plan.breakdown.lpDelta)} ${applied ? '(applied)' : '(observed, not applied)'}`,
+      )
+    }
 
     if (plan.intent.openTokenId !== null) {
       const margin = await assessFinalStateReserve(
         executor,
         plan.intent,
-        snapshotBlock,
+        snapshot.blockNumber,
         config.MIN_MARGIN_RESERVE_BPS,
       )
       if (!margin.sufficient) {
@@ -710,15 +756,16 @@ export class HedgerBot {
   /** Read a fresh block-pinned snapshot (used for mid-deleverage re-assessment). */
   private async readSnapshot(_trigger: string): Promise<HedgeSnapshot> {
     const { config, publicClient } = this.deps
-    const blockNumber = await publicClient.getBlockNumber()
+    // No explicit pin block: readHedgeSnapshot resolves head once via its own
+    // shared getBlockMeta and pins every read to it.
     return readHedgeSnapshot({
       publicClient,
       poolAddress: config.POOL_ADDRESS,
       chainId: BigInt(config.CHAIN_ID),
       safeAddress: config.SAFE_ADDRESS,
+      poolMetadata: this.deps.poolMetadata,
       storage: this.deps.storage,
       fromBlock: config.SYNC_FROM_BLOCK ?? protocolGenesisBlock(config.CHAIN_ID),
-      blockNumber,
     })
   }
 }

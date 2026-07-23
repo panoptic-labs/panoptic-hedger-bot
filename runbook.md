@@ -128,6 +128,23 @@ pnpm inspect:hedge      # dry-run one cycle, prints the plan, sends nothing
 DRY_RUN=true pnpm start  # full loop, simulates dispatch via eth_call
 ```
 
+**Optional — Uniswap LP positions (same token pair).** If the Safe (or a
+separate wallet) also holds plain Uniswap v3/v4 LP on this pool's pair, the bot
+can fold that LP delta into the hedge:
+
+- Set `UNISWAP_LP_OWNER` to the extra wallet holding LP — leave it unset if only
+  the Safe holds LP (it is always scanned; pointing it at the Safe is harmless
+  but redundant).
+- Start with `HEDGE_INCLUDE_LP=false` (observe-only): the delta is computed and
+  logged but not applied.
+- Run `pnpm inspect:hedge` and verify the `lpDelta` line — position count,
+  delta magnitude, and that the subgraph is fresh (not stale). `pnpm status` and
+  `pnpm preflight` also surface the LP count, subgraph lag, and freshness.
+- Once verified and the LP subgraph is fully synced, set `HEDGE_INCLUDE_LP=true`
+  and re-run the sequence below. A runtime freshness guard
+  (`LP_SUBGRAPH_MAX_LAG_BLOCKS`) still forces observe-only whenever the subgraph
+  lags chain head, so a stale indexer can never cause a mis-hedge.
+
 The production sequence is deliberately ordered and must be repeated for the
 exact candidate artifact after any configuration, role, Safe, pool, signer, or
 build-identity change:

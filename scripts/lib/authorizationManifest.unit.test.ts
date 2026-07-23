@@ -43,8 +43,10 @@ const scopeFunctionEvent = {
   ],
 } as const
 
-function log(topics: readonly Hex[], data: Hex) {
-  return { address: MODIFIER, topics, data }
+function log(topics: readonly (Hex | Hex[] | null)[], data: Hex) {
+  // encodeEventTopics returns `[Hex, ...(Hex | Hex[] | null)[]]`; these events
+  // have only scalar, always-present topics, so keep the plain Hex entries.
+  return { address: MODIFIER, topics: topics.filter((t): t is Hex => typeof t === 'string'), data }
 }
 
 function assign(module: Address, role = ROLE) {

@@ -105,6 +105,30 @@ describe('parseHedgerBotConfig', () => {
     ).toThrow(/below MIN_MARGIN_RESERVE_BPS/)
   })
 
+  it('accepts UNISWAP_LP_OWNER equal to SAFE_ADDRESS (dedup makes it harmless)', () => {
+    // The Safe is always scanned; a UNISWAP_LP_OWNER pointed at it is deduped in
+    // readSafeLpPositions, so it is redundant rather than a double-count error.
+    const cfg = parseHedgerBotConfig({ ...BASE_ENV, UNISWAP_LP_OWNER: BASE_ENV.SAFE_ADDRESS })
+    expect(cfg.UNISWAP_LP_OWNER).toBe(BASE_ENV.SAFE_ADDRESS)
+  })
+
+  it('accepts a distinct UNISWAP_LP_OWNER with LP hedging enabled', () => {
+    const cfg = parseHedgerBotConfig({
+      ...BASE_ENV,
+      UNISWAP_LP_OWNER: '0x4444444444444444444444444444444444444444',
+      HEDGE_INCLUDE_LP: 'true',
+    })
+    expect(cfg.UNISWAP_LP_OWNER).toBe('0x4444444444444444444444444444444444444444')
+    expect(cfg.HEDGE_INCLUDE_LP).toBe(true)
+    expect(cfg.LP_SUBGRAPH_MAX_LAG_BLOCKS).toBe(50n)
+  })
+
+  it('allows HEDGE_INCLUDE_LP with no UNISWAP_LP_OWNER (Safe-only LP is valid)', () => {
+    const cfg = parseHedgerBotConfig({ ...BASE_ENV, HEDGE_INCLUDE_LP: 'true' })
+    expect(cfg.HEDGE_INCLUDE_LP).toBe(true)
+    expect(cfg.UNISWAP_LP_OWNER).toBeUndefined()
+  })
+
   it('does not enforce deleverage tuning relationships while disabled', () => {
     // trigger >= target would be rejected only when enabled.
     const cfg = parseHedgerBotConfig({

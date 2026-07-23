@@ -158,7 +158,7 @@ const closeSevenPlan = {
     currentTick: 0n,
     slippageBps: 30n,
   },
-} as never
+} as unknown as ReturnType<typeof computeHedgePlan>
 
 /** A consolidation that burns both old loans before minting one replacement. */
 const consolidatePlan = {
@@ -183,7 +183,7 @@ const consolidatePlan = {
     currentTick: 0n,
     slippageBps: 30n,
   },
-} as never
+} as unknown as ReturnType<typeof computeHedgePlan>
 
 type BotDeps = ConstructorParameters<typeof HedgerBot>[0]
 
@@ -271,7 +271,7 @@ describe('HedgerBot gas deferral gate', () => {
 
   it('a deferring gas policy blocks execution before the executor runs', async () => {
     const execute = vi.fn()
-    const notify = vi.fn(async () => undefined)
+    const notify = vi.fn(async (_message: unknown) => undefined)
     const { bot } = await makeBot(deferResult, 'success', {
       executor: { kind: 'same-pool-loan', execute } as unknown as HedgeExecutor,
       notifier: { notify },
@@ -398,7 +398,7 @@ describe('HedgerBot final-state margin reserve', () => {
 
 describe('HedgerBot stuck dispatch (TxNotMinedError)', () => {
   it('alerts once and leaves the tracked hedge set untouched', async () => {
-    const notify = vi.fn(async () => undefined)
+    const notify = vi.fn(async (_message: unknown) => undefined)
     const execute = vi
       .fn()
       .mockRejectedValueOnce(new TxNotMinedError(['0xaa', '0xbb'] as never, 180_000))
@@ -568,7 +568,7 @@ describe('HedgerBot deleverage path', () => {
       ...(closeSevenPlan as object),
     } as never)
 
-    const deleveragerExecute = vi.fn(async () => okResult)
+    const deleveragerExecute = vi.fn(async (_intent: unknown) => okResult)
     const { bot, execute: loanExecute } = await makeBot(okResult, 'success', {
       deleveragerExecutor: {
         kind: 'same-pool-loan',
@@ -604,8 +604,8 @@ describe('HedgerBot deleverage path', () => {
       ...(consolidatePlan as object),
     } as never)
 
-    const deleveragerExecute = vi.fn(async () => okResult)
-    const notify = vi.fn(async () => undefined)
+    const deleveragerExecute = vi.fn(async (_intent: unknown) => okResult)
+    const notify = vi.fn(async (_message: unknown) => undefined)
     const { bot, execute: loanExecute } = await makeBot(okResult, 'success', {
       notifier: { notify },
       deleveragerExecutor: {

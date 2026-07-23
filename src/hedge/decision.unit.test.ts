@@ -1,6 +1,8 @@
+import { getLpGreeks } from '@panoptic-eng/sdk/uniswap'
 import { describe, expect, it } from 'vitest'
 
 import { type HedgeItem, type PlanHedgeConfig, computeHedgePlan, planHedge } from './decision'
+import type { LpPositionForHedge } from './lpPositions'
 
 // assetIndex = 1n → short hedge tokenType = 1n (asset), long hedge tokenType = 0n (numeraire).
 const CFG: PlanHedgeConfig = {
@@ -70,6 +72,69 @@ describe('computeHedgePlan — collateral delta', () => {
     expect(plan.netDelta).toBe(token1Assets)
     // No mint planned here → the collision diagnostic is threaded as an empty list.
     expect(plan.intent.skippedCollidingTokenIds).toEqual([])
+  })
+})
+
+describe('computeHedgePlan — Uniswap LP delta', () => {
+  const lp: LpPositionForHedge = { liquidity: 10n ** 18n, tickLower: -2000n, tickUpper: 2000n }
+  // In-range LP at tick 0, token0-asset frame → positive delta (long the asset).
+  const expectedLpDelta = getLpGreeks({
+    liquidity: lp.liquidity,
+    tickLower: lp.tickLower,
+    tickUpper: lp.tickUpper,
+    currentTick: 0n,
+    assetIndex: 0,
+  }).delta
+
+  const planWithLp = (includeLp: boolean) =>
+    computeHedgePlan({
+      pool: { currentTick: 0n, poolId: 1n, poolKey: { tickSpacing: 10 } } as never,
+      collateral: { token0: { assets: 0n }, token1: { assets: 0n } } as never,
+      signalTick: 0n,
+      assetIndex: 0n,
+      deltaThresholdBps: 200n,
+      deltaOffsetBps: 0n,
+      absoluteMaxHedgeCount: 4,
+      slippageBps: 30n,
+      positions: [],
+      hedgePositions: [],
+      lpPositions: [lp],
+      includeLp,
+    })
+
+  it('adds lpDelta to netDelta when includeLp is true', () => {
+    expect(expectedLpDelta > 0n).toBe(true)
+    const plan = planWithLp(true)
+    expect(plan.breakdown.lpDelta).toBe(expectedLpDelta)
+    expect(plan.breakdown.lpIncluded).toBe(true)
+    expect(plan.netDelta).toBe(expectedLpDelta) // collateral + positions are 0 here
+  })
+
+  it('computes lpDelta but excludes it from netDelta when includeLp is false', () => {
+    const plan = planWithLp(false)
+    expect(plan.breakdown.lpDelta).toBe(expectedLpDelta)
+    expect(plan.breakdown.lpIncluded).toBe(false)
+    expect(plan.netDelta).toBe(0n)
+  })
+
+  it('lpIncluded is false when there are no LP positions', () => {
+    const plan = computeHedgePlan({
+      pool: { currentTick: 0n, poolId: 1n, poolKey: { tickSpacing: 10 } } as never,
+      collateral: { token0: { assets: 0n }, token1: { assets: 0n } } as never,
+      signalTick: 0n,
+      assetIndex: 0n,
+      deltaThresholdBps: 200n,
+      deltaOffsetBps: 0n,
+      absoluteMaxHedgeCount: 4,
+      slippageBps: 30n,
+      positions: [],
+      hedgePositions: [],
+      lpPositions: [],
+      includeLp: true,
+    })
+    expect(plan.breakdown.lpDelta).toBe(0n)
+    expect(plan.breakdown.lpIncluded).toBe(false)
+    expect(plan.netDelta).toBe(0n)
   })
 })
 

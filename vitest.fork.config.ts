@@ -6,7 +6,11 @@ export default mergeConfig(
   baseConfig,
   defineConfig({
     test: {
-      include: ['scripts/setup.fork.test.ts', 'scripts/deleverage.fork.test.ts'],
+      include: [
+        'scripts/setup.fork.test.ts',
+        'scripts/deleverage.fork.test.ts',
+        'scripts/hedgeLp.fork.test.ts',
+      ],
       exclude: [],
       testTimeout: 120_000,
       hookTimeout: 30_000,

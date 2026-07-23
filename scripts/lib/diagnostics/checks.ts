@@ -2,6 +2,7 @@ import { getPool, getPoolMetadata } from '@panoptic-eng/sdk/v2'
 import { formatEther } from 'viem'
 
 import { deleveragerRoleKey } from '../../../src/config'
+import { readSafeLpPositions } from '../../../src/hedge/lpPositions'
 import { validateBotToken } from '../../../src/notify/telegramOnboard'
 import { createPriceSignalSource, PriceSignalUnavailableError } from '../../../src/priceSignal'
 import { rolesModifierV2Abi } from '../../../src/safe/rolesAbi'
@@ -485,7 +486,71 @@ export async function runDoctorChecks(
     }
   }
 
-  // 11. Telegram delivery (optional).
+  // 11. Uniswap LP subgraph freshness (only when LP tracking is configured).
+  //     A lagging subgraph is not fatal — the runtime guard forces observe-only —
+  //     but the operator should know their LP delta is (or would be) suppressed.
+  if (config.HEDGE_INCLUDE_LP || config.UNISWAP_LP_OWNER) {
+    try {
+      const [chainHead, pool] = await Promise.all([
+        publicClient.getBlockNumber(),
+        getPool({
+          client: asSdkClient<typeof getPool>(publicClient),
+          poolAddress: config.POOL_ADDRESS,
+          chainId: BigInt(config.CHAIN_ID),
+        }),
+      ])
+      const owners = config.UNISWAP_LP_OWNER
+        ? [config.SAFE_ADDRESS, config.UNISWAP_LP_OWNER]
+        : [config.SAFE_ADDRESS]
+      const res = await readSafeLpPositions({
+        url: config.LP_SUBGRAPH_URL,
+        owners,
+        token0: pool.poolKey.currency0,
+        token1: pool.poolKey.currency1,
+      })
+      const mode = config.HEDGE_INCLUDE_LP ? 'fold into hedge' : 'observe-only'
+      if (!res.ok) {
+        push({
+          id: 'lp-subgraph',
+          title: 'Uniswap LP subgraph',
+          status: config.HEDGE_INCLUDE_LP ? 'warn' : 'skip',
+          detail: `query failed against ${config.LP_SUBGRAPH_URL} (mode: ${mode})`,
+          remedy: config.HEDGE_INCLUDE_LP
+            ? 'LP delta will be treated as observe-only until the subgraph responds; check LP_SUBGRAPH_URL.'
+            : undefined,
+        })
+      } else {
+        const lag = chainHead > res.headBlock ? chainHead - res.headBlock : 0n
+        const fresh = res.headBlock > 0n && lag <= config.LP_SUBGRAPH_MAX_LAG_BLOCKS
+        push({
+          id: 'lp-subgraph',
+          title: 'Uniswap LP subgraph',
+          // Only a fold-mode stale subgraph is worth a warning (it suppresses a
+          // delta the operator expects to be applied); observe-only stays pass.
+          status: fresh || !config.HEDGE_INCLUDE_LP ? 'pass' : 'warn',
+          detail:
+            `${res.positions.length} same-pair position(s); head=${res.headBlock} ` +
+            `chain=${chainHead} lag=${lag} (max ${config.LP_SUBGRAPH_MAX_LAG_BLOCKS}); ` +
+            `${fresh ? 'fresh' : 'STALE'}; mode: ${mode}`,
+          remedy:
+            fresh || !config.HEDGE_INCLUDE_LP
+              ? undefined
+              : 'Subgraph lags chain head: LP delta will be observe-only (not hedged) until it catches up.',
+        })
+      }
+    } catch (err) {
+      push({
+        id: 'lp-subgraph',
+        title: 'Uniswap LP subgraph',
+        status: config.HEDGE_INCLUDE_LP ? 'warn' : 'skip',
+        detail: msg(err),
+        remedy:
+          'Could not read the pool or LP subgraph — verify RPC_URL, POOL_ADDRESS, and LP_SUBGRAPH_URL.',
+      })
+    }
+  }
+
+  // 12. Telegram delivery (optional).
   if (config.TELEGRAM_BOT_TOKEN && config.TELEGRAM_CHAT_ID) {
     try {
       const username = await validateBotToken(config.TELEGRAM_BOT_TOKEN)

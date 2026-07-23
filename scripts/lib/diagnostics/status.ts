@@ -32,6 +32,8 @@ export interface StatusSnapshot {
   loanOnlyScope?: 'ok' | 'FAILED' | 'unknown'
   positions?: string
   netDelta?: string
+  /** Uniswap LP summary (owner scope, count, subgraph lag/freshness, delta); undefined when LP tracking is off. */
+  lp?: string
   priceSignal?: string
   lastPoll?: string
   lastHedge?: string
@@ -152,6 +154,16 @@ export async function gatherStatus(ctx: StatusDiagnosticsContext): Promise<Statu
       safeAddress: config.SAFE_ADDRESS,
       storage: createMemoryStorage(),
       fromBlock: config.SYNC_FROM_BLOCK ?? protocolGenesisBlock(config.CHAIN_ID),
+      lp:
+        config.HEDGE_INCLUDE_LP || config.UNISWAP_LP_OWNER
+          ? {
+              subgraphUrl: config.LP_SUBGRAPH_URL,
+              owners: config.UNISWAP_LP_OWNER
+                ? [config.SAFE_ADDRESS, config.UNISWAP_LP_OWNER]
+                : [config.SAFE_ADDRESS],
+              maxLagBlocks: config.LP_SUBGRAPH_MAX_LAG_BLOCKS,
+            }
+          : undefined,
     })
     const hedgeCount = snapshot.hedgePositions.length
     snap.positions = `${snapshot.positions.length} open (${hedgeCount} hedge loan${
@@ -192,10 +204,25 @@ export async function gatherStatus(ctx: StatusDiagnosticsContext): Promise<Statu
       slippageBps: BigInt(config.SLIPPAGE_BPS),
       positions: snapshot.positions,
       hedgePositions: snapshot.hedgePositions,
+      lpPositions: snapshot.lp?.positions,
+      includeLp: config.HEDGE_INCLUDE_LP && (snapshot.lp?.fresh ?? false),
     })
     const dec = config.ASSET_INDEX === 0n ? Number(md.token0Decimals) : Number(md.token1Decimals)
     const sym = config.ASSET_INDEX === 0n ? md.token0Symbol : md.token1Symbol
     snap.netDelta = `${formatUnits(plan.netDelta, dec)} ${sym} (drift ${plan.driftBps}bps, action ${plan.action})`
+
+    // Uniswap LP: only when tracking is configured (snapshot.lp is present).
+    if (snapshot.lp) {
+      const lp = snapshot.lp
+      const lag = snapshot.blockNumber > lp.headBlock ? snapshot.blockNumber - lp.headBlock : 0n
+      const owners = config.UNISWAP_LP_OWNER ? `Safe + ${config.UNISWAP_LP_OWNER}` : 'Safe'
+      const freshness = lp.fresh ? 'fresh' : 'STALE'
+      const mode = plan.breakdown.lpIncluded ? 'applied' : 'observed'
+      snap.lp =
+        `${lp.positions.length} pos [${owners}], ` +
+        `head=${lp.headBlock} lag=${lag} (${freshness}), ` +
+        `Δ ${formatUnits(plan.breakdown.lpDelta, dec)} ${sym} (${mode})`
+    }
   } catch (err) {
     notes.push(`on-chain read failed: ${sanitizeError(err)}`)
   }

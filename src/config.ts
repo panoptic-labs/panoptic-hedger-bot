@@ -122,6 +122,14 @@ const boundedGwei = (min: string, max: string, defaultValue: string) =>
 const boundedEth = (min: string, max: string, defaultValue: string) =>
   boundedAmount(parseEther, min, max, defaultValue)
 
+// Default LP-positions subgraph (Ethereum mainnet) — the same deployment the
+// monitor bot reads. Indexes plain Uniswap v3/v4 LP positions.
+export const DEFAULT_LP_SUBGRAPH_URL =
+  'https://api.goldsky.com/api/public/project_cl9gc21q105380hxuh8ks53k3/subgraphs/panoptic-subgraph-lp-mainnet/v2_prod/gn'
+
+/** Default for LP_SUBGRAPH_MAX_LAG_BLOCKS; shared with the setup wizard's preview. */
+export const DEFAULT_LP_SUBGRAPH_MAX_LAG_BLOCKS = 50n
+
 export const PRICE_SIGNAL_SOURCES = ['pool-tick', 'uniswap-pool', 'cex'] as const
 
 /**
@@ -141,6 +149,9 @@ const rawEnvSchema = z
     // Chain / RPC
     CHAIN_ID: z.coerce.number().int().positive(),
     RPC_URL: rpcUrlSchema,
+    // Optional secondary endpoint: reads/sends fall back to it when the primary
+    // errors (viem fallback transport, deterministic order — primary first).
+    RPC_URL_FALLBACK: rpcUrlSchema.optional(),
 
     // Panoptic pool holding options + hedge loans
     POOL_ADDRESS: addressSchema,
@@ -270,6 +281,20 @@ const rawEnvSchema = z
       .transform(BigInt)
       .optional(),
     PANOPTIC_BUILDER_CODE: z.string().optional(),
+    // Optional extra address (besides the Safe) whose plain Uniswap v3/v4 LP
+    // positions on this pool's token pair are folded into the hedge delta when
+    // HEDGE_INCLUDE_LP is enabled. Also used for read-only monitoring via
+    // @panopticMonitorBot (/monitor <address>).
+    UNISWAP_LP_OWNER: addressSchema.optional(),
+    // Uniswap LP delta hedging (see README "Tracking Uniswap LP positions").
+    // LP positions are read from the LP subgraph; delta is only ADDED to the
+    // hedge when HEDGE_INCLUDE_LP=true AND the subgraph is fresh (see guard).
+    LP_SUBGRAPH_URL: z.string().url().default(DEFAULT_LP_SUBGRAPH_URL),
+    HEDGE_INCLUDE_LP: booleanSchema.default('false'),
+    // Max blocks the LP subgraph head may lag chain head before LP delta is
+    // treated as unavailable (observe-only). Guards against a still-syncing
+    // subgraph causing a mis-hedge.
+    LP_SUBGRAPH_MAX_LAG_BLOCKS: boundedBigint(0n, 10_000_000n, DEFAULT_LP_SUBGRAPH_MAX_LAG_BLOCKS),
     // Telegram notifications (both required together to enable).
     TELEGRAM_BOT_TOKEN: z.string().optional(),
     TELEGRAM_CHAT_ID: z.string().optional(),
@@ -400,6 +425,7 @@ const rawEnvSchema = z
         })
       }
     }
+
     const hasTgToken = Boolean(cfg.TELEGRAM_BOT_TOKEN)
     const hasTgChat = Boolean(cfg.TELEGRAM_CHAT_ID)
     if (hasTgToken !== hasTgChat) {

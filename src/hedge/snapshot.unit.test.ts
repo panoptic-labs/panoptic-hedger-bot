@@ -5,6 +5,7 @@ import { readSafePositions } from './positionReader'
 import { readHedgeSnapshot } from './snapshot'
 
 const sdk = vi.hoisted(() => ({
+  getBlockMeta: vi.fn(),
   getPool: vi.fn(),
   getAccountBuyingPower: vi.fn(),
   getAccountCollateral: vi.fn(),
@@ -18,8 +19,10 @@ vi.mock('./positionReader', () => ({ readSafePositions: vi.fn() }))
 describe('readHedgeSnapshot', () => {
   it('pins every account read to one block and reads the pool once', async () => {
     const blockNumber = 456n
+    const blockMeta = { blockNumber, blockHash: '0xabc', blockTimestamp: 1n }
     const positions = [{ tokenId: 7n, legs: [], positionSize: 1n, tickAtMint: 0n }]
     vi.mocked(readSafePositions).mockResolvedValue({ positions, hedgePositions: [] })
+    sdk.getBlockMeta.mockResolvedValue(blockMeta)
     sdk.getPool.mockResolvedValue({ poolId: 1n })
     sdk.getCollateralAddresses.mockReturnValue(['0x01', '0x02'])
     sdk.getAccountBuyingPower.mockResolvedValue({})
@@ -37,6 +40,8 @@ describe('readHedgeSnapshot', () => {
       storage: {} as never, // unused: readSafePositions is mocked
     })
 
+    // The pin block is resolved by exactly one shared getBlockMeta call.
+    expect(sdk.getBlockMeta).toHaveBeenCalledTimes(1)
     expect(sdk.getPool).toHaveBeenCalledTimes(1)
     for (const call of [
       vi.mocked(readSafePositions).mock.calls[0][0],

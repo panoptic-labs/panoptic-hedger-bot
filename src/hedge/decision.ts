@@ -1,3 +1,4 @@
+import { getLpGreeks } from '@panoptic-eng/sdk/uniswap'
 import { tickToSqrtPriceX96, toVaultFrameAtTick } from '@panoptic-eng/sdk/v2'
 
 import type { HedgeAction, HedgeIntent } from '../executor/types'
@@ -9,6 +10,7 @@ import {
   computePortfolioSizeInVaultAsset,
   toVaultFrameAtSqrtPriceX96,
 } from './frame'
+import type { LpPositionForHedge } from './lpPositions'
 import type { HedgeSnapshot } from './snapshot'
 
 /** A hedge loan position reduced to the fields the planner needs. `size` is a positive magnitude in vault-asset units. */
@@ -236,6 +238,13 @@ export interface ComputeHedgePlanDeps {
   positions: PositionSnapshot[]
   /** Subset of `positions` that are the bot's hedge loans. */
   hedgePositions: PositionSnapshot[]
+  /**
+   * Same-pair Uniswap LP positions (Safe + configured owner). Their delta is
+   * always computed for reporting, but only ADDED to netDelta when `includeLp`.
+   */
+  lpPositions?: LpPositionForHedge[]
+  /** Apply lpDelta to netDelta (HEDGE_INCLUDE_LP && subgraph fresh). */
+  includeLp?: boolean
 }
 
 /** Itemized inputs to the delta calculation, for `inspect:hedge` / debugging. */
@@ -254,7 +263,11 @@ export interface HedgeDeltaBreakdown {
   collateralToken1Assets: bigint
   /** Asset-side collateral in the vault frame (the delta it adds). */
   collateralDelta: bigint
-  /** positionsDelta + collateralDelta — the "true total" drift is measured on. */
+  /** Delta of same-pair Uniswap LP positions (vault-asset frame). */
+  lpDelta: bigint
+  /** Whether lpDelta was applied to netDelta (vs observed-only). */
+  lpIncluded: boolean
+  /** positionsDelta + collateralDelta (+ lpDelta if applied) — drift is measured on this. */
   netDelta: bigint
   /** Hedge-book decomposition (vault-asset frame magnitudes). */
   hedges: HedgeItem[]
@@ -297,7 +310,29 @@ export function computeHedgePlan(deps: ComputeHedgePlanDeps): HedgePlan {
     assetIndex,
   )
   const positionsDelta = portfolioDelta.total
-  const netDelta = positionsDelta + collateralDelta
+
+  // Same-pair Uniswap LP delta, priced at the pool's mark tick. Because the LP
+  // pair == the Panoptic pair (canonical ordering), assetIndex is the vault
+  // asset frame directly — no further conversion, same sign as collateralDelta.
+  let lpDelta = 0n
+  for (const lp of deps.lpPositions ?? []) {
+    // Fail closed per position: a malformed LP entry (e.g. an out-of-range tick)
+    // must not throw out of the hedge cycle and take the options/loans hedge down
+    // with it. Skip that position's contribution and keep going.
+    try {
+      lpDelta += getLpGreeks({
+        liquidity: lp.liquidity,
+        tickLower: lp.tickLower,
+        tickUpper: lp.tickUpper,
+        currentTick: markTick,
+        assetIndex: assetIndex === 0n ? 0 : 1,
+      }).delta
+    } catch {
+      // skip — contributes 0 to lpDelta
+    }
+  }
+  const lpIncluded = Boolean(deps.includeLp) && (deps.lpPositions?.length ?? 0) > 0
+  const netDelta = positionsDelta + collateralDelta + (lpIncluded ? lpDelta : 0n)
   const portfolioSize = computePortfolioSizeInVaultAsset(deps.positions, assetIndex)
 
   // Decompose the hedge book into short/long magnitudes (vault-asset frame).
@@ -385,6 +420,8 @@ export function computeHedgePlan(deps: ComputeHedgePlanDeps): HedgePlan {
     collateralToken0Assets: collateral.token0.assets,
     collateralToken1Assets: collateral.token1.assets,
     collateralDelta,
+    lpDelta,
+    lpIncluded,
     netDelta,
     hedges: hedgeItems,
     H_short,

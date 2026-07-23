@@ -87,6 +87,28 @@ describe('assess — two-tier basefee deferral', () => {
     expect((await policy.assess(false)).shouldNotifySkip).toBe(true)
   })
 
+  it('always reads a fresh basefee: a within-TTL spike still defers', async () => {
+    let base = parseGwei('30')
+    const publicClient = {
+      getBlock: vi.fn(async () => ({ baseFeePerGas: base })),
+      estimateMaxPriorityFeePerGas: vi.fn(async () => parseGwei('0.1')),
+    } as unknown as PublicClient
+    const policy = createGasPolicy({
+      publicClient,
+      account: { address: KEEPER } as Account,
+      notifier: { notify: vi.fn(async () => undefined) },
+      config: CONFIG,
+      now: () => 0, // clock frozen — every call lands inside the cache TTL
+    })
+    expect((await policy.assess(false)).proceed).toBe(true)
+    base = parseGwei('80') // spike within the TTL — assess must still see it
+    expect((await policy.assess(false)).proceed).toBe(false)
+    // fees() right after assess reuses the primed cache (no extra getBlock).
+    const callsBefore = vi.mocked(publicClient.getBlock).mock.calls.length
+    await policy.fees()
+    expect(vi.mocked(publicClient.getBlock).mock.calls.length).toBe(callsBefore)
+  })
+
   it('a recovered streak re-arms the skip alert immediately', async () => {
     let base = parseGwei('80')
     let t = 0
@@ -103,7 +125,8 @@ describe('assess — two-tier basefee deferral', () => {
       now: () => t,
     })
     expect((await policy.assess(false)).shouldNotifySkip).toBe(true)
-    base = parseGwei('10') // spike over
+    base = parseGwei('10') // spike over (next poll — past the basefee cache TTL)
+    t += 60_000
     await policy.assess(false)
     base = parseGwei('80') // new spike 1 min later — alert again
     t += 60_000

@@ -82,13 +82,16 @@ describe('CEX quote policy', () => {
     }
     const address = server.address()
     if (address === null || typeof address === 'string') throw new Error('missing test server port')
+    // Capture the port here: TS drops the narrowing above inside the nested
+    // class/closure below (captured vars aren't narrowed across function scopes).
+    const { port } = address
 
     class RejectedFeed extends ExchangeFeed {
       constructor() {
         super('rejected', { reconnectBaseMs: 5, random: () => 0.5 })
       }
       get url() {
-        return `ws://127.0.0.1:${address.port}`
+        return `ws://127.0.0.1:${port}`
       }
       onOpen(): void {}
       onMessage(_raw: WebSocket.RawData): void {}

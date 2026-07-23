@@ -3,8 +3,14 @@ import 'dotenv/config'
 import { randomBytes } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-import { getChainDeployment, getPoolMetadata, isSupportedChain } from '@panoptic-eng/sdk/v2'
+import {
+  getChainDeployment,
+  getPool,
+  getPoolMetadata,
+  isSupportedChain,
+} from '@panoptic-eng/sdk/v2'
 import { DELEVERAGER_ROLE_KEY } from '@panoptic-eng/sdk/zodiac'
 import {
   type PublicClient,
@@ -19,7 +25,12 @@ import {
 import { privateKeyToAccount } from 'viem/accounts'
 import { z } from 'zod'
 
-import { parseHedgerBotConfig } from '../src/config'
+import {
+  DEFAULT_LP_SUBGRAPH_MAX_LAG_BLOCKS,
+  DEFAULT_LP_SUBGRAPH_URL,
+  parseHedgerBotConfig,
+} from '../src/config'
+import { readSafeLpPositions } from '../src/hedge/lpPositions'
 import {
   readSecureJson,
   removeSecureFile,
@@ -104,6 +115,10 @@ interface DeployState {
   deltaThresholdBps?: number
   deltaOffset?: number
   dryRun: boolean
+  /** Extra LP-holding address scanned alongside the Safe. */
+  uniswapLpOwner?: `0x${string}`
+  /** Fold Uniswap LP delta into the hedge (vs observe-only). */
+  hedgeIncludeLp: boolean
   storage: 'keystore' | 'plaintext'
   extraRoles: { kind: ExtraRoleKind; member: `0x${string}`; sizeCap?: string }[]
   /** Filled in by onDeployed as each contract lands, for a clean resume. */
@@ -115,7 +130,7 @@ const addressSchema = z
   .string()
   .regex(/^0x[0-9a-fA-F]{40}$/)
   .transform((value) => getAddress(value))
-const deployStateSchema: z.ZodType<DeployState, z.ZodTypeDef, unknown> = z
+export const deployStateSchema: z.ZodType<DeployState, z.ZodTypeDef, unknown> = z
   .object({
     version: z.literal(1),
     safeMode: z.enum(['new', 'existing']),
@@ -135,6 +150,10 @@ const deployStateSchema: z.ZodType<DeployState, z.ZodTypeDef, unknown> = z
     deltaThresholdBps: z.number().int().positive().optional(),
     deltaOffset: z.number().int().optional(),
     dryRun: z.boolean(),
+    uniswapLpOwner: addressSchema.optional(),
+    // Optional for resume compatibility: a version-1 state file written before
+    // LP hedging existed has no hedgeIncludeLp; default it to observe-only.
+    hedgeIncludeLp: z.boolean().optional().default(false),
     storage: z.enum(['keystore', 'plaintext']),
     extraRoles: z.array(
       z
@@ -411,6 +430,28 @@ async function main(): Promise<void> {
       }),
     )
     const dryRun = await p.confirm('Start in DRY_RUN (simulate, send nothing)?', true)
+
+    // Optional: an extra address (besides the Safe) holding plain Uniswap v3/v4
+    // LP positions on this pool's token pair. Recorded as UNISWAP_LP_OWNER and
+    // scanned alongside the Safe. Enter to skip.
+    const lpOwnerRaw = (
+      await p.text('UNISWAP_LP_OWNER (extra LP-holding address; Enter to skip)', {
+        default: '',
+      })
+    ).trim()
+    let uniswapLpOwner: `0x${string}` | undefined
+    if (lpOwnerRaw !== '') {
+      const parsed = addressSchema.safeParse(lpOwnerRaw)
+      if (parsed.success) {
+        uniswapLpOwner = parsed.data
+      } else {
+        console.log('  → Ignoring UNISWAP_LP_OWNER: not a valid address.')
+      }
+    }
+
+    // The fold-vs-observe decision is deferred to Phase B, where we can read the
+    // chain and preview the operator's actual LP exposure before offering it.
+
     // Telegram alerts are optional and configured out-of-band: set TELEGRAM_BOT_TOKEN
     // and TELEGRAM_CHAT_ID in .env after onboarding (see README). The wizard no
     // longer walks through BotFather so it stays focused on the on-chain setup.
@@ -507,6 +548,66 @@ async function main(): Promise<void> {
       ),
     ) as 0 | 1
 
+    // LP fold decision (deferred from Phase A): now that we can read the chain,
+    // preview the operator's detected same-pair LP exposure before offering to
+    // fold it into the hedge. A brand-new Safe holds nothing yet, so we only
+    // preview/offer when an address could already hold LP: the configured
+    // UNISWAP_LP_OWNER and/or an existing Safe. Persist HEDGE_INCLUDE_LP=true
+    // only after the operator confirms against real numbers; else observe-only.
+    let hedgeIncludeLp = false
+    const lpPreviewOwners = [
+      ...(uniswapLpOwner ? [uniswapLpOwner] : []),
+      ...(safeMode === 'existing' && existingSafeAddress ? [existingSafeAddress] : []),
+    ]
+    if (lpPreviewOwners.length === 0) {
+      console.log(
+        '  → Uniswap LP fold: observe-only for now (no existing LP-holding address to preview).\n' +
+          '    Enable HEDGE_INCLUDE_LP later after verifying with `pnpm inspect:hedge`.',
+      )
+    } else {
+      try {
+        const [chainHead, pool] = await Promise.all([
+          publicClient.getBlockNumber(),
+          getPool({
+            client: asSdkClient<typeof getPool>(publicClient),
+            poolAddress,
+            chainId: BigInt(chainId),
+          }),
+        ])
+        const lp = await readSafeLpPositions({
+          url: DEFAULT_LP_SUBGRAPH_URL,
+          owners: lpPreviewOwners,
+          token0: pool.poolKey.currency0,
+          token1: pool.poolKey.currency1,
+        })
+        const lag = chainHead > lp.headBlock ? chainHead - lp.headBlock : 0n
+        const fresh = lp.ok && lp.headBlock > 0n && lag <= DEFAULT_LP_SUBGRAPH_MAX_LAG_BLOCKS
+        console.log('\n Uniswap LP exposure (same pool pair):')
+        console.log(`   • owners scanned: ${lpPreviewOwners.join(', ')}`)
+        console.log(
+          `   • same-pair LP positions: ${lp.ok ? lp.positions.length : 'subgraph unavailable'}`,
+        )
+        console.log(
+          `   • subgraph: head=${lp.headBlock} chain=${chainHead} lag=${lag} ` +
+            `(${fresh ? 'fresh' : 'STALE / still syncing'})`,
+        )
+        if (lp.ok && lp.positions.length > 0) {
+          hedgeIncludeLp = await p.confirm(
+            'Fold this Uniswap LP delta into the hedge? (No = observe-only; you can enable later)',
+            false,
+          )
+        } else {
+          console.log(
+            '   → Nothing to fold yet — keeping observe-only. Re-check with `pnpm inspect:hedge`.',
+          )
+        }
+      } catch (err) {
+        console.log(
+          `   → Could not preview LP exposure (${sanitizeError(err)}); keeping observe-only.`,
+        )
+      }
+    }
+
     const addresses = getSafeZodiacAddresses(chainId)
     await verifySafeZodiacBytecode(publicClient, addresses)
     console.log('  → Safe/Zodiac infrastructure verified on-chain.')
@@ -584,6 +685,19 @@ async function main(): Promise<void> {
         '   • You then execute the enable/scope tx(s) from your Safe owner in the Safe UI',
       )
     }
+    if (uniswapLpOwner || hedgeIncludeLp) {
+      console.log('\n Uniswap LP hedging:')
+      console.log(
+        `   • Scanning for same-pair LP positions: Safe${
+          uniswapLpOwner ? ` + ${uniswapLpOwner}` : ' only'
+        }`,
+      )
+      console.log(
+        hedgeIncludeLp
+          ? '   • LP delta will be FOLDED into the hedge (once the subgraph is fresh)'
+          : '   • LP delta is OBSERVE-ONLY (logged, not hedged) — flip HEDGE_INCLUDE_LP later to apply',
+      )
+    }
     if (!(await p.confirm('\n Proceed?', false))) {
       console.log('Aborted. Nothing was deployed.')
       p.close()
@@ -622,6 +736,8 @@ async function main(): Promise<void> {
       deltaThresholdBps: Number.isFinite(deltaThresholdBps) ? deltaThresholdBps : undefined,
       deltaOffset: Number.isFinite(deltaOffset) ? deltaOffset : undefined,
       dryRun,
+      uniswapLpOwner,
+      hedgeIncludeLp,
       storage: botStorage,
       extraRoles: extraRoles.map((r) => ({
         kind: r.kind,
@@ -845,6 +961,8 @@ async function finalizeDeployment(args: {
     PRICE_SIGNAL_SOURCE: 'pool-tick',
     HEDGE_VENUE: 'in-pool',
     DRY_RUN: state.dryRun,
+    UNISWAP_LP_OWNER: state.uniswapLpOwner,
+    HEDGE_INCLUDE_LP: state.hedgeIncludeLp,
     DELEVERAGER_ENABLED: deleveragerSpec ? true : undefined,
   }
   const body = renderEnvFile(values)
@@ -912,6 +1030,16 @@ async function finalizeDeployment(args: {
   console.log('  7. pnpm activate           # bind approval to policy + artifact')
   console.log('  8. pnpm start              # live only after activation')
   console.log('  9. pnpm status && pnpm health')
+  if (state.uniswapLpOwner || state.hedgeIncludeLp) {
+    console.log(
+      '\n  Uniswap LP hedging is configured. In `pnpm inspect:hedge`, check the\n' +
+        '  `lpDelta` line: confirm the position count + delta match your real LP\n' +
+        '  exposure and that the subgraph is fresh (not stale).' +
+        (state.hedgeIncludeLp
+          ? ''
+          : '\n  It is OBSERVE-ONLY now; set HEDGE_INCLUDE_LP=true to fold it into the hedge.'),
+    )
+  }
   if (state.storage === 'keystore') {
     console.log(
       '\n  The bot key is stored encrypted; you will be prompted for the keystore\n' +
@@ -959,7 +1087,13 @@ function dotenvObject(body: string): NodeJS.ProcessEnv {
   return out
 }
 
-main().catch((err) => {
-  console.error(sanitizeError(err))
-  process.exit(1)
-})
+// Only run the wizard when invoked directly (matches generateIdea.ts /
+// checkWsVersion.ts) so importing this module for its exports — e.g. the state
+// schema in tests — does not kick off an interactive deployment.
+const entrypoint = process.argv[1]
+if (entrypoint && fileURLToPath(import.meta.url) === entrypoint) {
+  main().catch((err) => {
+    console.error(sanitizeError(err))
+    process.exit(1)
+  })
+}

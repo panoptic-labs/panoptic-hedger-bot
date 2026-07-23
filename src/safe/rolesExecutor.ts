@@ -189,16 +189,26 @@ export function createRolesExecutor(deps: RolesExecutorDeps): RolesExecutor {
     const pollMs = deps.txWait?.pollIntervalMs ?? 4_000
     const deadline = now() + windowMs
     for (;;) {
-      for (let i = hashes.length - 1; i >= 0; i--) {
-        try {
-          const receipt = await publicClient.getTransactionReceipt({ hash: hashes[i] })
-          if (receipt) return receipt
-        } catch (err) {
-          // Not mined yet — keep polling. Anything else (RPC outage, auth
-          // failure) must propagate rather than masquerade as "not mined".
-          if (!(err instanceof TransactionReceiptNotFoundError)) throw err
+      // One concurrent sweep per tick (the transport batches these); at most one
+      // attempt can mine per nonce, so take the first receipt found — preferring
+      // the newest (highest-fee) attempt on the off chance a flaky node reports
+      // more than one. A failed lookup on one hash must not mask a receipt on
+      // another, so collect settled results and check every hash first. Non-
+      // "not found" errors (RPC outage, auth failure) still propagate — but only
+      // once no receipt was found — rather than masquerade as "not mined".
+      const sweep = await Promise.allSettled(
+        hashes.map((hash) => publicClient.getTransactionReceipt({ hash })),
+      )
+      let sweepError: unknown
+      for (let i = sweep.length - 1; i >= 0; i--) {
+        const result = sweep[i]
+        if (result.status === 'fulfilled') {
+          if (result.value) return result.value
+        } else if (!(result.reason instanceof TransactionReceiptNotFoundError)) {
+          sweepError ??= result.reason
         }
       }
+      if (sweepError !== undefined) throw sweepError
       const remaining = deadline - now()
       if (remaining <= 0) return null
       await sleep(remaining < pollMs ? remaining : pollMs)
@@ -208,11 +218,13 @@ export function createRolesExecutor(deps: RolesExecutorDeps): RolesExecutor {
   async function send(call: RolesCall, opts?: { urgent?: boolean }): Promise<TransactionReceipt> {
     await assertBotIsNotSafeOwner(publicClient, safeAddress, account.address)
     const data = wrapCalldata(call)
-    const nonce = await publicClient.getTransactionCount({
-      address: account.address,
-      blockTag: 'pending',
-    })
-    const submittedAtBlock = await publicClient.getBlockNumber()
+    const [nonce, submittedAtBlock] = await Promise.all([
+      publicClient.getTransactionCount({
+        address: account.address,
+        blockTag: 'pending',
+      }),
+      publicClient.getBlockNumber(),
+    ])
     const hashes: Hex[] = []
     const observe = () =>
       deps.observeTransaction({
