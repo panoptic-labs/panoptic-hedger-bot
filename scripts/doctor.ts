@@ -20,6 +20,7 @@ async function main(): Promise<void> {
     config = parseHedgerBotConfig()
   } catch (err) {
     console.error(sanitizeError(err))
+    console.error('\nNext safe command: pnpm onboard')
     process.exitCode = 1
     return
   }

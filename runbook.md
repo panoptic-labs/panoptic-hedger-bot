@@ -63,6 +63,44 @@ until the scope verification passes. Run it against a fork first.
 The manual, fully env-driven steps below remain the authoritative reference and
 the path for unlisted chains or an externally-managed Safe.
 
+### Upgrade an existing Safe with the SFPM off-venue swap
+
+Do not manually assemble a partial SFPM scope. From an existing hedger-bot
+configuration, generate the complete owner-authorized batch:
+
+```bash
+pnpm deactivate
+pnpm migrate:sfpm-venue > sfpm-venue-migration.json
+```
+
+This command sends nothing and never requests a Safe-owner key. It resolves the
+reviewed venue from the deployment registry and emits one Safe Transaction
+Builder batch containing:
+
+- the canonical CompatibilityFallbackHandler when the Safe has no handler;
+- the Roles MultiSend unwrapper;
+- the pool-ID-pinned SFPM `multicall` scope;
+- both collateral trackers' solvency-aware withdraw and Safe-bound deposit
+  scopes;
+- WETH deposit/withdraw scopes for native-ETH collateral; and
+- every SFPM/collateral-tracker ERC-20 approval.
+
+Import the JSON into Safe Transaction Builder, review and simulate every call,
+collect the Safe's normal threshold approvals, and execute it. After
+confirmation, copy the exact `.env` block printed by the command, then run:
+
+```bash
+pnpm run doctor
+DRY_RUN=true pnpm inspect:hedge
+pnpm activate
+```
+
+The batch is idempotent and works both for a Safe with no prior SFPM setup and
+for an older partial setup. It preserves a compatible custom fallback handler;
+an incompatible nonzero handler is a blocking error that requires owner review.
+Fresh `pnpm onboard` configurations already include these on-chain
+prerequisites and do not need the migration.
+
 ## Steps
 
 ### 0. Dry-run on a fork FIRST
@@ -145,14 +183,12 @@ can fold that LP delta into the hedge:
   (`LP_SUBGRAPH_MAX_LAG_BLOCKS`) still forces observe-only whenever the subgraph
   lags chain head, so a stale indexer can never cause a mis-hedge.
 
-The production sequence is deliberately ordered and must be repeated for the
-exact candidate artifact after any configuration, role, Safe, pool, signer, or
+Guided activation performs the ordered preflight, read-only hedge inspection,
+SFPM route choice, safety review, and live confirmation for the exact candidate
+artifact. Repeat it after any configuration, role, Safe, pool, signer, or
 build-identity change:
 
 ```
-pnpm preflight
-pnpm inspect:hedge
-DRY_RUN=true pnpm start
 pnpm activate
 pnpm start
 pnpm status

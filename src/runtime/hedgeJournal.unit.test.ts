@@ -77,7 +77,7 @@ describe('HedgeJournal', () => {
     const restarted = journal()
     await restarted.recover(client(new Map([[HASH_B, 'success']])))
 
-    expect(restarted.checkpoint()).toEqual({ transactionHash: HASH_B, fromBlock: 100n })
+    expect(restarted.checkpoint()).toMatchObject({ transactionHash: HASH_B, fromBlock: 100n })
   })
 
   it('fails closed when no observed replacement has a receipt', async () => {
@@ -96,14 +96,34 @@ describe('HedgeJournal', () => {
     await target.recover(client(new Map([[HASH_A, 'success']]), BLOCK_HASH, [HASH_A]))
   })
 
-  it('journals the new deleverage stage actions', async () => {
-    for (const action of ['deleverage_loans', 'deleverage_options'] as const) {
+  it('uses a known mined hash without an obsolete bounded block scan', async () => {
+    const target = journal()
+    target.begin('grow')
+    observe(target, [HASH_A])
+    const recoveryClient = client(new Map([[HASH_A, 'success']]), BLOCK_HASH, [], 10_000n)
+    recoveryClient.findMinedTransactions = vi.fn(async () => {
+      throw new Error('ambiguous hedge recovery exceeds the bounded block search window')
+    })
+
+    await target.recover(recoveryClient)
+
+    expect(recoveryClient.findMinedTransactions).not.toHaveBeenCalled()
+    expect(target.checkpoint()).toMatchObject({ transactionHash: HASH_A, fromBlock: 100n })
+  })
+
+  it('journals the non-planner transaction actions', async () => {
+    for (const action of [
+      'deleverage_loans',
+      'deleverage_options',
+      'sfpm_swap',
+      'wallet_redeposit',
+    ] as const) {
       const target = journal()
       target.begin(action)
       observe(target, [HASH_A])
       const restarted = journal()
       await restarted.recover(client(new Map([[HASH_A, 'success']])))
-      expect(restarted.checkpoint()).toEqual({ transactionHash: HASH_A, fromBlock: 100n })
+      expect(restarted.checkpoint()).toMatchObject({ transactionHash: HASH_A, fromBlock: 100n })
     }
   })
 

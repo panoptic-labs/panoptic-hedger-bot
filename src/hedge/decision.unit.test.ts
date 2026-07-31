@@ -73,6 +73,33 @@ describe('computeHedgePlan — collateral delta', () => {
     // No mint planned here → the collision diagnostic is threaded as an empty list.
     expect(plan.intent.skippedCollidingTokenIds).toEqual([])
   })
+
+  it('includes loose Safe balance on the vault-asset side', () => {
+    const plan = computeHedgePlan({
+      pool: { currentTick: 0n, poolId: 1n, poolKey: { tickSpacing: 10 } } as never,
+      collateral: {
+        token0: { assets: 10n },
+        token1: { assets: 1_000n },
+      } as never,
+      walletBalances: {
+        token0: { token: 20n, native: 30n, total: 50n },
+        token1: { token: 9_000n, native: 0n, total: 9_000n },
+      },
+      signalTick: 0n,
+      assetIndex: 0n,
+      deltaThresholdBps: 200n,
+      deltaOffsetBps: 0n,
+      absoluteMaxHedgeCount: 4,
+      slippageBps: 30n,
+      positions: [],
+      hedgePositions: [],
+    })
+
+    expect(plan.breakdown.walletToken0Assets).toBe(50n)
+    expect(plan.breakdown.walletToken1Assets).toBe(9_000n)
+    expect(plan.breakdown.collateralDelta).toBe(60n)
+    expect(plan.netDelta).toBe(60n)
+  })
 })
 
 describe('computeHedgePlan — Uniswap LP delta', () => {

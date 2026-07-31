@@ -1,3 +1,4 @@
+import { getChainDeployment } from '@panoptic-eng/sdk/v2'
 import { DELEVERAGER_ROLE_KEY as SDK_DELEVERAGER_ROLE_KEY } from '@panoptic-eng/sdk/zodiac'
 import { getAddress, isAddress, isHex, parseEther, parseUnits, size } from 'viem'
 import { z } from 'zod'
@@ -298,6 +299,41 @@ const rawEnvSchema = z
     // Telegram notifications (both required together to enable).
     TELEGRAM_BOT_TOKEN: z.string().optional(),
     TELEGRAM_CHAT_ID: z.string().optional(),
+
+    // ---------------------------------------------------------------------
+    // Off-venue SFPM swap (v3 only). Routes the hedge-netting swap through a
+    // cheaper Uniswap v3 pool (e.g. 5bps) via SFPM.multicall([mint,burn]),
+    // aggregated with CT withdraw/deposit through a Safe MultiSend. See the
+    // SDK panoptic/v2/sfpmSwap module + zodiac SfpmSwapCondition.
+    // NOTE: distinct from the removed cross-pool-uniswap path — new env names.
+    // ---------------------------------------------------------------------
+    // True only after onboarding/migration has installed the reviewed Roles
+    // scopes and token approvals. Enabling execution without provisioning is
+    // rejected below.
+    SFPM_SWAP_PROVISIONED: booleanSchema.default('false'),
+    SFPM_SWAP_ENABLED: booleanSchema.default('false'),
+    // Off-venue execution is intentionally v3-only. A v4 PoolManager custody
+    // design needs a separate reviewed accounting/authorization model.
+    SFPM_SWAP_POOL_VERSION: z.literal('v3').default('v3'),
+    SFPM_SWAP_ADDRESS_V3: addressSchema.optional(),
+    // The cheaper Uniswap v3 pool to swap in. Its ERC20 pair (e.g. USDC/WETH)
+    // corresponds to the options pool's collateral assets, bridging native ETH
+    // via WETH when the options pool's currency0 is native.
+    SFPM_SWAP_POOL_ADDRESS: addressSchema.optional(),
+    // Uniswap fee tier of SFPM_SWAP_POOL_ADDRESS (e.g. 500 = 0.05%).
+    SFPM_SWAP_FEE: boundedInteger(1, 1_000_000, 500),
+    // Optional pinned uint64 SFPM poolId; resolved on-chain at startup when unset.
+    SFPM_SWAP_POOL_ID: z.coerce.bigint().optional(),
+    // Slippage band (bps) for the SFPM swap; falls back to SLIPPAGE_BPS when unset.
+    SFPM_SWAP_SLIPPAGE_BPS: boundedInteger(1, 1_000).optional(),
+    // Route off-venue only when the quoted saving vs the in-pool swap beats this.
+    SFPM_SWAP_MIN_SAVINGS_BPS: boundedBigint(0n, 3_000n, 5n),
+    // WETH9 address — required when an options-pool collateral asset is native ETH
+    // (the v3 swap pool trades WETH, so the batch wraps/unwraps around the swap).
+    WETH_ADDRESS: addressSchema.optional(),
+    // Safe MultiSendCallOnly + the Roles MultiSend unwrapper (registered at setup).
+    MULTISEND_CALL_ONLY_ADDRESS: addressSchema.optional(),
+    MULTISEND_UNWRAPPER_ADDRESS: addressSchema.optional(),
   })
   .superRefine((cfg, ctx) => {
     const hasKey = Boolean(cfg.BOT_PRIVATE_KEY)
@@ -337,6 +373,31 @@ const rawEnvSchema = z
             code: z.ZodIssueCode.custom,
             path: ['UNISWAP_SIGNAL_POOL_ID'],
             message: 'UNISWAP_SIGNAL_POOL_ID is required for a v4 uniswap-pool signal',
+          })
+        }
+      }
+    }
+    if (cfg.SFPM_SWAP_ENABLED && !cfg.SFPM_SWAP_PROVISIONED) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SFPM_SWAP_PROVISIONED'],
+        message:
+          'SFPM_SWAP_ENABLED=true requires an explicitly provisioned SFPM authorization surface',
+      })
+    }
+    if (cfg.SFPM_SWAP_PROVISIONED) {
+      const required: Array<[keyof typeof cfg, string]> = [
+        ['SFPM_SWAP_ADDRESS_V3', 'the v3 SFPM the swap runs through'],
+        ['SFPM_SWAP_POOL_ADDRESS', 'the cheaper Uniswap v3 pool to swap in'],
+        ['MULTISEND_CALL_ONLY_ADDRESS', 'the Safe MultiSendCallOnly address'],
+        ['MULTISEND_UNWRAPPER_ADDRESS', 'the Roles MultiSend unwrapper address'],
+      ]
+      for (const [key, why] of required) {
+        if (cfg[key] === undefined) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: [key],
+            message: `${key} is required when SFPM_SWAP_PROVISIONED=true (${why})`,
           })
         }
       }
@@ -448,6 +509,13 @@ export function deleveragerRoleKey(
   config: Pick<HedgerBotConfig, 'DELEVERAGER_ROLE_KEY'>,
 ): `0x${string}` {
   return config.DELEVERAGER_ROLE_KEY ?? SDK_DELEVERAGER_ROLE_KEY
+}
+
+/** WETH used to combine native ETH + wrapped ETH wallet exposure. */
+export function walletWethAddress(
+  config: Pick<HedgerBotConfig, 'CHAIN_ID' | 'WETH_ADDRESS'>,
+): `0x${string}` | undefined {
+  return config.WETH_ADDRESS ?? getChainDeployment(config.CHAIN_ID)?.sfpmSwap?.weth
 }
 
 const REMOVED_CROSS_POOL_KEYS = [

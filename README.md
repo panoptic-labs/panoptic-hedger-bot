@@ -78,9 +78,10 @@ The wizard asks for:
     hedger, or bringing a clean self-generated Safe. Provide `SAFE_ADDRESS` (and
     an existing `ROLES_MODIFIER_ADDRESS` + `ROLE_KEY` when adding a pool; leave
     the modifier blank to have the bot deploy one). Because your Safe owner is a
-    hardware/multisig wallet, the wizard **prints the exact enable/scope
-    transactions** for you to execute in the Safe UI (app.safe.global), then
-    polls on-chain until the loan-only boundary is live. Roles scoping is
+    hardware/multisig wallet, the wizard writes the exact enable/scope
+    transactions to an importable `safe-onboarding-<modifier>.json` batch for
+    you to review, simulate, approve, and execute in Safe Transaction Builder,
+    then polls on-chain until the loan-only boundary is live. Roles scoping is
     additive, so adding a pool never un-scopes the others.
 - **Bot signer** — generate a fresh key, import one, or reuse an existing
   owner-only `bot-keystore.json` without entering the plaintext key or rewriting
@@ -107,8 +108,93 @@ loan-only scope is verified (bot can dispatch a width=0 loan, cannot dispatch a
 width>0 option). Re-run with `pnpm onboard --force` to overwrite an existing
 `.env` (deploys a new Safe).
 
+Running `pnpm onboard` with an existing configuration starts guided repair. It
+keeps the Safe and bot key, disables live execution, identifies unexpected
+Roles members/targets/functions, and offers to replace a stale or shared
+modifier with a dedicated one. The generated Safe batch enables the replacement
+and disables the old modifier atomically. Interrupted onboarding is detected
+and offered for continuation automatically.
+
+To retune strategy parameters without touching permissions, run `pnpm tune`:
+it re-prompts the strategy/gas/cadence knobs (delta threshold/offset, slippage,
+margin reserve, fee caps, poll interval, SFPM savings threshold, deleverage
+tunables) with the current values as defaults, validates the result, and
+patches `.env` in place. Nothing on-chain changes and DRY_RUN/activation are
+untouched — restart the bot to pick the new values up. Permission changes
+(adding the SFPM venue or deleverager role) still go through `pnpm onboard`.
+
 > First run against an **anvil/Tenderly fork** to rehearse end-to-end with no
 > real transactions.
+
+### Add the off-venue SFPM swap to an existing Safe
+
+Fresh `pnpm onboard` deployments install the complete SFPM permission and
+approval surface only after explicit opt-in. The generated `.env` records
+`SFPM_SWAP_PROVISIONED=true` and leaves `SFPM_SWAP_ENABLED=false` until you
+validate it.
+
+For a Safe/Role configuration created before SFPM support—or one deliberately
+started without it—use the idempotent migration command:
+
+```bash
+# Keep the bot stopped/deactivated while changing its authorization.
+pnpm deactivate
+
+# Writes clean Safe Transaction Builder JSON to the file. It sends nothing.
+# Review instructions and the exact .env block are printed separately to stderr.
+pnpm migrate:sfpm-venue > sfpm-venue-migration.json
+```
+
+The generated Safe batch installs the reviewed CompatibilityFallbackHandler
+when the Safe has none, registers the MultiSend unwrapper, scopes SFPM
+`multicall`, both collateral trackers' solvency-aware withdraw/deposit calls,
+WETH wrap/unwrap when required, and sets the necessary maximum token approvals.
+It is safe to generate again: the Roles calls and approvals are idempotent. An
+existing nonzero fallback handler is preserved only if it demonstrably accepts
+the SFPM ERC-1155 callback; otherwise the command stops instead of replacing a
+custom handler silently.
+
+Then:
+
+1. Import `sfpm-venue-migration.json` into Safe Transaction Builder.
+2. Inspect and simulate every call, collect the Safe's normal threshold
+   approvals, and execute the batch.
+3. After it confirms, copy the exact SFPM `.env` block printed by the command.
+4. Run `pnpm run doctor`, keep `DRY_RUN=true`, and run
+   `pnpm inspect:hedge`.
+5. Run `pnpm activate` again before returning to live trading.
+
+The command derives the venue, collateral trackers, pool ID, adapters, WETH,
+and approval paths from the reviewed deployment registry and live pool
+metadata; no Safe-owner key is accepted or handled.
+
+The off-venue route is v3-only. It is deliberately not advertised for v4:
+PoolManager-held balances need a separate custody, accounting, and authorization
+design.
+
+Loose collateral held by the Safe is part of portfolio exposure. On a native
+side, ETH and WETH are combined. Off-venue swaps consume loose balances before
+withdrawing the remainder from the input CollateralTracker, and no-action cycles
+periodically sweep loose balances back into the trackers. The bot reports loose
+balances as economic collateral, but protocol liquidation margin remains only
+what the CollateralTrackers recognize until the redeposit transaction confirms.
+
+For simple OPEN/GROW adjustments, owned input collateral is used before the bot
+opens more persistent debt. If the Safe/CollateralTracker already has the
+numeraire needed to buy the asset—or asset inventory that can be sold—the bot
+swaps up to the required amount directly. In-pool this is one atomic
+temporary-loan dispatch (`swapAtMint=false` mint followed by a
+`swapAtMint=true` burn) whose final position list is unchanged. Off-venue it is
+one atomic SFPM withdrawal/swap/deposit. Partial inventory is consumed first and
+the next pinned cycle replans the residual. Every balance-first swap retains a
+rounded-up 50bps reserve of the sold token for premiums and commissions; a
+positive dust balance therefore never rounds down to a zero reserve.
+
+The two-transaction off-venue loan fallback remains restart-safe: after its
+no-swap loan dispatch confirms, a durable exact-input obligation blocks all new
+planning until the swap confirms. A failed tx2 therefore never causes another
+loan to be minted; recovery uses loose Safe input first and otherwise withdraws
+the input left in the CollateralTracker by tx1.
 
 ### Run the bot (two-stage go-live)
 
@@ -116,11 +202,9 @@ Live trading is deliberately gated: `pnpm start` **forces dry-run** until you
 `pnpm activate`, so nobody goes live by flipping one env var.
 
 ```bash
-pnpm preflight           # read-only checks: wiring, scope, keys, gas, signal (sends NOTHING)
-pnpm inspect:hedge       # dry-run one cycle — computes the hedge plan, sends NOTHING
 pnpm start               # full loop; runs in dry-run until activated
-pnpm activate            # re-runs preflight, confirms, writes the activation marker
-pnpm start               # now trades live (needs DRY_RUN unset)
+pnpm activate            # guided preflight + inspection + route choice + live confirmation
+pnpm start               # now trades live
 pnpm status              # operator snapshot: running, mode, positions, delta, last poll/hedge
 pnpm health              # machine-readable readiness; non-zero unless healthy and ready
 pnpm deactivate          # emergency local kill marker; restart cannot trade until re-activated
@@ -544,30 +628,32 @@ Notes:
 | Symptom | First check |
 |---------|-------------|
 | Something looks mis-wired (scope, keys, gas, signal) | `pnpm run doctor` — read-only, sends nothing and prints what fails |
-| Bot won't trade even after `pnpm start` | It stays in dry-run until `pnpm activate`; run activate (which re-preflights) and unset `DRY_RUN` |
+| Bot won't trade even after `pnpm start` | It stays in dry-run until `pnpm activate`; activation safely updates the execution flags after guided validation |
 | Not sure what the bot is doing | `pnpm status` for a live snapshot; `pnpm health` for machine-readable readiness |
 | Need to stop trading immediately | `pnpm deactivate` writes a local kill marker; a restart cannot trade until you re-activate |
 | Startup fails on RPC | Remote RPC endpoints must be HTTPS; plain HTTP is only accepted for a loopback fork |
 | Keystore start hangs / prompts | Set `BOT_KEYSTORE_PASSPHRASE_FILE` (owner-only) for unattended restart |
 | Activation "invalidated" after a rebuild | `HEDGER_BUILD_ID` changed; set `SOURCE_SHA` to the reviewed commit and re-activate |
-| `doctor` warns about the permission graph | Extra keeper roles/members were scoped; re-onboard with a fresh modifier to restore the exact manifest |
+| `doctor` fails the permission graph | Run `pnpm onboard`; guided repair identifies the exact extra permission and offers a dedicated replacement modifier |
+| Existing Safe needs the off-venue swap | Run `pnpm onboard`; guided repair offers SFPM provisioning and writes the verified configuration automatically |
 | No Telegram notifications | Message [@panopticMonitorBot](https://t.me/panopticMonitorBot) `/monitor <SAFE_ADDRESS>`, then `/status` to confirm it's following the Safe |
 
 ## Scripts
 
 | Script | Description |
 |--------|-------------|
-| `pnpm onboard` | Interactive wizard: deploy Safe + Roles, verify scope, write `.env` |
+| `pnpm onboard` | Resumable setup/repair wizard: Safe batch, exact scope verification, configuration, and optional guided activation |
 | `pnpm onboard:cleanup` | Report resume artifacts; remove only with explicit `--confirm` |
 | `pnpm preflight` | Read-only preflight checks (alias: `pnpm run doctor`); sends nothing |
 | `pnpm start` | Run the hedging loop; dry-run until activated (`tsx src/main.ts`) |
-| `pnpm activate` | Re-run preflight, confirm, and write the live-trading activation marker |
+| `pnpm activate` | Choose SFPM eligibility, run preflight + read-only hedge inspection, review safety boundaries, and activate |
 | `pnpm deactivate` | Write the emergency local deactivation marker (sends nothing) |
 | `pnpm health` | Signer-free machine-readable liveness/readiness check |
 | `pnpm status` | Operator snapshot: running, mode, positions, delta, last poll/hedge |
 | `pnpm inspect:hedge` | Dry-run one cycle, print the plan, send nothing |
 | `pnpm deploy:safe-roles` | Deploy Safe + Roles modifier and scope the bot |
 | `pnpm scope:bot-role` | (Re)scope the bot EOA on an existing modifier |
+| `pnpm migrate:sfpm-venue` | Generate an unsigned Safe batch that adds the complete SFPM venue to an existing Safe |
 | `pnpm manage-role` | Add/remove a role member on an existing Safe (routed via the Safe owner) |
 | `typecheck` / `lint` / `test` | Development helpers |
 

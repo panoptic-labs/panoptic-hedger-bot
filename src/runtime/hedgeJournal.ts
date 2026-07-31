@@ -8,6 +8,12 @@ import type { HedgeAction } from '../executor/types'
 import { runtimeDataPath } from './paths'
 import { readSecureJson, writeSecureJson } from './secureFile'
 
+export type HedgeJournalAction =
+  | Exclude<HedgeAction, 'none'>
+  | 'collateral_swap'
+  | 'sfpm_swap'
+  | 'wallet_redeposit'
+
 const addressSchema = z.string().regex(/^0x[0-9a-fA-F]{40}$/)
 const hexSchema = z.string().regex(/^0x[0-9a-f]+$/)
 const tokenIdSchema = z.string().regex(/^\d+$/)
@@ -24,6 +30,9 @@ const journalIntentSchema = z
       'consolidate',
       'deleverage_loans',
       'deleverage_options',
+      'collateral_swap',
+      'sfpm_swap',
+      'wallet_redeposit',
     ]),
     sender: addressSchema.nullable(),
     nonce: z.number().int().nonnegative().nullable(),
@@ -91,6 +100,8 @@ export interface JournalTransactionUpdate {
 }
 
 export interface HedgeJournalCheckpoint {
+  intentId?: string
+  action?: HedgeJournalAction
   transactionHash?: Hex
   fromBlock?: bigint
 }
@@ -150,7 +161,7 @@ export function createHedgeRecoveryClient(publicClient: PublicClient): HedgeReco
 }
 
 export interface HedgeJournalPort {
-  begin(action: HedgeAction): void
+  begin(action: HedgeJournalAction): string
   observeTransaction(update: JournalTransactionUpdate): void
   confirm(receipt: { transactionHash: Hex; blockNumber: bigint; blockHash: Hex }): void
   fail(): void
@@ -229,8 +240,7 @@ export class HedgeJournal implements HedgeJournalPort {
     this.data = parsed
   }
 
-  begin(action: HedgeAction): void {
-    if (action === 'none') throw new Error('cannot journal a no-op hedge')
+  begin(action: HedgeJournalAction): string {
     if (this.data.intents.some((entry) => entry.status === 'pending')) {
       throw new Error('ambiguous pending hedge intent must be recovered before planning')
     }
@@ -252,6 +262,7 @@ export class HedgeJournal implements HedgeJournalPort {
     this.data.intents.push(entry)
     this.activeIntentId = entry.id
     this.persist()
+    return entry.id
   }
 
   observeTransaction(update: JournalTransactionUpdate): void {
@@ -334,7 +345,24 @@ export class HedgeJournal implements HedgeJournalPort {
         continue
       }
       if (entry.status !== 'pending') continue
+
+      const getReceipts = () =>
+        Promise.all(
+          entry.hashes.map((hash) => {
+            if (!isHex(hash)) throw new Error('invalid transaction hash in hedge journal')
+            return publicClient.getTransactionReceipt({ hash }).catch(() => null)
+          }),
+        )
+      let receipts = await getReceipts()
+      let mined = receipts.filter((receipt) => receipt !== null)
+
+      // An observed replacement hash is durable before broadcast. If one of
+      // those hashes is mined, its receipt resolves recovery directly and there
+      // is no reason to scan historical blocks. The bounded identity scan only
+      // exists for the crash window after broadcast but before the hash list was
+      // persisted.
       if (
+        mined.length === 0 &&
         entry.sender !== null &&
         entry.nonce !== null &&
         entry.target !== null &&
@@ -351,15 +379,12 @@ export class HedgeJournal implements HedgeJournalPort {
         entry.hashes = [
           ...new Set([...entry.hashes, ...discovered.map((hash) => hash.toLowerCase())]),
         ]
-        if (discovered.length > 0) this.persist()
+        if (discovered.length > 0) {
+          this.persist()
+          receipts = await getReceipts()
+          mined = receipts.filter((receipt) => receipt !== null)
+        }
       }
-      const receipts = await Promise.all(
-        entry.hashes.map((hash) => {
-          if (!isHex(hash)) throw new Error('invalid transaction hash in hedge journal')
-          return publicClient.getTransactionReceipt({ hash }).catch(() => null)
-        }),
-      )
-      const mined = receipts.filter((receipt) => receipt !== null)
       if (mined.length > 1) throw new Error('ambiguous hedge recovery: multiple replacements mined')
       const receipt = mined[0]
       if (!receipt)
@@ -391,6 +416,8 @@ export class HedgeJournal implements HedgeJournalPort {
       const entry = this.data.intents[index]
       if (entry.status === 'confirmed' && entry.confirmedHash !== null) {
         return {
+          intentId: entry.id,
+          action: entry.action,
           transactionHash: checkedHex(entry.confirmedHash),
           fromBlock: entry.submittedAtBlock === null ? undefined : BigInt(entry.submittedAtBlock),
         }

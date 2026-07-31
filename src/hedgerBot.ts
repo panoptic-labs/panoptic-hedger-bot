@@ -4,12 +4,19 @@ import {
   isNonceError,
   isRetryableRpcError,
 } from '@panoptic-eng/sdk/v2'
-import type { Account, Hex, PublicClient } from 'viem'
+import type { Account, Hex, PublicClient, TransactionReceipt } from 'viem'
 import { formatUnits } from 'viem'
 
-import type { HedgerBotConfig } from './config'
+import { type HedgerBotConfig, walletWethAddress } from './config'
 import { protocolGenesisBlock } from './constants/genesis'
-import type { HedgeExecutor, HedgeIntent } from './executor/types'
+import type {
+  CollateralSwapRequest,
+  HedgeContext,
+  HedgeExecutionResult,
+  HedgeExecutor,
+  HedgeIntent,
+  HedgeSwapRequirement,
+} from './executor/types'
 import type { GasPolicy } from './gas/gasPolicy'
 import { type HedgePlan, computeHedgePlan } from './hedge/decision'
 import {
@@ -20,10 +27,15 @@ import {
   DeleverageIncident,
   selectOptionBurns,
 } from './hedge/deleverage'
+import type { ExecuteWithVenueResult, SfpmSwapExecutorLike } from './hedge/executeWithVenue'
+import { executeHedgeWithSfpmVenue } from './hedge/executeWithVenue'
 import { computePortfolioDeltaDetailed } from './hedge/frame'
 import { type MarginReserveAssessment, assessMarginReserve } from './hedge/marginReserve'
 import { assessSafety } from './hedge/safety'
+import type { SfpmSwapQuote, SfpmVenueDecision } from './hedge/sfpmVenueCoordinator'
+import { isSfpmVenueEligible } from './hedge/sfpmVenueRouter'
 import { type HedgeSnapshot, readHedgeSnapshot } from './hedge/snapshot'
+import { EMPTY_SAFE_WALLET_BALANCES, spendableAfterCollateralReserve } from './hedge/walletBalances'
 import type { Notifier } from './notify/telegram'
 import {
   formatCycleSummary,
@@ -33,7 +45,12 @@ import {
   formatSkip,
 } from './presenters/summary'
 import { type PriceSignalSource, PriceSignalUnavailableError } from './priceSignal'
-import { type HedgeJournalPort, createHedgeRecoveryClient } from './runtime/hedgeJournal'
+import {
+  type HedgeJournalAction,
+  type HedgeJournalPort,
+  createHedgeRecoveryClient,
+} from './runtime/hedgeJournal'
+import type { PendingSfpmSwapPort } from './runtime/pendingSfpmSwap'
 import { type RolesExecutor, TxNotMinedError } from './safe/rolesExecutor'
 import { botError, botLog, botWarn } from './utils/log'
 import { sanitizeError } from './utils/sanitize'
@@ -52,6 +69,22 @@ export interface HedgerBotDeps {
    * loan-scoped `executor`.
    */
   deleveragerExecutor?: HedgeExecutor
+  /**
+   * Off-venue SFPM swap venue (present only when config.SFPM_SWAP_ENABLED). For any
+   * swapping hedge action, if the SFPM 5bps quote beats the in-pool 30bps swap by the
+   * savings threshold, the dispatch runs with swapAtMint=false and the net swap is
+   * routed off-venue (two transactions); the coordinator sizes + directs it from the
+   * swapAtMint true-vs-false collateral delta.
+   */
+  sfpmVenue?: {
+    coordinator: {
+      evaluate(intent: HedgeIntent): Promise<SfpmVenueDecision | null>
+      quoteSwap(sellToken0: boolean, amountIn: bigint): Promise<SfpmSwapQuote | null>
+    }
+    sfpmExecutor: SfpmSwapExecutorLike
+  }
+  /** Durable tx1→tx2 obligation, read even when the venue is disabled. */
+  pendingSwapStore?: PendingSfpmSwapPort
   notifier: Notifier
   gasPolicy: GasPolicy
   hedgeJournal: HedgeJournalPort
@@ -82,6 +115,45 @@ export interface HedgerBotDeps {
 
 export type CycleOutcome = 'complete' | 'signal-unavailable' | 'error' | 'in-flight'
 
+interface IntentExecutionResult {
+  dispatch: HedgeExecutionResult
+  venue: ExecuteWithVenueResult | null
+}
+
+type BalanceFirstSwap =
+  | {
+      route: 'in-pool'
+      requirement: HedgeSwapRequirement
+      request: CollateralSwapRequest
+    }
+  | {
+      route: 'sfpm'
+      requirement: HedgeSwapRequirement
+      request: {
+        sellToken0: boolean
+        kind: 'exactIn'
+        amount: bigint
+        expectedAmountOut: bigint
+        currentTick: number
+        positionIdList: bigint[]
+      }
+    }
+
+type BalanceFirstSwapDecision = BalanceFirstSwap | 'deferred' | null
+
+function successfulReceipt(
+  result: { transactionHash: Hex | null; receipt: TransactionReceipt | null },
+  label: string,
+): TransactionReceipt {
+  if (!result.receipt || !result.transactionHash) {
+    throw new Error(`live ${label} executor returned without a confirmed transaction receipt`)
+  }
+  if (result.receipt.status !== 'success') {
+    throw new Error(`${label} reverted: ${result.receipt.transactionHash}`)
+  }
+  return result.receipt
+}
+
 async function assessFinalStateReserve(
   executor: HedgeExecutor,
   intent: HedgeIntent,
@@ -105,6 +177,7 @@ export class HedgerBot {
   private isCycleInFlight = false
   private lastDispatchTxHash?: Hex
   private readonly incident?: DeleverageIncident
+  private lastWalletRedepositCheckAt = 0
 
   constructor(deps: HedgerBotDeps) {
     this.deps = deps
@@ -122,6 +195,25 @@ export class HedgerBot {
     await this.deps.hedgeJournal.recover(createHedgeRecoveryClient(this.deps.publicClient))
     const checkpoint = this.deps.hedgeJournal.checkpoint()
     this.lastDispatchTxHash = checkpoint.transactionHash
+    const venue = this.deps.sfpmVenue
+    const pending = this.deps.pendingSwapStore?.read()
+    if (pending) {
+      if (!venue) {
+        throw new Error(
+          'a pending SFPM swap exists but SFPM_SWAP_ENABLED is false; refusing to plan',
+        )
+      }
+      const swapConfirmed =
+        checkpoint.action === 'sfpm_swap' &&
+        (pending.swapIntentId === undefined || checkpoint.intentId === pending.swapIntentId)
+      const dispatchConfirmed = checkpoint.intentId === pending.dispatchIntentId
+      if (swapConfirmed) this.deps.pendingSwapStore?.clear()
+      else if (!dispatchConfirmed) {
+        // Recovery removed a reverted dispatch journal entry. No imbalance was
+        // created, so the pre-dispatch obligation must not be executed.
+        this.deps.pendingSwapStore?.clear()
+      }
+    }
     await this.deps.notifier.notify('🤖 hedger-bot started')
   }
 
@@ -193,6 +285,7 @@ export class HedgerBot {
       chainId,
       safeAddress,
       poolMetadata: this.deps.poolMetadata,
+      weth9: walletWethAddress(config),
       storage: this.deps.storage,
       fromBlock: config.SYNC_FROM_BLOCK ?? protocolGenesisBlock(config.CHAIN_ID),
       blockNumber: signal.blockNumber,
@@ -204,7 +297,9 @@ export class HedgerBot {
           }
         : undefined,
     })
+    if (await this.recoverPendingSfpmSwap(snapshot, trigger)) return
     const { pool, buyingPower: bp } = snapshot
+    const walletBalances = snapshot.walletBalances ?? EMPTY_SAFE_WALLET_BALANCES
     const legCount = snapshot.positions.reduce((n, position) => n + position.legs.length, 0)
     const free0 =
       bp.collateralBalance0 > bp.requiredCollateral0
@@ -232,6 +327,11 @@ export class HedgerBot {
     botLog(
       `[hedger-bot] portfolio positions=${snapshot.positions.length} legs=${legCount} ` +
         `collateral=[${f0(bp.collateralBalance0)}, ${f1(bp.collateralBalance1)}] ` +
+        `safeWallet=[${f0(walletBalances.token0.total)}, ` +
+        `${f1(walletBalances.token1.total)}] ` +
+        `portfolioCollateral=[${f0(
+          snapshot.collateral.token0.assets + walletBalances.token0.total,
+        )}, ${f1(snapshot.collateral.token1.assets + walletBalances.token1.total)}] ` +
         `buyingPower=[${f0(free0)}, ${f1(free1)}] ` +
         `marginUsed=[${f0(bp.requiredCollateral0)}, ${f1(bp.requiredCollateral1)}]${oorNote}`,
     )
@@ -248,6 +348,16 @@ export class HedgerBot {
           }
         : undefined,
     })
+    const hasLooseCollateral = walletBalances.token0.total > 0n || walletBalances.token1.total > 0n
+    if (
+      safety.verdict !== 'hedge' &&
+      hasLooseCollateral &&
+      !config.DRY_RUN &&
+      (await this.maybeRedepositWalletBalances(trigger, true))
+    ) {
+      botLog('[hedger-bot] unsafe-state loose collateral was redeposited; replanning next cycle')
+      return
+    }
     if (safety.verdict === 'deleverage') {
       await this.runDeleverage(trigger, snapshot, bufferBps, safety.paused)
       return
@@ -279,6 +389,7 @@ export class HedgerBot {
     const plan = computeHedgePlan({
       pool,
       collateral: snapshot.collateral,
+      walletBalances,
       signalTick: signal.tick,
       assetIndex: config.ASSET_INDEX as 0n | 1n,
       deltaThresholdBps: config.DELTA_THRESHOLD_BPS,
@@ -290,6 +401,7 @@ export class HedgerBot {
       lpPositions: snapshot.lp?.positions,
       includeLp: config.HEDGE_INCLUDE_LP && (snapshot.lp?.fresh ?? false),
     })
+    const balanceFirstSwap = await this.planBalanceFirstSwap(plan, snapshot)
 
     // Surface the Uniswap LP delta contribution (observed vs applied).
     if (snapshot.lp) {
@@ -309,7 +421,9 @@ export class HedgerBot {
       )
     }
 
-    if (plan.intent.openTokenId !== null) {
+    if (balanceFirstSwap === 'deferred') return
+
+    if (plan.intent.openTokenId !== null && balanceFirstSwap === null) {
       const margin = await assessFinalStateReserve(
         executor,
         plan.intent,
@@ -317,6 +431,16 @@ export class HedgerBot {
         config.MIN_MARGIN_RESERVE_BPS,
       )
       if (!margin.sufficient) {
+        if (
+          hasLooseCollateral &&
+          !config.DRY_RUN &&
+          (await this.maybeRedepositWalletBalances(trigger, true))
+        ) {
+          botLog(
+            '[hedger-bot] loose collateral was redeposited for protocol margin; replanning next cycle',
+          )
+          return
+        }
         botWarn(
           `[hedger-bot] final-state preflight blocked (${trigger}): ${margin.reasons.join('; ')}`,
         )
@@ -332,7 +456,10 @@ export class HedgerBot {
         `H=${asset(plan.H)} H*=${asset(plan.Hstar)} drift=${plan.driftBps}bps`,
     )
 
-    if (plan.action === 'none') return
+    if (plan.action === 'none') {
+      await this.maybeRedepositWalletBalances(trigger)
+      return
+    }
 
     // Urgent = large drift; loosens the basefee deferral gate AND lifts the
     // priority-tip floor on the send (threaded via ctx → rolesExecutor.send).
@@ -355,8 +482,18 @@ export class HedgerBot {
     }
 
     const ctx = { urgent }
-    let result
-    let journalStarted = false
+    if (balanceFirstSwap !== null) {
+      const executed = await this.executeBalanceFirstSwap(balanceFirstSwap, plan, trigger, ctx)
+      if (executed) return
+      // Preflight rejected the standalone swap (e.g. ExceedsMaximumRedemption
+      // when CT liquidity/utilization cannot fund the withdrawal). Fall through
+      // to the loan hedge, which needs no collateral withdrawal.
+    }
+    let execution: IntentExecutionResult
+    let activeJournal: HedgeJournalAction | null = null
+    let dispatchIntentId: string | null = null
+    let pendingPrepared = false
+    let dispatchConfirmed = false
     try {
       if (!config.DRY_RUN && plan.intent.openTokenId !== null) {
         const preSendBlock = await publicClient.getBlockNumber()
@@ -376,15 +513,59 @@ export class HedgerBot {
         }
       }
       if (!config.DRY_RUN) {
-        this.deps.hedgeJournal.begin(plan.action)
-        journalStarted = true
+        dispatchIntentId = this.deps.hedgeJournal.begin(plan.action)
+        activeJournal = plan.action
       }
-      result = await executor.execute(plan.intent, ctx)
+      execution = await this.executeIntent(
+        plan.intent,
+        ctx,
+        (pending) => {
+          if (dispatchIntentId === null || !this.deps.sfpmVenue || !this.deps.pendingSwapStore) {
+            throw new Error('off-venue dispatch started without durable journal state')
+          }
+          this.deps.pendingSwapStore.save({
+            dispatchIntentId,
+            sellToken0: pending.sellToken0,
+            amount: pending.amount,
+          })
+          pendingPrepared = true
+        },
+        (dispatch) => {
+          const receipt = successfulReceipt(dispatch, 'off-venue dispatch')
+          dispatchConfirmed = true
+          this.lastDispatchTxHash = receipt.transactionHash
+          this.deps.hedgeJournal.confirm({
+            transactionHash: receipt.transactionHash,
+            blockNumber: receipt.blockNumber,
+            blockHash: receipt.blockHash,
+          })
+          activeJournal = null
+          const swapIntentId = this.deps.hedgeJournal.begin('sfpm_swap')
+          activeJournal = 'sfpm_swap'
+          const pending = this.deps.pendingSwapStore?.read()
+          if (!pending) throw new Error('durable SFPM swap obligation disappeared after dispatch')
+          this.deps.pendingSwapStore?.save({ ...pending, swapIntentId })
+        },
+      )
     } catch (error) {
-      if (journalStarted) this.deps.hedgeJournal.fail()
+      // A receipt timeout is uncertain: one of the observed transactions may
+      // still land. Preserve that active intent for startup recovery rather
+      // than deleting the only durable identity that can find it.
+      const confirmedDispatchNeedsRecovery = dispatchConfirmed && activeJournal === plan.action
+      if (
+        activeJournal !== null &&
+        !(error instanceof TxNotMinedError) &&
+        !confirmedDispatchNeedsRecovery
+      ) {
+        this.deps.hedgeJournal.fail()
+        activeJournal = null
+      }
+      if (pendingPrepared && !dispatchConfirmed && !(error instanceof TxNotMinedError)) {
+        this.deps.pendingSwapStore?.clear()
+      }
       // The send confirmed nothing within the receipt budget despite fee-bumped
-      // replacements. Same semantics as the old receipt timeout: alert, remember
-      // the best-guess hash for the next cycle's re-read, tracker untouched.
+      // replacements. Alert and keep the best-guess hash; the durable pending
+      // intent prevents an unsafe duplicate until startup recovery resolves it.
       if (error instanceof TxNotMinedError) {
         this.lastDispatchTxHash = error.lastHash
         botError('[hedger-bot] dispatch not mined', error)
@@ -394,23 +575,35 @@ export class HedgerBot {
       throw error
     }
 
-    // Only a confirmed successful dispatch may update the recovery journal.
+    const result = execution.dispatch
+    // Only confirmed successful transactions may update the recovery journal.
     if (!result.dryRun) {
-      const receipt = result.receipt
-      if (!receipt || !result.transactionHash) {
-        if (journalStarted) this.deps.hedgeJournal.fail()
-        throw new Error('live executor returned without a confirmed transaction receipt')
-      }
+      const receipt = successfulReceipt(result, 'dispatch')
       this.lastDispatchTxHash = receipt.transactionHash
-      if (receipt.status !== 'success') {
+      if (execution.venue === null) {
+        this.deps.hedgeJournal.confirm({
+          transactionHash: receipt.transactionHash,
+          blockNumber: receipt.blockNumber,
+          blockHash: receipt.blockHash,
+        })
+        activeJournal = null
+        this.deps.pendingSwapStore?.clear()
+      } else if (execution.venue.swap !== null) {
+        const swapReceipt = successfulReceipt(execution.venue.swap, 'off-venue swap')
+        this.deps.hedgeJournal.confirm({
+          transactionHash: swapReceipt.transactionHash,
+          blockNumber: swapReceipt.blockNumber,
+          blockHash: swapReceipt.blockHash,
+        })
+        activeJournal = null
+        // The durable obligation is fulfilled; leaving it would make the next
+        // cycle's recovery re-execute the full swap against a neutral book.
+        this.deps.pendingSwapStore?.clear()
+        botLog(`[hedger-bot] off-venue swap confirmed: ${swapReceipt.transactionHash}`)
+      } else if (!(execution.venue.swapError instanceof TxNotMinedError)) {
         this.deps.hedgeJournal.fail()
-        throw new Error(`dispatch reverted: ${receipt.transactionHash}`)
+        activeJournal = null
       }
-      this.deps.hedgeJournal.confirm({
-        transactionHash: receipt.transactionHash,
-        blockNumber: receipt.blockNumber,
-        blockHash: receipt.blockHash,
-      })
       this.deps.recordHedge?.(plan.action, receipt.transactionHash)
     }
 
@@ -419,6 +612,395 @@ export class HedgerBot {
     const summary = formatCycleSummary(plan, result, trigger, this.deps.vaultAsset)
     botLog(`\n${summary}`)
     await notifier.notify(summary)
+    if (execution.venue?.neutralized !== false) {
+      await this.maybeRedepositWalletBalances(trigger)
+    }
+  }
+
+  /**
+   * Prefer owned collateral over a new persistent loan for simple OPEN/GROW
+   * hedges. A standalone swap creates the same asset-frame delta as the
+   * swapAtMint leg, but consumes available inventory instead of retaining the
+   * temporary debt. When inventory covers only part of the required input, the
+   * next pinned cycle replans the residual. Shrink/flip/close operations are
+   * excluded because their existing-loan burns are part of the transition.
+   */
+  private async planBalanceFirstSwap(
+    plan: HedgePlan,
+    snapshot: HedgeSnapshot,
+  ): Promise<BalanceFirstSwapDecision> {
+    const { intent } = plan
+    const executor = this.deps.executor
+    if (
+      (plan.action !== 'open' && plan.action !== 'grow') ||
+      !intent.swapAtMint ||
+      intent.openTokenId === null ||
+      intent.closeTokenIds.length !== 0 ||
+      !executor.deriveSwapRequirement ||
+      !executor.simulateCollateralSwap ||
+      !executor.executeCollateralSwap
+    ) {
+      return null
+    }
+
+    let requirement: HedgeSwapRequirement | null
+    try {
+      requirement = await executor.deriveSwapRequirement(intent)
+    } catch (error) {
+      botWarn(
+        `[hedger-bot] balance-first swap sizing failed; retaining loan hedge: ${sanitizeError(error)}`,
+      )
+      return null
+    }
+    if (!requirement || requirement.amountIn <= 0n) return null
+
+    const collateralInput =
+      requirement.sellTokenType === 0
+        ? snapshot.collateral.token0.assets
+        : snapshot.collateral.token1.assets
+    const walletInput =
+      requirement.sellTokenType === 0
+        ? snapshot.walletBalances.token0.total
+        : snapshot.walletBalances.token1.total
+    const totalInput = collateralInput + walletInput
+    const spendableInput = spendableAfterCollateralReserve(totalInput)
+    if (spendableInput === 0n) return null
+
+    const venue = this.deps.sfpmVenue
+    if (venue) {
+      try {
+        const decision = await venue.coordinator.evaluate(intent)
+        if (decision?.use && decision.swapAmount === requirement.amountIn) {
+          const amount =
+            spendableInput < requirement.amountIn ? spendableInput : requirement.amountIn
+          const quote =
+            amount === requirement.amountIn
+              ? { amountOut: decision.amountOut, swapPoolTick: decision.swapPoolTick }
+              : await venue.coordinator.quoteSwap(decision.sellToken0, amount)
+          if (quote) {
+            return {
+              route: 'sfpm',
+              requirement,
+              request: {
+                sellToken0: decision.sellToken0,
+                kind: 'exactIn',
+                amount,
+                expectedAmountOut: quote.amountOut,
+                currentTick: quote.swapPoolTick,
+                positionIdList: snapshot.positions.map((position) => position.tokenId),
+              },
+            }
+          }
+        }
+      } catch (error) {
+        botWarn(
+          `[hedger-bot] balance-first SFPM evaluation failed; considering in-pool: ${sanitizeError(error)}`,
+        )
+      }
+    }
+
+    // The temporary-loan in-pool swap can spend CollateralTracker assets, not
+    // loose Safe tokens. When loose inventory is the difference, redeposit it
+    // first and let the next pinned snapshot size the swap.
+    const spendableCollateral = collateralInput < spendableInput ? collateralInput : spendableInput
+    if (spendableCollateral === 0n) {
+      if (
+        walletInput > 0n &&
+        !this.deps.config.DRY_RUN &&
+        (await this.maybeRedepositWalletBalances('balance-first', true))
+      ) {
+        botLog('[hedger-bot] redeposited loose input for an in-pool balance-first swap')
+        return 'deferred'
+      }
+      return null
+    }
+
+    const amount =
+      spendableCollateral < requirement.amountIn ? spendableCollateral : requirement.amountIn
+    return {
+      route: 'in-pool',
+      requirement,
+      request: {
+        sellTokenType: requirement.sellTokenType,
+        amountIn: amount,
+        existingPositionIds: snapshot.positions.map((position) => position.tokenId),
+        poolId: snapshot.pool.poolId,
+        tickSpacing: BigInt(snapshot.pool.poolKey.tickSpacing),
+        currentTick: snapshot.pool.currentTick,
+        slippageBps: BigInt(this.deps.config.SLIPPAGE_BPS),
+      },
+    }
+  }
+
+  /**
+   * Returns true when the balance-first swap was executed (or dry-run). A
+   * preflight simulation failure returns false so the caller falls back to the
+   * loan hedge — a persistently unwithdrawable CollateralTracker (high pool
+   * utilization → ExceedsMaximumRedemption) must not stall hedging forever.
+   */
+  private async executeBalanceFirstSwap(
+    swap: BalanceFirstSwap,
+    plan: HedgePlan,
+    trigger: string,
+    ctx: HedgeContext,
+  ): Promise<boolean> {
+    const venue = this.deps.sfpmVenue
+    const executor = this.deps.executor
+    try {
+      if (swap.route === 'sfpm') {
+        if (!venue) throw new Error('balance-first SFPM route selected without an executor')
+        await venue.sfpmExecutor.simulate(swap.request)
+      } else {
+        if (!executor.simulateCollateralSwap || !executor.executeCollateralSwap) {
+          throw new Error('balance-first in-pool route selected without an executor')
+        }
+        await executor.simulateCollateralSwap(swap.request)
+      }
+    } catch (error) {
+      botWarn(
+        `[hedger-bot] balance-first ${swap.route} swap pre-flight failed; ` +
+          `falling back to the loan hedge: ${sanitizeError(error)}`,
+      )
+      return false
+    }
+
+    let journalActive = false
+    try {
+      if (!this.deps.config.DRY_RUN) {
+        this.deps.hedgeJournal.begin('collateral_swap')
+        journalActive = true
+      }
+      const result =
+        swap.route === 'sfpm'
+          ? await venue?.sfpmExecutor.execute(swap.request)
+          : await executor.executeCollateralSwap?.(swap.request, ctx)
+      if (!result) throw new Error('balance-first swap executor returned no result')
+      if (!result.dryRun) {
+        const receipt = successfulReceipt(result, 'balance-first collateral swap')
+        this.deps.hedgeJournal.confirm({
+          transactionHash: receipt.transactionHash,
+          blockNumber: receipt.blockNumber,
+          blockHash: receipt.blockHash,
+        })
+        journalActive = false
+        this.lastDispatchTxHash = receipt.transactionHash
+        this.deps.recordHedge?.('collateral_swap', receipt.transactionHash)
+      }
+      const side = swap.requirement.sellTokenType === 0 ? 'token0' : 'token1'
+      const amountIn = swap.route === 'sfpm' ? swap.request.amount : swap.request.amountIn
+      const message =
+        `${this.deps.config.DRY_RUN ? '🟡' : '🟢'} balance-first hedge (${trigger}): ` +
+        `sold ${amountIn} ${side} ${swap.route}; ` +
+        `no persistent loan opened (planned ${plan.action})`
+      botLog(`[hedger-bot] ${message}`)
+      await this.deps.notifier.notify(message)
+    } catch (error) {
+      if (journalActive && !(error instanceof TxNotMinedError)) this.deps.hedgeJournal.fail()
+      throw error
+    }
+    return true
+  }
+
+  /**
+   * Execute a hedge intent. When the off-venue SFPM swap is configured and this
+   * intent is eligible + cheaper there, route it as two transactions (dispatch
+   * with swapAtMint=false, then the netting swap in the 5bps pool); otherwise use
+   * the in-pool executor unchanged. Returns both transaction results so their
+   * independent journal entries can be completed by the cycle orchestrator.
+   */
+  private async executeIntent(
+    intent: HedgeIntent,
+    ctx?: HedgeContext,
+    beforeDispatch?: (pending: { sellToken0: boolean; amount: bigint }) => void | Promise<void>,
+    afterDispatch?: (dispatch: HedgeExecutionResult) => void | Promise<void>,
+  ): Promise<IntentExecutionResult> {
+    const venue = this.deps.sfpmVenue
+    if (venue && isSfpmVenueEligible(intent, { enabled: true })) {
+      // A raw RPC/sim error while evaluating the venue must never fail the
+      // hedge — fall back to the in-pool executor.
+      let decision: SfpmVenueDecision | null = null
+      try {
+        decision = await venue.coordinator.evaluate(intent)
+      } catch (error) {
+        botWarn(`[hedger-bot] SFPM venue evaluation failed; using in-pool swap: ${String(error)}`)
+      }
+      if (decision && !decision.use) {
+        botLog('[hedger-bot] SFPM venue: 5bps not cheaper than in-pool by the threshold; in-pool')
+      } else if (!decision) {
+        botLog('[hedger-bot] SFPM venue: declined (see [sfpm-venue] reason above); in-pool')
+      }
+      if (decision?.use) {
+        // Pre-flight the off-venue MultiSend BEFORE dispatching tx1. A degraded or
+        // misconfigured venue (missing Roles scope/unwrapper, thin liquidity,
+        // insufficient collateral) must fall back to the in-pool path rather than
+        // land tx1 (swapAtMint=false) and then fail tx2, stranding the hedge.
+        let venueError: unknown
+        try {
+          await venue.sfpmExecutor.simulate({
+            sellToken0: decision.sellToken0,
+            kind: 'exactIn',
+            amount: decision.swapAmount,
+            expectedAmountOut: decision.amountOut,
+            currentTick: decision.swapPoolTick,
+            // Preflight runs before tx1, so withdrawal solvency is checked
+            // against the Safe's current on-chain position list.
+            positionIdList: intent.existingPositionIds,
+          })
+        } catch (error) {
+          venueError = error
+        }
+        if (venueError !== undefined) {
+          botWarn(
+            `[hedger-bot] off-venue swap pre-flight failed: ${sanitizeError(venueError)} — ` +
+              'using in-pool swap',
+          )
+          return { dispatch: await this.deps.executor.execute(intent, ctx), venue: null }
+        }
+        botLog(
+          `[hedger-bot] routing hedge swap off-venue (5bps SFPM), ` +
+            `sell ${decision.sellToken0 ? 'token0' : 'token1'} amount=${decision.swapAmount}`,
+        )
+        const res = await executeHedgeWithSfpmVenue({
+          dispatchExecutor: this.deps.executor,
+          sfpmExecutor: venue.sfpmExecutor,
+          intent,
+          ctx,
+          sellToken0: decision.sellToken0,
+          swapAmount: decision.swapAmount,
+          expectedAmountOut: decision.amountOut,
+          swapPoolTick: decision.swapPoolTick,
+          beforeDispatch,
+          afterDispatch,
+        })
+        if (!res.neutralized) {
+          if (res.swapError instanceof TxNotMinedError) {
+            botError(
+              '[hedger-bot] off-venue swap not confirmed before timeout — pending journal preserved for startup recovery',
+              res.swapError,
+            )
+            await this.deps.notifier.notify(
+              '⚠️ off-venue SFPM swap is still unconfirmed; restart the bot to recover the pending transaction before another hedge',
+            )
+          } else {
+            botError(
+              '[hedger-bot] off-venue swap FAILED after dispatch landed — book un-neutralized until next cycle',
+              res.swapError,
+            )
+            await this.deps.notifier.notify(
+              '⚠️ off-venue SFPM swap failed after the hedge dispatch; delta is un-neutralized until the next cycle',
+            )
+          }
+        }
+        return { dispatch: res.dispatch, venue: res }
+      }
+    }
+    return { dispatch: await this.deps.executor.execute(intent, ctx), venue: null }
+  }
+
+  /**
+   * Finish a previously confirmed off-venue dispatch before any new planning.
+   * The exact-input obligation is durable; only its quote/tick and live
+   * position list are refreshed. A failure keeps the obligation and blocks a
+   * second hedge.
+   */
+  private async recoverPendingSfpmSwap(snapshot: HedgeSnapshot, trigger: string): Promise<boolean> {
+    const venue = this.deps.sfpmVenue
+    if (!venue) return false
+    const store = this.deps.pendingSwapStore
+    if (!store) return false
+    const pending = store.read()
+    if (!pending) return false
+
+    const quote = await venue.coordinator.quoteSwap(pending.sellToken0, pending.amount)
+    if (!quote) {
+      throw new Error('pending SFPM swap cannot be quoted; refusing to plan another hedge')
+    }
+    const request = {
+      sellToken0: pending.sellToken0,
+      kind: 'exactIn' as const,
+      amount: pending.amount,
+      expectedAmountOut: quote.amountOut,
+      currentTick: quote.swapPoolTick,
+      positionIdList: snapshot.positions.map((position) => position.tokenId),
+    }
+    await venue.sfpmExecutor.simulate(request)
+
+    let journalActive = false
+    let confirmedReceiptSeen = false
+    try {
+      const swapIntentId = this.deps.hedgeJournal.begin('sfpm_swap')
+      journalActive = true
+      store.save({ ...pending, swapIntentId })
+      const result = await venue.sfpmExecutor.execute(request)
+      const receipt = successfulReceipt(result, 'pending off-venue swap')
+      confirmedReceiptSeen = true
+      this.deps.hedgeJournal.confirm({
+        transactionHash: receipt.transactionHash,
+        blockNumber: receipt.blockNumber,
+        blockHash: receipt.blockHash,
+      })
+      journalActive = false
+      store.clear()
+      botLog(`[hedger-bot] recovered pending off-venue swap: ${receipt.transactionHash}`)
+      await this.deps.notifier.notify(
+        `✅ recovered pending off-venue SFPM swap (${trigger}): ${receipt.transactionHash}`,
+      )
+    } catch (error) {
+      if (journalActive && !(error instanceof TxNotMinedError) && !confirmedReceiptSeen) {
+        this.deps.hedgeJournal.fail()
+      }
+      throw error
+    }
+    return true
+  }
+
+  /**
+   * Periodic best-effort maintenance. Loose balances are already included in
+   * economic delta, so a failed redeposit cannot trigger a duplicate hedge.
+   * Protocol margin remains the on-chain CT balance until this transaction lands.
+   */
+  private async maybeRedepositWalletBalances(trigger: string, force = false): Promise<boolean> {
+    const venue = this.deps.sfpmVenue
+    if (!venue) return false
+    const now = Date.now()
+    if (!force && now - this.lastWalletRedepositCheckAt < 15 * 60_000) return false
+    this.lastWalletRedepositCheckAt = now
+
+    let balances
+    try {
+      balances = await venue.sfpmExecutor.readWalletBalances()
+    } catch (error) {
+      botWarn(`[hedger-bot] loose collateral balance read failed: ${sanitizeError(error)}`)
+      return false
+    }
+    if (balances.token0.total === 0n && balances.token1.total === 0n) return false
+    if (this.deps.config.DRY_RUN) {
+      await venue.sfpmExecutor.redepositWalletBalances()
+      botLog('[hedger-bot] dry-run: loose Safe collateral redeposit simulation succeeded')
+      return false
+    }
+
+    let journalActive = false
+    try {
+      this.deps.hedgeJournal.begin('wallet_redeposit')
+      journalActive = true
+      const result = await venue.sfpmExecutor.redepositWalletBalances()
+      const receipt = successfulReceipt(result, 'wallet redeposit')
+      this.deps.hedgeJournal.confirm({
+        transactionHash: receipt.transactionHash,
+        blockNumber: receipt.blockNumber,
+        blockHash: receipt.blockHash,
+      })
+      journalActive = false
+      botLog(
+        `[hedger-bot] redeposited loose Safe collateral (${trigger}): ${receipt.transactionHash}`,
+      )
+      return true
+    } catch (error) {
+      if (journalActive && !(error instanceof TxNotMinedError)) this.deps.hedgeJournal.fail()
+      botWarn(`[hedger-bot] loose collateral redeposit failed: ${sanitizeError(error)}`)
+      return false
+    }
   }
 
   /** Build a burn-only intent (no mint) for the current open position set. */
@@ -455,13 +1037,14 @@ export class HedgerBot {
       await executor.execute(intent, { urgent: true })
       return undefined
     }
+    if (intent.action === 'none') throw new Error('cannot execute a no-op burn stage')
     this.deps.hedgeJournal.begin(intent.action)
     let result
     try {
       result = await executor.execute(intent, { urgent: true })
     } catch (error) {
-      this.deps.hedgeJournal.fail()
       if (error instanceof TxNotMinedError) this.lastDispatchTxHash = error.lastHash
+      else this.deps.hedgeJournal.fail()
       throw error
     }
     const receipt = result.receipt
@@ -516,6 +1099,7 @@ export class HedgerBot {
     return computeHedgePlan({
       pool: snapshot.pool,
       collateral: snapshot.collateral,
+      walletBalances: snapshot.walletBalances,
       signalTick: snapshot.pool.currentTick,
       assetIndex: config.ASSET_INDEX as 0n | 1n,
       deltaThresholdBps: config.DELTA_THRESHOLD_BPS,
@@ -764,6 +1348,7 @@ export class HedgerBot {
       chainId: BigInt(config.CHAIN_ID),
       safeAddress: config.SAFE_ADDRESS,
       poolMetadata: this.deps.poolMetadata,
+      weth9: walletWethAddress(config),
       storage: this.deps.storage,
       fromBlock: config.SYNC_FROM_BLOCK ?? protocolGenesisBlock(config.CHAIN_ID),
     })

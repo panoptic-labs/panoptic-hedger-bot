@@ -10,6 +10,7 @@ import { HedgerBot } from './hedgerBot'
 import { type RolesExecutor, TxNotMinedError } from './safe/rolesExecutor'
 
 vi.mock('@panoptic-eng/sdk/v2', () => ({
+  getChainDeployment: () => undefined,
   getPool: vi.fn(async () => ({
     healthStatus: 'active',
     poolKey: { tickSpacing: 10 },
@@ -185,13 +186,46 @@ const consolidatePlan = {
   },
 } as unknown as ReturnType<typeof computeHedgePlan>
 
+const openBalanceFirstPlan = {
+  action: 'open',
+  mints: [{ tokenType: 0n, size: 100n }],
+  burns: [],
+  swapAtMint: true,
+  H: 0n,
+  Hstar: 100n,
+  driftBps: 1_000n,
+  triggers: { drift: true, overCap: false, signFlip: false },
+  netDelta: -100n,
+  portfolioSize: 1_000n,
+  intent: {
+    action: 'open',
+    openTokenId: 99n,
+    openPositionSize: 100n,
+    swapAtMint: true,
+    closeTokenIds: [],
+    existingPositionIds: [7n, 8n],
+    skippedCollidingTokenIds: [],
+    currentTick: 0n,
+    slippageBps: 30n,
+  },
+} as unknown as ReturnType<typeof computeHedgePlan>
+
 type BotDeps = ConstructorParameters<typeof HedgerBot>[0]
 
 async function makeBot(
   executeResult: HedgeExecutionResult,
   receiptStatus: 'success' | 'reverted',
   overrides: Partial<
-    Pick<BotDeps, 'executor' | 'deleveragerExecutor' | 'notifier' | 'gasPolicy' | 'hedgeJournal'>
+    Pick<
+      BotDeps,
+      | 'executor'
+      | 'deleveragerExecutor'
+      | 'sfpmVenue'
+      | 'pendingSwapStore'
+      | 'notifier'
+      | 'gasPolicy'
+      | 'hedgeJournal'
+    >
   > = {},
 ) {
   const receipt = {
@@ -214,6 +248,7 @@ async function makeBot(
     })),
   } as unknown as PublicClient
   const notifier = overrides.notifier ?? { notify: vi.fn(async () => undefined) }
+  let pendingSwap: ReturnType<NonNullable<BotDeps['pendingSwapStore']>['read']> = null
   const bot = new HedgerBot({
     config: CONFIG,
     publicClient,
@@ -226,13 +261,23 @@ async function makeBot(
     executor:
       overrides.executor ?? ({ kind: 'same-pool-loan', execute } as unknown as HedgeExecutor),
     deleveragerExecutor: overrides.deleveragerExecutor,
+    sfpmVenue: overrides.sfpmVenue,
+    pendingSwapStore: overrides.pendingSwapStore ?? {
+      read: () => pendingSwap,
+      save: (value) => {
+        pendingSwap = value
+      },
+      clear: () => {
+        pendingSwap = null
+      },
+    },
     rolesExecutor: { preflight: vi.fn(async () => undefined) } as unknown as RolesExecutor,
     notifier,
     gasPolicy: overrides.gasPolicy ?? openGasPolicy,
     // Unused here: readHedgeSnapshot (the only storage consumer) is mocked.
     storage: {} as never,
     hedgeJournal: overrides.hedgeJournal ?? {
-      begin: vi.fn(),
+      begin: vi.fn(() => '00000000-0000-4000-8000-000000000001'),
       observeTransaction: vi.fn(),
       confirm: vi.fn(),
       fail: vi.fn(),
@@ -396,6 +441,188 @@ describe('HedgerBot final-state margin reserve', () => {
   })
 })
 
+describe('HedgerBot balance-first collateral swaps', () => {
+  const receipt = {
+    status: 'success',
+    transactionHash: '0x03',
+    blockNumber: 124n,
+    blockHash: `0x${'cd'.repeat(32)}`,
+  } as never
+
+  beforeEach(() => {
+    vi.mocked(computeHedgePlan).mockReturnValue(openBalanceFirstPlan)
+  })
+
+  it('leaves 50bps in the CollateralTracker when swapping numeraire in-pool', async () => {
+    vi.mocked(readHedgeSnapshot).mockResolvedValue({
+      ...snapshot(),
+      pool: {
+        ...snapshot().pool,
+        poolId: 1n,
+        poolKey: { tickSpacing: 10 },
+      },
+      collateral: { token0: { assets: 0n }, token1: { assets: 200n } },
+      walletBalances: {
+        token0: { token: 0n, native: 0n, total: 0n },
+        token1: { token: 0n, native: 0n, total: 0n },
+      },
+    } as never)
+    const execute = vi.fn()
+    const deriveSwapRequirement = vi.fn(async () => ({
+      sellTokenType: 1 as const,
+      amountIn: 199n,
+      inPoolAmountOut: 100n,
+    }))
+    const simulateCollateralSwap = vi.fn(async () => undefined)
+    const executeCollateralSwap = vi.fn(async () => ({
+      transactionHash: receipt.transactionHash,
+      receipt,
+      amountIn: 200n,
+      dryRun: false,
+    }))
+    const { bot } = await makeBot({} as HedgeExecutionResult, 'success', {
+      executor: {
+        kind: 'same-pool-loan',
+        execute,
+        deriveSwapRequirement,
+        simulateCollateralSwap,
+        executeCollateralSwap,
+      } as unknown as HedgeExecutor,
+    })
+
+    expect(await bot.runCycle('c1')).toBe('complete')
+    expect(simulateCollateralSwap).toHaveBeenCalledWith(
+      expect.objectContaining({ sellTokenType: 1, amountIn: 199n }),
+    )
+    expect(executeCollateralSwap).toHaveBeenCalledTimes(1)
+    expect(execute).not.toHaveBeenCalled()
+  })
+
+  it('leaves 50bps of loose Safe numeraire after a standalone off-venue swap', async () => {
+    vi.mocked(readHedgeSnapshot).mockResolvedValue({
+      ...snapshot(),
+      pool: {
+        ...snapshot().pool,
+        poolId: 1n,
+        poolKey: { tickSpacing: 10 },
+      },
+      collateral: { token0: { assets: 0n }, token1: { assets: 0n } },
+      walletBalances: {
+        token0: { token: 0n, native: 0n, total: 0n },
+        token1: { token: 200n, native: 0n, total: 200n },
+      },
+    } as never)
+    const execute = vi.fn()
+    const sfpmSimulate = vi.fn(async () => undefined)
+    const sfpmExecute = vi.fn(async () => ({
+      transactionHash: receipt.transactionHash,
+      receipt,
+      amountIn: 199n,
+      amountOut: 100n,
+      dryRun: false,
+    }))
+    const { bot } = await makeBot({} as HedgeExecutionResult, 'success', {
+      executor: {
+        kind: 'same-pool-loan',
+        execute,
+        deriveSwapRequirement: vi.fn(async () => ({
+          sellTokenType: 1 as const,
+          amountIn: 200n,
+          inPoolAmountOut: 95n,
+        })),
+        simulateCollateralSwap: vi.fn(),
+        executeCollateralSwap: vi.fn(),
+      } as unknown as HedgeExecutor,
+      sfpmVenue: {
+        coordinator: {
+          evaluate: vi.fn(async () => ({
+            use: true,
+            sellToken0: false,
+            swapAmount: 200n,
+            amountOut: 100n,
+            swapPoolTick: 0,
+          })),
+          quoteSwap: vi.fn(async () => ({ amountOut: 99n, swapPoolTick: 0 })),
+        },
+        sfpmExecutor: {
+          simulate: sfpmSimulate,
+          execute: sfpmExecute,
+          readWalletBalances: vi.fn(),
+          redepositWalletBalances: vi.fn(),
+        },
+      } as never,
+    })
+
+    expect(await bot.runCycle('c1')).toBe('complete')
+    expect(sfpmSimulate).toHaveBeenCalledWith(
+      expect.objectContaining({ amount: 199n, positionIdList: [7n, 8n] }),
+    )
+    expect(sfpmExecute).toHaveBeenCalledTimes(1)
+    expect(execute).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the loan hedge when the balance-first preflight rejects the withdrawal', async () => {
+    vi.mocked(readHedgeSnapshot).mockResolvedValue({
+      ...snapshot(),
+      pool: {
+        ...snapshot().pool,
+        poolId: 1n,
+        poolKey: { tickSpacing: 10 },
+      },
+      collateral: { token0: { assets: 0n }, token1: { assets: 200n } },
+      walletBalances: {
+        token0: { token: 0n, native: 0n, total: 0n },
+        token1: { token: 0n, native: 0n, total: 0n },
+      },
+    } as never)
+    const loanResult = {
+      transactionHash: '0x04',
+      receipt: {
+        status: 'success',
+        transactionHash: '0x04',
+        blockNumber: 125n,
+        blockHash: `0x${'ef'.repeat(32)}`,
+      },
+      openedTokenId: 99n,
+      closedTokenIds: [],
+      dryRun: false,
+    } as unknown as HedgeExecutionResult
+    const execute = vi.fn(async () => loanResult)
+    const sfpmExecute = vi.fn()
+    const executeCollateralSwap = vi.fn()
+    const { bot } = await makeBot(loanResult, 'success', {
+      executor: {
+        kind: 'same-pool-loan',
+        execute,
+        deriveSwapRequirement: vi.fn(async () => ({
+          sellTokenType: 1 as const,
+          amountIn: 199n,
+          inPoolAmountOut: 100n,
+        })),
+        // High pool utilization: CT.withdraw preflight rejects the standalone swap.
+        simulateCollateralSwap: vi.fn(async () => {
+          throw new Error('input CollateralTracker withdrawal rejected: ExceedsMaximumRedemption')
+        }),
+        executeCollateralSwap,
+        previewFinalState: vi.fn(async () => ({
+          success: true as const,
+          margin: {
+            collateralBalance0: 1_000n,
+            requiredCollateral0: 100n,
+            collateralBalance1: 1_000n,
+            requiredCollateral1: 100n,
+          },
+        })),
+      } as unknown as HedgeExecutor,
+    })
+
+    expect(await bot.runCycle('c1')).toBe('complete')
+    expect(execute).toHaveBeenCalledTimes(1)
+    expect(executeCollateralSwap).not.toHaveBeenCalled()
+    expect(sfpmExecute).not.toHaveBeenCalled()
+  })
+})
+
 describe('HedgerBot stuck dispatch (TxNotMinedError)', () => {
   it('alerts once and leaves the tracked hedge set untouched', async () => {
     const notify = vi.fn(async (_message: unknown) => undefined)
@@ -436,6 +663,329 @@ describe('HedgerBot stuck dispatch (TxNotMinedError)', () => {
     // best-guess dispatch hash into the read.
     expect(vi.mocked(readHedgeSnapshot).mock.calls.length).toBe(2)
     expect(execute).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('HedgerBot off-venue transaction journal', () => {
+  it('confirms tx1 and opens a separate journal intent before tx2 is sent', async () => {
+    const order: string[] = []
+    const dispatchReceipt = {
+      status: 'success',
+      transactionHash: '0x01',
+      blockNumber: 123n,
+      blockHash: `0x${'ab'.repeat(32)}`,
+    } as never
+    const swapReceipt = {
+      status: 'success',
+      transactionHash: '0x02',
+      blockNumber: 124n,
+      blockHash: `0x${'cd'.repeat(32)}`,
+    } as never
+    const dispatchResult = {
+      transactionHash: '0x01',
+      receipt: dispatchReceipt,
+      openedTokenId: null,
+      closedTokenIds: [7n],
+      dryRun: false,
+    } as HedgeExecutionResult
+    const journal = {
+      begin: vi.fn((action) => {
+        order.push(`begin:${action}`)
+        return action === 'sfpm_swap'
+          ? '00000000-0000-4000-8000-000000000002'
+          : '00000000-0000-4000-8000-000000000001'
+      }),
+      observeTransaction: vi.fn(),
+      confirm: vi.fn((receipt) => order.push(`confirm:${receipt.transactionHash}`)),
+      fail: vi.fn(),
+      recover: vi.fn(async () => undefined),
+      checkpoint: () => ({}),
+    } satisfies BotDeps['hedgeJournal']
+    const executeOffVenue = vi.fn(async () => {
+      order.push('send:dispatch')
+      return dispatchResult
+    })
+    const sfpmExecute = vi.fn(async () => {
+      order.push('send:swap')
+      return {
+        transactionHash: '0x02',
+        receipt: swapReceipt,
+        amountIn: 500n,
+        amountOut: 490n,
+        dryRun: false,
+      } as const
+    })
+    const { bot } = await makeBot(dispatchResult, 'success', {
+      executor: {
+        kind: 'same-pool-loan',
+        execute: vi.fn(),
+        executeOffVenue,
+        previewFinalState: vi.fn(),
+      },
+      sfpmVenue: {
+        coordinator: {
+          evaluate: vi.fn(async () => ({
+            use: true,
+            sellToken0: false,
+            swapAmount: 500n,
+            amountOut: 490n,
+            swapPoolTick: 0,
+          })),
+          quoteSwap: vi.fn(),
+        },
+        sfpmExecutor: {
+          simulate: vi.fn(async () => undefined),
+          execute: sfpmExecute,
+          readWalletBalances: vi.fn(async () => ({
+            token0: { token: 0n, native: 0n, total: 0n },
+            token1: { token: 0n, native: 0n, total: 0n },
+          })),
+          redepositWalletBalances: vi.fn(),
+        },
+      },
+      hedgeJournal: journal,
+    })
+
+    await bot.runCycle('c1')
+
+    expect(order).toEqual([
+      'begin:close_all',
+      'send:dispatch',
+      'confirm:0x01',
+      'begin:sfpm_swap',
+      'send:swap',
+      'confirm:0x02',
+    ])
+    expect(journal.fail).not.toHaveBeenCalled()
+  })
+
+  it('clears the durable swap obligation after tx1+tx2 confirm so the next cycle does not re-swap', async () => {
+    const dispatchReceipt = {
+      status: 'success',
+      transactionHash: '0x01',
+      blockNumber: 123n,
+      blockHash: `0x${'ab'.repeat(32)}`,
+    } as never
+    const swapReceipt = {
+      status: 'success',
+      transactionHash: '0x02',
+      blockNumber: 124n,
+      blockHash: `0x${'cd'.repeat(32)}`,
+    } as never
+    const dispatchResult = {
+      transactionHash: '0x01',
+      receipt: dispatchReceipt,
+      openedTokenId: null,
+      closedTokenIds: [7n],
+      dryRun: false,
+    } as HedgeExecutionResult
+    let pending: Parameters<NonNullable<BotDeps['pendingSwapStore']>['save']>[0] | null = null
+    const store = {
+      read: vi.fn(() => pending),
+      save: vi.fn((value: never) => {
+        pending = value
+      }),
+      clear: vi.fn(() => {
+        pending = null
+      }),
+    }
+    const quoteSwap = vi.fn(async () => ({ amountOut: 490n, swapPoolTick: 0 }))
+    const sfpmExecute = vi.fn(async () => ({
+      transactionHash: '0x02',
+      receipt: swapReceipt,
+      amountIn: 500n,
+      amountOut: 490n,
+      dryRun: false,
+    }))
+    const { bot } = await makeBot(dispatchResult, 'success', {
+      executor: {
+        kind: 'same-pool-loan',
+        execute: vi.fn(),
+        executeOffVenue: vi.fn(async () => dispatchResult),
+        previewFinalState: vi.fn(),
+      },
+      pendingSwapStore: store as never,
+      sfpmVenue: {
+        coordinator: {
+          evaluate: vi.fn(async () => ({
+            use: true,
+            sellToken0: false,
+            swapAmount: 500n,
+            amountOut: 490n,
+            swapPoolTick: 0,
+          })),
+          quoteSwap,
+        },
+        sfpmExecutor: {
+          simulate: vi.fn(async () => undefined),
+          execute: sfpmExecute,
+          readWalletBalances: vi.fn(async () => ({
+            token0: { token: 0n, native: 0n, total: 0n },
+            token1: { token: 0n, native: 0n, total: 0n },
+          })),
+          redepositWalletBalances: vi.fn(),
+        },
+      },
+    })
+
+    await bot.runCycle('c1')
+    expect(sfpmExecute).toHaveBeenCalledTimes(1)
+    expect(store.clear).toHaveBeenCalled()
+    expect(pending).toBeNull()
+
+    // The next cycle must plan a fresh hedge, not replay the fulfilled
+    // obligation through recovery (which would re-quote via quoteSwap).
+    await bot.runCycle('c2')
+    expect(quoteSwap).not.toHaveBeenCalled()
+    expect(sfpmExecute).toHaveBeenCalledTimes(2)
+  })
+
+  it('preserves the swap intent when tx2 times out so startup can recover it', async () => {
+    const dispatchReceipt = {
+      status: 'success',
+      transactionHash: '0x01',
+      blockNumber: 123n,
+      blockHash: `0x${'ab'.repeat(32)}`,
+    } as never
+    const dispatchResult = {
+      transactionHash: '0x01',
+      receipt: dispatchReceipt,
+      openedTokenId: null,
+      closedTokenIds: [7n],
+      dryRun: false,
+    } as HedgeExecutionResult
+    const journal = {
+      begin: vi
+        .fn()
+        .mockReturnValueOnce('00000000-0000-4000-8000-000000000001')
+        .mockReturnValueOnce('00000000-0000-4000-8000-000000000002'),
+      observeTransaction: vi.fn(),
+      confirm: vi.fn(),
+      fail: vi.fn(),
+      recover: vi.fn(async () => undefined),
+      checkpoint: () => ({}),
+    } satisfies BotDeps['hedgeJournal']
+    const { bot } = await makeBot(dispatchResult, 'success', {
+      executor: {
+        kind: 'same-pool-loan',
+        execute: vi.fn(),
+        executeOffVenue: vi.fn(async () => dispatchResult),
+        previewFinalState: vi.fn(),
+      },
+      sfpmVenue: {
+        coordinator: {
+          evaluate: vi.fn(async () => ({
+            use: true,
+            sellToken0: false,
+            swapAmount: 500n,
+            amountOut: 490n,
+            swapPoolTick: 0,
+          })),
+          quoteSwap: vi.fn(),
+        },
+        sfpmExecutor: {
+          simulate: vi.fn(async () => undefined),
+          execute: vi.fn(async () => {
+            throw new TxNotMinedError(['0x02'] as never, 180_000)
+          }),
+          readWalletBalances: vi.fn(async () => ({
+            token0: { token: 0n, native: 0n, total: 0n },
+            token1: { token: 0n, native: 0n, total: 0n },
+          })),
+          redepositWalletBalances: vi.fn(),
+        },
+      },
+      hedgeJournal: journal,
+    })
+
+    await bot.runCycle('c1')
+
+    expect(journal.begin).toHaveBeenNthCalledWith(1, 'close_all')
+    expect(journal.begin).toHaveBeenNthCalledWith(2, 'sfpm_swap')
+    expect(journal.confirm).toHaveBeenCalledOnce()
+    expect(journal.confirm).toHaveBeenCalledWith(
+      expect.objectContaining({ transactionHash: '0x01' }),
+    )
+    expect(journal.fail).not.toHaveBeenCalled()
+  })
+
+  it('finishes a durable swap obligation before planning another hedge', async () => {
+    const dispatchIntentId = '00000000-0000-4000-8000-000000000001'
+    const swapIntentId = '00000000-0000-4000-8000-000000000002'
+    let pending: {
+      dispatchIntentId: string
+      swapIntentId?: string
+      sellToken0: boolean
+      amount: bigint
+    } = {
+      dispatchIntentId,
+      sellToken0: true,
+      amount: 500n,
+    }
+    const store = {
+      read: vi.fn(() => pending),
+      save: vi.fn((value) => {
+        pending = value
+      }),
+      clear: vi.fn(),
+    }
+    const journal = {
+      begin: vi.fn(() => swapIntentId),
+      observeTransaction: vi.fn(),
+      confirm: vi.fn(),
+      fail: vi.fn(),
+      recover: vi.fn(async () => undefined),
+      checkpoint: () => ({
+        intentId: dispatchIntentId,
+        action: 'close_all' as const,
+        transactionHash: '0x01' as const,
+      }),
+    } satisfies BotDeps['hedgeJournal']
+    const recoveredReceipt = {
+      status: 'success',
+      transactionHash: '0x02',
+      blockNumber: 124n,
+      blockHash: `0x${'cd'.repeat(32)}`,
+    } as never
+    const sfpmExecute = vi.fn(async () => ({
+      transactionHash: '0x02' as const,
+      receipt: recoveredReceipt,
+      amountIn: 500n,
+      amountOut: 490n,
+      dryRun: false,
+    }))
+    const dispatchResult = {
+      transactionHash: '0x01',
+      receipt: recoveredReceipt,
+      openedTokenId: null,
+      closedTokenIds: [],
+      dryRun: false,
+    } as HedgeExecutionResult
+    const { bot } = await makeBot(dispatchResult, 'success', {
+      pendingSwapStore: store,
+      hedgeJournal: journal,
+      sfpmVenue: {
+        coordinator: {
+          evaluate: vi.fn(),
+          quoteSwap: vi.fn(async () => ({ amountOut: 490n, swapPoolTick: 0 })),
+        },
+        sfpmExecutor: {
+          simulate: vi.fn(async () => undefined),
+          execute: sfpmExecute,
+          readWalletBalances: vi.fn(async () => ({
+            token0: { token: 0n, native: 0n, total: 0n },
+            token1: { token: 0n, native: 0n, total: 0n },
+          })),
+          redepositWalletBalances: vi.fn(),
+        },
+      },
+    })
+
+    expect(await bot.runCycle('recovery')).toBe('complete')
+    expect(sfpmExecute).toHaveBeenCalledOnce()
+    expect(vi.mocked(computeHedgePlan)).not.toHaveBeenCalled()
+    expect(store.clear).toHaveBeenCalledOnce()
+    expect(journal.begin).toHaveBeenCalledWith('sfpm_swap')
   })
 })
 

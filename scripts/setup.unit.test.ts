@@ -24,6 +24,7 @@ describe('deployStateSchema resume compatibility', () => {
   it('accepts a version-1 state without hedgeIncludeLp and defaults it to false', () => {
     const state = deployStateSchema.parse(LEGACY_V1_STATE)
     expect(state.hedgeIncludeLp).toBe(false)
+    expect(state.sfpmSwapProvisioned).toBe(false)
   })
 
   it('preserves an explicit hedgeIncludeLp when present', () => {

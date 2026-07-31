@@ -5,7 +5,7 @@ import { getAddress, keccak256, toHex } from 'viem'
 import { z } from 'zod'
 
 import type { HedgerBotConfig } from '../config'
-import { deleveragerRoleKey } from '../config'
+import { deleveragerRoleKey, walletWethAddress } from '../config'
 import {
   assertProductionEligibleConfig,
   isProductionEligibleConfig,
@@ -16,10 +16,10 @@ import { readSecureJson, writeSecureJson } from './secureFile'
 import { botVersion } from './stateFile'
 
 const ACTIVATION_SCHEMA_VERSION = 2 as const
-// v4: adds the optional bot-held burn-only deleverager role to the reviewed
-// profile. Bumping this invalidates existing activation markers on purpose —
+// v5: binds the optional explicitly provisioned SFPM venue to activation.
+// Bumping this invalidates existing activation markers on purpose —
 // operators re-review and re-run `pnpm activate` after upgrading.
-export const ACTIVATION_POLICY_VERSION = 'hedger-bot-policy-v4' as const
+export const ACTIVATION_POLICY_VERSION = 'hedger-bot-policy-v6' as const
 const MAX_ACTIVATION_BYTES = 16 * 1024
 // keccak256(toHex(JSON.stringify(build<Role>DispatchConditions()))) of the
 // reviewed SDK condition trees — recompute and re-review on any builder change.
@@ -63,15 +63,29 @@ function hashCanonical(value: unknown): Hex {
 }
 
 /** The exact reviewed permission policy accepted for this release candidate. */
-export function expectedPermissionManifestFingerprint(
-  config: Pick<HedgerBotConfig, 'DELEVERAGER_ENABLED'>,
-): Hex {
+export function expectedPermissionManifestFingerprint(config: HedgerBotConfig): Hex {
   return hashCanonical({
-    version: 3,
+    version: 4,
     loanRoleTree: REVIEWED_LOAN_ROLE_TREE_HASH,
     deleveragerRoleTree: config.DELEVERAGER_ENABLED ? REVIEWED_DELEVERAGER_ROLE_TREE_HASH : null,
     rolePolicy: resolveRolePolicy(config),
     routerPermissions: 'none',
+    sfpmSwap: config.SFPM_SWAP_PROVISIONED
+      ? {
+          policy: 'exact-reviewed-sfpm-v3-venue-v1',
+          sfpm: config.SFPM_SWAP_ADDRESS_V3 ? canonicalAddress(config.SFPM_SWAP_ADDRESS_V3) : null,
+          pool: config.SFPM_SWAP_POOL_ADDRESS
+            ? canonicalAddress(config.SFPM_SWAP_POOL_ADDRESS)
+            : null,
+          poolId: config.SFPM_SWAP_POOL_ID?.toString() ?? null,
+          multiSend: config.MULTISEND_CALL_ONLY_ADDRESS
+            ? canonicalAddress(config.MULTISEND_CALL_ONLY_ADDRESS)
+            : null,
+          unwrapper: config.MULTISEND_UNWRAPPER_ADDRESS
+            ? canonicalAddress(config.MULTISEND_UNWRAPPER_ADDRESS)
+            : null,
+        }
+      : null,
     loanBounds: 'not-enforced-operator-deferred-phase-2.4',
   })
 }
@@ -83,6 +97,17 @@ function codeIdentityAddresses(config: HedgerBotConfig): readonly [string, Addre
     ['rolesModifier', config.ROLES_MODIFIER_ADDRESS],
     ['uniswapV3SignalPool', config.UNISWAP_SIGNAL_POOL_ADDRESS],
     ['uniswapV4StateView', config.UNISWAP_SIGNAL_STATE_VIEW_ADDRESS],
+    ['sfpmV3', config.SFPM_SWAP_PROVISIONED ? config.SFPM_SWAP_ADDRESS_V3 : undefined],
+    ['sfpmSwapPool', config.SFPM_SWAP_PROVISIONED ? config.SFPM_SWAP_POOL_ADDRESS : undefined],
+    [
+      'multiSendCallOnly',
+      config.SFPM_SWAP_PROVISIONED ? config.MULTISEND_CALL_ONLY_ADDRESS : undefined,
+    ],
+    [
+      'multiSendUnwrapper',
+      config.SFPM_SWAP_PROVISIONED ? config.MULTISEND_UNWRAPPER_ADDRESS : undefined,
+    ],
+    ['weth9', config.SFPM_SWAP_PROVISIONED ? walletWethAddress(config) : undefined],
   ]
   return entries.flatMap(([name, address]) => (address ? [[name, address]] : []))
 }
@@ -118,6 +143,7 @@ export function buildActivationPolicy(
   botAddress: Address,
   evidence: ActivationEvidence,
 ): unknown {
+  const weth9 = walletWethAddress(config)
   return {
     policyVersion: ACTIVATION_POLICY_VERSION,
     releaseVersion: botVersion(),
@@ -137,6 +163,21 @@ export function buildActivationPolicy(
           targetMarginBps: config.DELEVERAGE_TARGET_MARGIN_BPS.toString(),
           slippageBps: config.DELEVERAGE_SLIPPAGE_BPS,
           cooldownMs: config.DELEVERAGE_COOLDOWN_MS,
+        }
+      : null,
+    sfpmSwap: config.SFPM_SWAP_PROVISIONED
+      ? {
+          enabled: config.SFPM_SWAP_ENABLED,
+          version: 'v3',
+          sfpm: config.SFPM_SWAP_ADDRESS_V3 ? canonicalAddress(config.SFPM_SWAP_ADDRESS_V3) : null,
+          pool: config.SFPM_SWAP_POOL_ADDRESS
+            ? canonicalAddress(config.SFPM_SWAP_POOL_ADDRESS)
+            : null,
+          poolId: config.SFPM_SWAP_POOL_ID?.toString() ?? null,
+          fee: config.SFPM_SWAP_FEE,
+          slippageBps: config.SFPM_SWAP_SLIPPAGE_BPS ?? config.SLIPPAGE_BPS,
+          minSavingsBps: config.SFPM_SWAP_MIN_SAVINGS_BPS.toString(),
+          weth9: weth9 ? canonicalAddress(weth9) : null,
         }
       : null,
     hedgeVenue: config.HEDGE_VENUE,

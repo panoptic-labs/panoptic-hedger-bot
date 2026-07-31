@@ -13,6 +13,24 @@ const MARK: Record<CheckStatus, string> = {
   skip: dim('- skip'),
 }
 
+const ONBOARD_REPAIR_CHECKS = new Set([
+  'key',
+  'safe-owner',
+  'safe-module',
+  'scope',
+  'sfpm-authorization',
+  'deleverager-scope',
+  'permission-manifest',
+  'code-safe',
+  'code-modifier',
+  'proxy-identity',
+])
+
+export function doctorNextCommand(results: DoctorResult[]): string {
+  const failed = results.filter(({ status }) => status === 'fail')
+  return failed.some(({ id }) => ONBOARD_REPAIR_CHECKS.has(id)) ? 'pnpm onboard' : 'pnpm run doctor'
+}
+
 /** Render doctor results; returns true when every check passed (no fails). */
 export function renderDoctor(results: DoctorResult[]): boolean {
   console.log('\nHedger-bot preflight (read-only — no transactions sent)\n')
@@ -28,6 +46,7 @@ export function renderDoctor(results: DoctorResult[]): boolean {
       (warns ? paint(33, `, ${warns} warn`) : '') +
       '\n',
   )
+  if (fails > 0) console.log(`Next safe command: ${doctorNextCommand(results)}\n`)
   return fails === 0
 }
 

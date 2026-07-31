@@ -29,6 +29,17 @@ export interface EnvValues {
   PRICE_SIGNAL_SOURCE?: string
   // Hedge venue
   HEDGE_VENUE?: string
+  // Off-venue SFPM swap (prefilled from the deployments registry when available)
+  SFPM_SWAP_PROVISIONED?: boolean
+  SFPM_SWAP_ENABLED?: boolean
+  SFPM_SWAP_POOL_VERSION?: string
+  SFPM_SWAP_ADDRESS_V3?: `0x${string}`
+  SFPM_SWAP_POOL_ADDRESS?: `0x${string}`
+  SFPM_SWAP_POOL_ID?: string
+  SFPM_SWAP_FEE?: number
+  WETH_ADDRESS?: `0x${string}`
+  MULTISEND_CALL_ONLY_ADDRESS?: `0x${string}`
+  MULTISEND_UNWRAPPER_ADDRESS?: `0x${string}`
   // Emergency deleverager (burn-only role held by the bot)
   DELEVERAGER_ENABLED?: boolean
   // Loop
@@ -104,6 +115,24 @@ export function renderEnvFile(values: EnvValues): string {
     {
       heading: 'Hedge venue: in-pool',
       lines: [{ key: 'HEDGE_VENUE', value: values.HEDGE_VENUE }],
+    },
+    {
+      heading:
+        'Off-venue SFPM swap — route the hedge-netting swap through a cheaper pool ' +
+        '(v3 only; emitted only after explicit provisioning). Flip SFPM_SWAP_ENABLED=true ' +
+        'after a DRY_RUN validation.',
+      lines: [
+        { key: 'SFPM_SWAP_PROVISIONED', value: values.SFPM_SWAP_PROVISIONED },
+        { key: 'SFPM_SWAP_ENABLED', value: values.SFPM_SWAP_ENABLED },
+        { key: 'SFPM_SWAP_POOL_VERSION', value: values.SFPM_SWAP_POOL_VERSION },
+        { key: 'SFPM_SWAP_ADDRESS_V3', value: values.SFPM_SWAP_ADDRESS_V3 },
+        { key: 'SFPM_SWAP_POOL_ADDRESS', value: values.SFPM_SWAP_POOL_ADDRESS },
+        { key: 'SFPM_SWAP_POOL_ID', value: values.SFPM_SWAP_POOL_ID },
+        { key: 'SFPM_SWAP_FEE', value: values.SFPM_SWAP_FEE },
+        { key: 'WETH_ADDRESS', value: values.WETH_ADDRESS },
+        { key: 'MULTISEND_CALL_ONLY_ADDRESS', value: values.MULTISEND_CALL_ONLY_ADDRESS },
+        { key: 'MULTISEND_UNWRAPPER_ADDRESS', value: values.MULTISEND_UNWRAPPER_ADDRESS },
+      ],
     },
     {
       heading:

@@ -29,6 +29,7 @@ const BYTES32_RE = /^0x[a-fA-F0-9]{64}$/
  *   BOT_ADDRESS, POOL_ADDRESS, ROLE_KEY (bytes32), SALT_NONCE (integer).
  * Safe/Zodiac addresses come from the chain registry (scripts/lib/safeZodiacRegistry.ts);
  * override per-address with SAFE_PROXY_FACTORY, SAFE_SINGLETON,
+ * SAFE_COMPATIBILITY_FALLBACK_HANDLER,
  * ZODIAC_MODULE_PROXY_FACTORY, ROLES_MASTERCOPY for unlisted chains.
  */
 

@@ -64,6 +64,34 @@ export interface HedgeExecutionResult {
   dryRun: boolean
 }
 
+/** The swap embedded in a state-changing hedge dispatch. */
+export interface HedgeSwapRequirement {
+  /** Options-pool collateral token index sold by the swap. */
+  sellTokenType: 0 | 1
+  /** Exact input in the sold collateral token's smallest units. */
+  amountIn: bigint
+  /** Output produced by the ordinary in-pool hedge simulation. */
+  inPoolAmountOut: bigint
+}
+
+/** Standalone exact-input collateral swap which leaves no loan position open. */
+export interface CollateralSwapRequest {
+  sellTokenType: 0 | 1
+  amountIn: bigint
+  existingPositionIds: bigint[]
+  poolId: bigint
+  tickSpacing: bigint
+  currentTick: bigint
+  slippageBps: bigint
+}
+
+export interface CollateralSwapResult {
+  transactionHash: Hex | null
+  receipt: TransactionReceipt | null
+  amountIn: bigint
+  dryRun: boolean
+}
+
 /**
  * Execution context used for urgency-aware transaction fees.
  */
@@ -85,4 +113,21 @@ export interface HedgeExecutor {
   previewFinalState(intent: HedgeIntent, blockNumber: bigint): Promise<HedgeFinalStatePreview>
   /** Convert an intent to on-chain calls and submit (or simulate when dryRun). */
   execute(intent: HedgeIntent, ctx?: HedgeContext): Promise<HedgeExecutionResult>
+  /**
+   * Execute the no-swap dispatch half of an off-venue hedge. Its operation
+   * ordering may differ from the ordinary in-pool dispatch.
+   */
+  executeOffVenue(intent: HedgeIntent, ctx?: HedgeContext): Promise<HedgeExecutionResult>
+  /**
+   * Resolve the exact swap performed by swapAtMint for balance-first routing.
+   * Optional for test/dummy executors which do not support standalone swaps.
+   */
+  deriveSwapRequirement?(intent: HedgeIntent): Promise<HedgeSwapRequirement | null>
+  /** Preflight a temporary-loan exact-input swap which leaves no position open. */
+  simulateCollateralSwap?(request: CollateralSwapRequest): Promise<void>
+  /** Execute a temporary-loan exact-input swap which leaves no position open. */
+  executeCollateralSwap?(
+    request: CollateralSwapRequest,
+    ctx?: HedgeContext,
+  ): Promise<CollateralSwapResult>
 }

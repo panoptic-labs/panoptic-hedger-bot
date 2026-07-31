@@ -13,6 +13,7 @@ import type { Address, PublicClient } from 'viem'
 import { asSdkClient } from '../utils/sdkClient'
 import { type LpPositionForHedge, readSafeLpPositions } from './lpPositions'
 import { readSafePositions } from './positionReader'
+import { type SafeWalletBalances, readSafeWalletBalances } from './walletBalances'
 
 /** Uniswap LP positions folded into the hedge delta, plus their freshness. */
 export interface HedgeSnapshotLp {
@@ -36,6 +37,8 @@ export interface HedgeSnapshot {
   buyingPower: Awaited<ReturnType<typeof getAccountBuyingPower>>
   collateral: Awaited<ReturnType<typeof getAccountCollateral>>
   liquidation: Awaited<ReturnType<typeof isLiquidatable>>
+  /** Loose collateral assets held directly by the Safe, including ETH + WETH. */
+  walletBalances: SafeWalletBalances
   /** Present only when LP tracking is configured (lpSubgraphUrl set). */
   lp?: HedgeSnapshotLp
 }
@@ -51,6 +54,8 @@ export interface ReadHedgeSnapshotDeps {
    * getPool from re-reading addresses/decimals/symbols every cycle.
    */
   poolMetadata?: PoolMetadata
+  /** WETH9 used to combine native ETH and WETH wallet exposure. */
+  weth9?: Address
   /** Persistence for the SDK position sync (file-backed in the bot). */
   storage: StorageAdapter
   /** Block floor for the first (full) position-event scan. */
@@ -99,7 +104,7 @@ export async function readHedgeSnapshot(deps: ReadHedgeSnapshotDeps): Promise<He
   // The LP subgraph read only needs `pool` (resolved above), so run it alongside
   // the account reads rather than serially after them.
   const lpDeps = deps.lp
-  const [buyingPower, collateral, liquidation, lpResult] = await Promise.all([
+  const [buyingPower, collateral, liquidation, walletBalances, lpResult] = await Promise.all([
     getAccountBuyingPower({
       client: asSdkClient<typeof getAccountBuyingPower>(deps.publicClient),
       poolAddress: deps.poolAddress,
@@ -124,6 +129,14 @@ export async function readHedgeSnapshot(deps: ReadHedgeSnapshotDeps): Promise<He
       blockNumber,
       _meta: blockMeta,
     }),
+    readSafeWalletBalances({
+      publicClient: deps.publicClient,
+      safeAddress: deps.safeAddress,
+      asset0: pool.metadata.token0Asset,
+      asset1: pool.metadata.token1Asset,
+      weth9: deps.weth9,
+      blockNumber,
+    }),
     lpDeps
       ? readSafeLpPositions({
           url: lpDeps.subgraphUrl,
@@ -142,5 +155,14 @@ export async function readHedgeSnapshot(deps: ReadHedgeSnapshotDeps): Promise<He
     lp = { positions: lpResult.positions, headBlock: lpResult.headBlock, fresh }
   }
 
-  return { blockNumber, ...positions, pool, buyingPower, collateral, liquidation, lp }
+  return {
+    blockNumber,
+    ...positions,
+    pool,
+    buyingPower,
+    collateral,
+    liquidation,
+    walletBalances,
+    lp,
+  }
 }

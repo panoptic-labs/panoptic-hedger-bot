@@ -1,6 +1,7 @@
 import { createMemoryStorage, getPoolMetadata } from '@panoptic-eng/sdk/v2'
 import { formatEther, formatUnits } from 'viem'
 
+import { walletWethAddress } from '../../../src/config'
 import { protocolGenesisBlock } from '../../../src/constants/genesis'
 import { computeHedgePlan } from '../../../src/hedge/decision'
 import { readHedgeSnapshot } from '../../../src/hedge/snapshot'
@@ -152,6 +153,7 @@ export async function gatherStatus(ctx: StatusDiagnosticsContext): Promise<Statu
       poolAddress: config.POOL_ADDRESS,
       chainId: BigInt(config.CHAIN_ID),
       safeAddress: config.SAFE_ADDRESS,
+      weth9: walletWethAddress(config),
       storage: createMemoryStorage(),
       fromBlock: config.SYNC_FROM_BLOCK ?? protocolGenesisBlock(config.CHAIN_ID),
       lp:
@@ -196,6 +198,7 @@ export async function gatherStatus(ctx: StatusDiagnosticsContext): Promise<Statu
     const plan = computeHedgePlan({
       pool: snapshot.pool,
       collateral: snapshot.collateral,
+      walletBalances: snapshot.walletBalances,
       signalTick,
       assetIndex: config.ASSET_INDEX as 0n | 1n,
       deltaThresholdBps: config.DELTA_THRESHOLD_BPS,

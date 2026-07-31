@@ -1,3 +1,5 @@
+import { writeFileSync } from 'node:fs'
+
 import type { Address, Hex } from 'viem'
 import { getAddress } from 'viem'
 
@@ -40,6 +42,21 @@ export function buildSafeTransactionBuilderBatch(params: {
       contractInputsValues: null,
     })),
   }
+}
+
+/** Write a clean Safe Transaction Builder batch without pnpm lifecycle output. */
+export function writeSafeTransactionBuilderBatch(
+  filePath: string,
+  params: Parameters<typeof buildSafeTransactionBuilderBatch>[0],
+): void {
+  writeFileSync(
+    filePath,
+    `${JSON.stringify(buildSafeTransactionBuilderBatch(params), null, 2)}\n`,
+    {
+      encoding: 'utf8',
+      mode: 0o600,
+    },
+  )
 }
 
 /** Print review text to stderr and clean importable JSON to stdout. */

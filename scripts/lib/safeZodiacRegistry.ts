@@ -17,6 +17,8 @@ export interface SafeZodiacAddresses {
   safeProxyFactory: `0x${string}`
   /** Safe v1.4.1 SafeL2 singleton (emits events for every tx — indexer-friendly). */
   safeSingleton: `0x${string}`
+  /** Safe v1.4.1 CompatibilityFallbackHandler (ERC-1155/ERC-721 callbacks). */
+  compatibilityFallbackHandler: `0x${string}`
   /** Zodiac ModuleProxyFactory (deploys the Roles modifier proxy). */
   moduleProxyFactory: `0x${string}`
   /** Zodiac Roles Modifier v2.1 mastercopy. */
@@ -35,6 +37,8 @@ export const ROLES_V2_1_MASTERCOPY = '0x9646fDAD06d3e24444381f44362a3B0eB343D337
 /** Safe v1.4.1 canonical deployments (identical on mainnet + base). */
 const SAFE_V1_4_1_PROXY_FACTORY = '0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67' as const
 const SAFE_V1_4_1_L2_SINGLETON = '0x29fcB43b46531BcA003ddC8FCB67FFE91900C762' as const
+export const SAFE_V1_4_1_COMPATIBILITY_FALLBACK_HANDLER =
+  '0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99' as const
 /** Zodiac ModuleProxyFactory (CREATE2, identical on every chain). */
 const ZODIAC_MODULE_PROXY_FACTORY = '0x000000000000aDdB49795b0f9bA5BC298cDda236' as const
 /**
@@ -44,9 +48,20 @@ const ZODIAC_MODULE_PROXY_FACTORY = '0x000000000000aDdB49795b0f9bA5BC298cDda236'
  */
 const SAFE_V1_4_1_MULTISEND_CALL_ONLY = '0x9641d764fc13c8B624c04430C7356C1C7C8102e2' as const
 
+/**
+ * Canonical Zodiac Roles v2 MultiSend unwrapper — teaches the modifier to decode
+ * a `multiSend(bytes)` batch and re-check each inner call against its scope.
+ * Same address on every chain (gnosisguild deployment); bytecode verified on
+ * mainnet. Registered for MultiSendCallOnly via `setTransactionUnwrapper`. Used
+ * by the off-venue SFPM swap. (Not part of SafeZodiacAddresses — it's specific to
+ * the swap feature, not the base deploy.)
+ */
+export const MULTISEND_UNWRAPPER = '0xB4Cd4bb764C089f20DA18700CE8bc5e49F369efD' as const
+
 const CANONICAL: SafeZodiacAddresses = {
   safeProxyFactory: SAFE_V1_4_1_PROXY_FACTORY,
   safeSingleton: SAFE_V1_4_1_L2_SINGLETON,
+  compatibilityFallbackHandler: SAFE_V1_4_1_COMPATIBILITY_FALLBACK_HANDLER,
   moduleProxyFactory: ZODIAC_MODULE_PROXY_FACTORY,
   rolesMastercopy: ROLES_V2_1_MASTERCOPY,
   multiSend: SAFE_V1_4_1_MULTISEND_CALL_ONLY,
@@ -56,6 +71,8 @@ const CANONICAL_CODE_HASHES: Record<keyof SafeZodiacAddresses, `0x${string}`> = 
   // @safe-global/safe-deployments v1.4.1 canonical artifacts.
   safeProxyFactory: '0x50c3cdc4074750a7a974204a716c999edd37482f907608d960b2b025ee0b3317',
   safeSingleton: '0xb1f926978a0f44a2c0ec8fe822418ae969bd8c3f18d61e5103100339894f81ff',
+  compatibilityFallbackHandler:
+    '0x7c6007a5d711cea8dfd5d91f5940ec29c7f200fe511eb1fc1397b367af3c42f9',
   multiSend: '0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939',
   // gnosisguild/zodiac pinned deployment artifacts: ModuleProxyFactory 1.2.0
   // and Roles 2.1.0 respectively.
@@ -80,6 +97,7 @@ export const SAFE_ZODIAC_ADDRESSES: Record<number, SafeZodiacAddresses> = {
 const ENV_OVERRIDES: Record<keyof SafeZodiacAddresses, string> = {
   safeProxyFactory: 'SAFE_PROXY_FACTORY',
   safeSingleton: 'SAFE_SINGLETON',
+  compatibilityFallbackHandler: 'SAFE_COMPATIBILITY_FALLBACK_HANDLER',
   moduleProxyFactory: 'ZODIAC_MODULE_PROXY_FACTORY',
   rolesMastercopy: 'ROLES_MASTERCOPY',
   multiSend: 'SAFE_MULTISEND',

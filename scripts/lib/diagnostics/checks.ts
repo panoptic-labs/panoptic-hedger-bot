@@ -1,10 +1,13 @@
 import { getPool, getPoolMetadata } from '@panoptic-eng/sdk/v2'
-import { formatEther } from 'viem'
+import { CANONICAL_ADAPTERS } from '@panoptic-eng/sdk/zodiac'
+import type { Address } from 'viem'
+import { formatEther, zeroAddress } from 'viem'
 
-import { deleveragerRoleKey } from '../../../src/config'
+import { deleveragerRoleKey, walletWethAddress } from '../../../src/config'
 import { readSafeLpPositions } from '../../../src/hedge/lpPositions'
 import { validateBotToken } from '../../../src/notify/telegramOnboard'
 import { createPriceSignalSource, PriceSignalUnavailableError } from '../../../src/priceSignal'
+import { assertSafeCanReceiveErc1155 } from '../../../src/safe/erc1155Receiver'
 import { rolesModifierV2Abi } from '../../../src/safe/rolesAbi'
 import {
   isProductionEligibleConfig,
@@ -12,8 +15,12 @@ import {
 } from '../../../src/security/productionProfile'
 import { sanitizeError } from '../../../src/utils/sanitize'
 import { asSdkClient } from '../../../src/utils/sdkClient'
-import { verifyExactAuthorizationManifest } from '../authorizationManifest'
-import { isModuleEnabled, readSafeOwners } from '../existingSafe'
+import {
+  formatAuthorizationManifestDiff,
+  inspectExactAuthorizationManifest,
+} from '../authorizationManifest'
+import type { SfpmSwapConfigureInput } from '../deployCore'
+import { isModuleEnabled, readSafeOwners, verifySfpmSwapReady } from '../existingSafe'
 import {
   findContractDeploymentBlock,
   getSafeZodiacAddresses,
@@ -241,6 +248,38 @@ export async function runDoctorChecks(
     push({ id: 'module', title: 'Roles module enabled', status: 'fail', detail: msg(err) })
   }
 
+  // 5b. The SFPM temporarily mints an ERC-1155 position to its caller. Safe
+  // accounts only accept that callback through a compatible fallback handler.
+  if (config.SFPM_SWAP_PROVISIONED) {
+    const sfpmAddress = config.SFPM_SWAP_ADDRESS_V3
+    if (sfpmAddress === undefined) {
+      push(skip('safe-erc1155', 'Safe ERC-1155 receiver', 'missing v3 SFPM address'))
+    } else {
+      try {
+        await assertSafeCanReceiveErc1155({
+          publicClient,
+          safeAddress: config.SAFE_ADDRESS,
+          tokenAddress: sfpmAddress,
+        })
+        push({
+          id: 'safe-erc1155',
+          title: 'Safe ERC-1155 receiver',
+          status: 'pass',
+          detail: 'fallback handler accepts SFPM position mints',
+        })
+      } catch (err) {
+        push({
+          id: 'safe-erc1155',
+          title: 'Safe ERC-1155 receiver',
+          status: 'fail',
+          detail: msg(err),
+          remedy:
+            'Have the Safe owners set the reviewed CompatibilityFallbackHandler before enabling the SFPM venue.',
+        })
+      }
+    }
+  }
+
   // 6. Modifier wiring: avatar == target == owner == Safe.
   try {
     const [avatar, target, owner] = (await Promise.all(
@@ -274,6 +313,10 @@ export async function runDoctorChecks(
   let token1Symbol = ''
   let token0Decimals = 0n
   let token1Decimals = 0n
+  let token0Asset: Address | undefined
+  let token1Asset: Address | undefined
+  let collateralTracker0: Address | undefined
+  let collateralTracker1: Address | undefined
   try {
     const md = await getPoolMetadata({
       client: asSdkClient<typeof getPoolMetadata>(publicClient),
@@ -284,6 +327,10 @@ export async function runDoctorChecks(
     token1Symbol = md.token1Symbol
     token0Decimals = BigInt(md.token0Decimals)
     token1Decimals = BigInt(md.token1Decimals)
+    token0Asset = md.token0Asset
+    token1Asset = md.token1Asset
+    collateralTracker0 = md.collateralToken0Address
+    collateralTracker1 = md.collateralToken1Address
   } catch (err) {
     push({ id: 'metadata', title: 'Pool metadata', status: 'fail', detail: msg(err) })
   }
@@ -317,6 +364,86 @@ export async function runDoctorChecks(
     }
   } else {
     push(skip('scope', 'Loan-only scope', 'pool metadata or bot key unavailable'))
+  }
+
+  let sfpmSwap: SfpmSwapConfigureInput | undefined
+  if (config.SFPM_SWAP_PROVISIONED) {
+    const sfpmAddress = config.SFPM_SWAP_ADDRESS_V3
+    if (
+      sfpmAddress === undefined ||
+      config.SFPM_SWAP_POOL_ID === undefined ||
+      config.MULTISEND_CALL_ONLY_ADDRESS === undefined ||
+      config.MULTISEND_UNWRAPPER_ADDRESS === undefined ||
+      token0Asset === undefined ||
+      token1Asset === undefined ||
+      collateralTracker0 === undefined ||
+      collateralTracker1 === undefined
+    ) {
+      push({
+        id: 'sfpm-authorization',
+        title: 'SFPM venue authorization',
+        status: 'fail',
+        detail: 'SFPM venue configuration or pool metadata is incomplete',
+        remedy:
+          'Run pnpm migrate:sfpm-venue, approve the Safe batch, and apply the exact .env block it prints.',
+      })
+    } else {
+      const sides = [
+        { asset: token0Asset, ct: collateralTracker0, key: 'token0' as const },
+        { asset: token1Asset, ct: collateralTracker1, key: 'token1' as const },
+      ]
+      const nativeSide = sides.find(
+        ({ asset }) => asset.toLowerCase() === zeroAddress.toLowerCase(),
+      )
+      const weth9 = walletWethAddress(config)
+      const approvals: SfpmSwapConfigureInput['approvals'] = []
+      for (const side of sides) {
+        if (side.asset.toLowerCase() === zeroAddress.toLowerCase()) continue
+        approvals.push({ token: side.asset, spender: sfpmAddress })
+        approvals.push({ token: side.asset, spender: side.ct })
+      }
+      if (nativeSide && weth9) {
+        approvals.push({ token: weth9, spender: sfpmAddress })
+      }
+      sfpmSwap = {
+        sfpm: sfpmAddress,
+        collateralTracker0,
+        collateralTracker1,
+        adapter: CANONICAL_ADAPTERS.SfpmSwapCondition,
+        poolIdPin: config.SFPM_SWAP_POOL_ID,
+        multiSendCallOnly: config.MULTISEND_CALL_ONLY_ADDRESS,
+        multiSendUnwrapper: config.MULTISEND_UNWRAPPER_ADDRESS,
+        nativeCollateral: nativeSide?.key ?? 'none',
+        weth9,
+        approvals,
+      }
+      try {
+        await verifySfpmSwapReady(publicClient, {
+          safeAddress: config.SAFE_ADDRESS,
+          rolesModifierAddress: config.ROLES_MODIFIER_ADDRESS,
+          roleKey: config.ROLE_KEY,
+          deploymentBlock: await findContractDeploymentBlock(
+            publicClient,
+            config.ROLES_MODIFIER_ADDRESS,
+          ),
+          sfpmSwap,
+        })
+        push({
+          id: 'sfpm-authorization',
+          title: 'SFPM venue authorization',
+          status: 'pass',
+          detail: 'handler, Roles scopes, MultiSend unwrapper, and token approvals verified',
+        })
+      } catch (err) {
+        push({
+          id: 'sfpm-authorization',
+          title: 'SFPM venue authorization',
+          status: 'fail',
+          detail: msg(err),
+          remedy: 'Run pnpm migrate:sfpm-venue, approve the Safe batch, then re-run doctor.',
+        })
+      }
+    }
   }
 
   // 7b. Deleverager scope (only when enabled): zero sizes pass, non-zero blocked.
@@ -363,7 +490,7 @@ export async function runDoctorChecks(
 
   if (botAddress && supportedProfile) {
     try {
-      await verifyExactAuthorizationManifest({
+      const manifestDiff = await inspectExactAuthorizationManifest({
         publicClient,
         rolesModifierAddress: config.ROLES_MODIFIER_ADDRESS,
         botAddress,
@@ -376,23 +503,53 @@ export async function runDoctorChecks(
         deleverager: config.DELEVERAGER_ENABLED
           ? { member: botAddress, roleKey: deleveragerRoleKey(config) }
           : undefined,
+        sfpmSwap: sfpmSwap
+          ? {
+              roleKey: config.ROLE_KEY,
+              safe: config.SAFE_ADDRESS,
+              sfpm: sfpmSwap.sfpm,
+              collateralTracker0: sfpmSwap.collateralTracker0,
+              collateralTracker1: sfpmSwap.collateralTracker1,
+              adapter: sfpmSwap.adapter,
+              poolIdPin: sfpmSwap.poolIdPin,
+              multiSendCallOnly: sfpmSwap.multiSendCallOnly,
+              multiSendUnwrapper: sfpmSwap.multiSendUnwrapper,
+              nativeCollateral: sfpmSwap.nativeCollateral,
+              weth9: sfpmSwap.weth9,
+            }
+          : undefined,
       })
-      push({
-        id: 'permission-manifest',
-        title: 'Complete Roles permission manifest',
-        status: 'pass',
-        detail: config.DELEVERAGER_ENABLED
-          ? 'exactly one member with the reviewed loan-only + burn-only deleverager function scopes'
-          : 'exactly one member, role, pool target, and reviewed loan-only function scope',
-      })
+      const mismatch =
+        manifestDiff.missing.length > 0 ||
+        manifestDiff.unexpected.length > 0 ||
+        manifestDiff.changed.length > 0
+      if (mismatch) {
+        push({
+          id: 'permission-manifest',
+          title: 'Complete Roles permission manifest',
+          status: 'fail',
+          detail: formatAuthorizationManifestDiff(manifestDiff),
+          remedy:
+            'Run `pnpm onboard`; it will keep this Safe and offer a fresh dedicated modifier.',
+        })
+      } else {
+        push({
+          id: 'permission-manifest',
+          title: 'Complete Roles permission manifest',
+          status: 'pass',
+          detail:
+            `exact reviewed loan-only permission graph` +
+            `${config.DELEVERAGER_ENABLED ? ' + burn-only deleverager' : ''}` +
+            `${sfpmSwap ? ' + SFPM venue' : ''}`,
+        })
+      }
     } catch (err) {
       push({
         id: 'permission-manifest',
         title: 'Complete Roles permission manifest',
-        status: 'warn',
+        status: 'fail',
         detail: msg(err),
-        remedy:
-          'Review stale permissions; re-onboard with a fresh modifier/role for the exact manifest.',
+        remedy: 'Run `pnpm onboard`; it will keep this Safe and offer a fresh dedicated modifier.',
       })
     }
   } else {

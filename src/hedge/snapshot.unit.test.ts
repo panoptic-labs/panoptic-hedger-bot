@@ -23,13 +23,20 @@ describe('readHedgeSnapshot', () => {
     const positions = [{ tokenId: 7n, legs: [], positionSize: 1n, tickAtMint: 0n }]
     vi.mocked(readSafePositions).mockResolvedValue({ positions, hedgePositions: [] })
     sdk.getBlockMeta.mockResolvedValue(blockMeta)
-    sdk.getPool.mockResolvedValue({ poolId: 1n })
+    sdk.getPool.mockResolvedValue({
+      poolId: 1n,
+      metadata: {
+        token0Asset: '0x3333333333333333333333333333333333333333',
+        token1Asset: '0x4444444444444444444444444444444444444444',
+      },
+    })
     sdk.getCollateralAddresses.mockReturnValue(['0x01', '0x02'])
     sdk.getAccountBuyingPower.mockResolvedValue({})
     sdk.getAccountCollateral.mockResolvedValue({})
     sdk.isLiquidatable.mockResolvedValue({ isLiquidatable: false })
     const publicClient = {
       getBlockNumber: vi.fn(async () => blockNumber),
+      readContract: vi.fn(async () => 0n),
     } as unknown as PublicClient
 
     await readHedgeSnapshot({

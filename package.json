@@ -11,6 +11,7 @@
     "start": "tsx src/main.ts",
     "onboard": "tsx scripts/setup.ts",
     "onboard:cleanup": "tsx scripts/onboardCleanup.ts",
+    "tune": "tsx scripts/tune.ts",
     "doctor": "tsx scripts/doctor.ts",
     "preflight": "tsx scripts/doctor.ts",
     "status": "tsx scripts/status.ts",
@@ -23,6 +24,7 @@
     "inspect:hedge": "tsx scripts/inspectHedge.ts",
     "deploy:safe-roles": "tsx scripts/deploySafeAndRoles.ts",
     "scope:bot-role": "tsx scripts/scopeBotRole.ts",
+    "migrate:sfpm-venue": "tsx scripts/migrateSfpmVenue.ts",
     "manage-role": "tsx scripts/manageRole.ts",
     "generate:idea": "tsx scripts/generateIdea.ts",
     "typecheck": "tsc --noEmit -p tsconfig.build.json",
@@ -34,7 +36,7 @@
     "docs:check": "node scripts/checkDocsLinks.mjs"
   },
   "dependencies": {
-    "@panoptic-eng/sdk": "1.0.31",
+    "@panoptic-eng/sdk": "1.0.33",
     "@tanstack/react-query": "5.45.1",
     "dotenv": "^17.2.3",
     "react": "18.2.0",

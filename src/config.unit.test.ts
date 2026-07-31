@@ -26,6 +26,19 @@ describe('parseHedgerBotConfig', () => {
     expect(cfg.PRICE_SIGNAL_SOURCE).toBe('pool-tick')
     expect(cfg.POLL_INTERVAL_MS).toBe(60_000)
     expect(cfg.DRY_RUN).toBe(false)
+    expect(cfg.SFPM_SWAP_PROVISIONED).toBe(false)
+  })
+
+  it('requires explicit SFPM provisioning before execution can be enabled', () => {
+    expect(() => parseHedgerBotConfig({ ...BASE_ENV, SFPM_SWAP_ENABLED: 'true' })).toThrow(
+      /explicitly provisioned/,
+    )
+  })
+
+  it('rejects v4 SFPM swap advertising', () => {
+    expect(() => parseHedgerBotConfig({ ...BASE_ENV, SFPM_SWAP_POOL_VERSION: 'v4' })).toThrow(
+      /SFPM_SWAP_POOL_VERSION/,
+    )
   })
 
   it('coerces DRY_RUN and numeric fields', () => {

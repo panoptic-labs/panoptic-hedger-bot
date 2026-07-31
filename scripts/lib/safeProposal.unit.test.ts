@@ -1,7 +1,15 @@
+import { mkdtempSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+
 import type { Address, Hex } from 'viem'
 import { describe, expect, it, vi } from 'vitest'
 
-import { buildSafeTransactionBuilderBatch, emitSafeTransactionBuilderBatch } from './safeProposal'
+import {
+  buildSafeTransactionBuilderBatch,
+  emitSafeTransactionBuilderBatch,
+  writeSafeTransactionBuilderBatch,
+} from './safeProposal'
 
 const SAFE: Address = '0x1111111111111111111111111111111111111111'
 const MODIFIER: Address = '0x2222222222222222222222222222222222222222'
@@ -50,5 +58,16 @@ describe('Safe administration proposals', () => {
     expect(stderr.mock.calls.flat().join(' ')).toContain('No transaction was sent')
     stdout.mockRestore()
     stderr.mockRestore()
+  })
+
+  it('writes clean importable JSON for interactive workflows', () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'hedger-safe-proposal-'))
+    const proposalPath = path.join(directory, 'proposal.json')
+
+    writeSafeTransactionBuilderBatch(proposalPath, params)
+
+    const batch = JSON.parse(readFileSync(proposalPath, 'utf8'))
+    expect(batch.version).toBe('1.0')
+    expect(batch.transactions).toHaveLength(2)
   })
 })

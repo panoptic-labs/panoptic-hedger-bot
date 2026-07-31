@@ -2,13 +2,17 @@ import 'dotenv/config'
 
 import { fileURLToPath } from 'node:url'
 
-import { createFileStorage, getPoolMetadata } from '@panoptic-eng/sdk/v2'
-import { createPublicClient, createWalletClient, fallback, http } from 'viem'
+import { createFileStorage, fetchSfpmV3PoolId, getPoolMetadata } from '@panoptic-eng/sdk/v2'
+import type { Address } from 'viem'
+import { createPublicClient, createWalletClient, fallback, http, parseAbi } from 'viem'
 
-import { deleveragerRoleKey, parseHedgerBotConfig } from './config'
+import { deleveragerRoleKey, parseHedgerBotConfig, walletWethAddress } from './config'
 import { createHedgeExecutor, createSamePoolLoanExecutor } from './executor'
+import { createSfpmSwapExecutor } from './executor/sfpmSwapExecutor'
 import { createGasPolicy } from './gas/gasPolicy'
-import { type CycleOutcome, HedgerBot } from './hedgerBot'
+import { createSfpmVenueCoordinator } from './hedge/sfpmVenueCoordinator'
+import { buildSwapPoolMapping } from './hedge/sfpmVenueRouter'
+import { type CycleOutcome, type HedgerBotDeps, HedgerBot } from './hedgerBot'
 import { createTelegramNotifier } from './notify/telegram'
 import { createPriceSignalSource } from './priceSignal'
 import { resolveCexAssetOrientation } from './priceSignal/cexSource'
@@ -21,6 +25,7 @@ import {
   startInstanceLeaseHeartbeat,
 } from './runtime/instanceLease'
 import { runtimeDataPath } from './runtime/paths'
+import { PendingSfpmSwapStore } from './runtime/pendingSfpmSwap'
 import {
   botVersion,
   clearRuntimeState,
@@ -245,6 +250,109 @@ async function main(): Promise<void> {
     initAttempts: 0,
   })
 
+  // Off-venue SFPM swap wiring. Resolves the swap pool + poolId, maps the v3
+  // pool's tokens to the options-pool CollateralTrackers by asset (handling the
+  // flipped ordering + native ETH↔WETH), and builds the executor + coordinator.
+  const NATIVE_ETH = '0x0000000000000000000000000000000000000000'
+  const weth9 = walletWethAddress(config)
+  async function buildSfpmVenue(): Promise<HedgerBotDeps['sfpmVenue']> {
+    if (!config.SFPM_SWAP_ENABLED || !config.SFPM_SWAP_POOL_ADDRESS) return undefined
+    const swapSfpm = config.SFPM_SWAP_ADDRESS_V3
+    if (!swapSfpm || !config.MULTISEND_CALL_ONLY_ADDRESS || !config.MULTISEND_UNWRAPPER_ADDRESS) {
+      throw new Error(
+        'SFPM_SWAP_ENABLED requires SFPM_SWAP_ADDRESS_V3 + MULTISEND_CALL_ONLY_ADDRESS + MULTISEND_UNWRAPPER_ADDRESS',
+      )
+    }
+    const swapPool = config.SFPM_SWAP_POOL_ADDRESS
+    const poolTokensAbi = parseAbi([
+      'function token0() view returns (address)',
+      'function token1() view returns (address)',
+    ])
+    const [swapToken0, swapToken1] = (await Promise.all([
+      publicClient.readContract({ address: swapPool, abi: poolTokensAbi, functionName: 'token0' }),
+      publicClient.readContract({ address: swapPool, abi: poolTokensAbi, functionName: 'token1' }),
+    ])) as [Address, Address]
+
+    const isNative = (asset: Address): boolean => asset.toLowerCase() === NATIVE_ETH
+    if ((isNative(metadata.token0Asset) || isNative(metadata.token1Asset)) && !weth9) {
+      throw new Error(
+        'WETH_ADDRESS is required when an options-pool collateral asset is native ETH',
+      )
+    }
+
+    const poolId =
+      config.SFPM_SWAP_POOL_ID ??
+      (await fetchSfpmV3PoolId({
+        client: asSdkClient<typeof fetchSfpmV3PoolId>(publicClient),
+        sfpmAddress: swapSfpm,
+        token0: swapToken0,
+        token1: swapToken1,
+        fee: config.SFPM_SWAP_FEE,
+      }))
+
+    const mapping = buildSwapPoolMapping({
+      optionsAsset0: metadata.token0Asset,
+      optionsAsset1: metadata.token1Asset,
+      swapToken0,
+      swapToken1,
+      weth9: weth9 ?? swapToken1,
+    })
+
+    // For each swap-pool token index, the CollateralTracker + native flag of the
+    // options collateral it corresponds to (invert the mapping).
+    const collateralForSwapIndex = (swapIndex: 0 | 1) => {
+      const tt: 0 | 1 = mapping.tokenTypeToSwapIndex[0] === swapIndex ? 0 : 1
+      return {
+        collateralTracker: (tt === 0
+          ? metadata.collateralToken0Address
+          : metadata.collateralToken1Address) as Address,
+        asset: tt === 0 ? metadata.token0Asset : metadata.token1Asset,
+        native: isNative(tt === 0 ? metadata.token0Asset : metadata.token1Asset),
+      }
+    }
+
+    const slippageBps = BigInt(config.SFPM_SWAP_SLIPPAGE_BPS ?? config.SLIPPAGE_BPS)
+    const sfpmExecutor = createSfpmSwapExecutor({
+      publicClient,
+      safeAddress: config.SAFE_ADDRESS,
+      rolesExecutor,
+      sfpmAddress: swapSfpm,
+      swapPoolAddress: swapPool,
+      swapPoolId: poolId,
+      token0Collateral: collateralForSwapIndex(0),
+      token1Collateral: collateralForSwapIndex(1),
+      weth9,
+      slippageBps,
+      multiSendCallOnly: config.MULTISEND_CALL_ONLY_ADDRESS,
+      dryRun: config.DRY_RUN,
+    })
+    const coordinator = createSfpmVenueCoordinator({
+      publicClient,
+      poolAddress: config.POOL_ADDRESS,
+      safeAddress: config.SAFE_ADDRESS,
+      builderCode: parseBuilderCode(config.PANOPTIC_BUILDER_CODE),
+      chainId: BigInt(config.CHAIN_ID),
+      swapPoolAddress: swapPool,
+      swapToken0,
+      swapToken1,
+      swapFee: BigInt(config.SFPM_SWAP_FEE),
+      mapping,
+      slippageBps,
+      minSavingsBps: config.SFPM_SWAP_MIN_SAVINGS_BPS,
+    })
+    botLog(`[hedger-bot] off-venue SFPM swap enabled (pool ${swapPool}, poolId ${poolId})`)
+    return { coordinator, sfpmExecutor }
+  }
+
+  const sfpmVenue = await buildSfpmVenue()
+  const pendingSwapStore = new PendingSfpmSwapStore({
+    chainId: config.CHAIN_ID,
+    safe: config.SAFE_ADDRESS,
+    pool: config.POOL_ADDRESS,
+    sfpm: config.SFPM_SWAP_ADDRESS_V3,
+    swapPool: config.SFPM_SWAP_POOL_ADDRESS,
+  })
+
   const bot = new HedgerBot({
     config,
     publicClient,
@@ -253,6 +361,8 @@ async function main(): Promise<void> {
     executor,
     rolesExecutor,
     deleveragerExecutor,
+    sfpmVenue,
+    pendingSwapStore,
     notifier,
     gasPolicy,
     hedgeJournal,

@@ -18,15 +18,22 @@ import {
   createTestClient,
   createWalletClient,
   http,
+  pad,
+  parseAbi,
   parseEther,
+  zeroAddress,
 } from 'viem'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import { mainnet } from 'viem/chains'
 import { beforeAll, describe, expect, it } from 'vitest'
 
 import { parseHedgerBotConfig } from '../src/config'
+import { assertSafeCanReceiveErc1155, readSafeFallbackHandler } from '../src/safe/erc1155Receiver'
 import { rolesModifierV2Abi } from '../src/safe/rolesAbi'
-import { verifyExactAuthorizationManifest } from './lib/authorizationManifest'
+import {
+  verifyExactAuthorizationManifest,
+  verifySfpmSwapAuthorization,
+} from './lib/authorizationManifest'
 import {
   buildConfigureCalls,
   buildSafeSetupInitializer,
@@ -36,9 +43,14 @@ import {
 } from './lib/deployCore'
 import { renderEnvFile } from './lib/renderEnv'
 import { execFromSoleOwner } from './lib/safeExec'
-import { getSafeZodiacAddresses, verifySafeAndRolesProxyIdentities } from './lib/safeZodiacRegistry'
+import {
+  getSafeZodiacAddresses,
+  MULTISEND_UNWRAPPER,
+  verifySafeAndRolesProxyIdentities,
+} from './lib/safeZodiacRegistry'
 import { fetchProxyCreationCode, makeSafeAddressPredictor } from './lib/vanitySafe'
 import { verifyDeleveragerScope, verifyLoanOnlyScope } from './lib/verifyScope'
+import { resolveSfpmSwap } from './setup'
 
 const RPC_URL = process.env.HEDGER_FORK_RPC_URL
 if (!RPC_URL) {
@@ -104,7 +116,10 @@ describe('hedger-bot setup core (mainnet fork)', () => {
     const predict = makeSafeAddressPredictor({
       factory: addresses.safeProxyFactory,
       singleton: addresses.safeSingleton,
-      initializer: buildSafeSetupInitializer(deployer.address),
+      initializer: buildSafeSetupInitializer(
+        deployer.address,
+        addresses.compatibilityFallbackHandler,
+      ),
       proxyCreationCode,
     })
     expect(predict(424242n).toLowerCase()).toBe(result.safeAddress.toLowerCase())
@@ -254,6 +269,106 @@ describe('hedger-bot setup core (mainnet fork)', () => {
     expect(() => parseHedgerBotConfig(env)).not.toThrow()
   }, 120_000)
 
+  // Zero-touch off-venue SFPM swap: onboard resolves the swap wiring from the
+  // deployments registry and applies it in the configure batch. Deploy a fresh
+  // Safe with the resolved sfpmSwap config and prove the swap surface is live on
+  // the new modifier/Safe: ERC-1155 receiver + scopes + all approvals live.
+  it('onboards every off-venue SFPM prerequisite from the registry', async () => {
+    const addresses = getSafeZodiacAddresses(CHAIN_ID)
+    const walletClient = createWalletClient({
+      account: deployer,
+      chain: mainnet,
+      transport: http(RPC_URL),
+    })
+
+    // The real resolver the wizard uses — reads the registry + live pool metadata.
+    const sfpm = await resolveSfpmSwap({
+      chainId: CHAIN_ID,
+      poolAddress: POOL_ADDRESS,
+      publicClient,
+      multiSendCallOnly: addresses.multiSend,
+    })
+    if (!sfpm) throw new Error('expected a registry sfpmSwap entry for mainnet')
+    // Prefilled env carries the current v3 SFPM + 5bps pool from the registry.
+    expect(sfpm.env.SFPM_SWAP_ADDRESS_V3?.toLowerCase()).toBe(
+      '0x00000000000005e4693adc8ec0f12d686f728198',
+    )
+    expect(sfpm.env.SFPM_SWAP_POOL_ID).toBe('2824133844976349')
+    expect(sfpm.env.MULTISEND_UNWRAPPER_ADDRESS).toBe(MULTISEND_UNWRAPPER)
+
+    const result = await deploySafeAndRoles({
+      publicClient,
+      walletClient,
+      botAddress: bot.address,
+      poolAddress: POOL_ADDRESS,
+      roleKey,
+      addresses,
+      saltNonce: 909090n,
+      sfpmSwap: sfpm.configure,
+      log: () => {},
+    })
+
+    // 1. The Safe is born with the reviewed ERC-1155-compatible fallback handler.
+    expect(await readSafeFallbackHandler(publicClient, result.safeAddress)).toBe(
+      addresses.compatibilityFallbackHandler,
+    )
+    await expect(
+      assertSafeCanReceiveErc1155({
+        publicClient,
+        safeAddress: result.safeAddress,
+        tokenAddress: sfpm.configure.sfpm,
+      }),
+    ).resolves.toBeUndefined()
+
+    // 2. The complete SFPM-specific Roles subset is live.
+    const deploymentBlock = result.rolesDeploymentBlock
+    if (deploymentBlock === undefined) throw new Error('expected roles deployment block')
+    await expect(
+      verifySfpmSwapAuthorization({
+        publicClient,
+        rolesModifierAddress: result.rolesModifierAddress,
+        deploymentBlock,
+        roleKey,
+        safe: result.safeAddress,
+        sfpm: sfpm.configure.sfpm,
+        collateralTracker0: sfpm.configure.collateralTracker0,
+        collateralTracker1: sfpm.configure.collateralTracker1,
+        adapter: sfpm.configure.adapter,
+        poolIdPin: sfpm.configure.poolIdPin,
+        multiSendCallOnly: sfpm.configure.multiSendCallOnly,
+        multiSendUnwrapper: sfpm.configure.multiSendUnwrapper,
+        nativeCollateral: sfpm.configure.nativeCollateral,
+        weth9: sfpm.configure.weth9,
+      }),
+    ).resolves.toBeUndefined()
+
+    // The direct mapping agrees for the MultiSend unwrapper.
+    const key = pad(
+      `0x${((BigInt(addresses.multiSend) << 96n) | (BigInt('0x8d80ff0a') << 64n)).toString(16)}`,
+      { size: 32 },
+    )
+    const unwrapper = await publicClient.readContract({
+      address: result.rolesModifierAddress,
+      abi: parseAbi(['function unwrappers(bytes32) view returns (address)']),
+      functionName: 'unwrappers',
+      args: [key],
+    })
+    expect(unwrapper.toLowerCase()).toBe(MULTISEND_UNWRAPPER.toLowerCase())
+
+    // 3. All three approvals set from the Safe (swap ERC20s -> SFPM, USDC -> USDC CT).
+    const erc20 = parseAbi(['function allowance(address,address) view returns (uint256)'])
+    const allowance = (token: `0x${string}`, spender: `0x${string}`) =>
+      publicClient.readContract({
+        address: token,
+        abi: erc20,
+        functionName: 'allowance',
+        args: [result.safeAddress, spender],
+      })
+    for (const { token, spender } of sfpm.configure.approvals) {
+      expect(await allowance(token, spender)).toBe((1n << 256n) - 1n)
+    }
+  }, 120_000)
+
   // Opt-in deleverager: deploy a fresh Safe scoping BOTH the loan role and the
   // bot-held burn-only deleverager role, then prove the burn-only boundary on
   // the real Roles v2.1 mastercopy (zero sizes pass, non-zero blocked) and that
@@ -374,7 +489,11 @@ describe('hedger-bot setup core (mainnet fork)', () => {
       address: addresses.safeProxyFactory,
       abi: factoryAbi,
       functionName: 'createProxyWithNonce',
-      args: [addresses.safeSingleton, buildSafeSetupInitializer(owner.address), 987654n],
+      args: [
+        addresses.safeSingleton,
+        buildSafeSetupInitializer(owner.address, zeroAddress),
+        987654n,
+      ],
     })
     const createReceipt = await publicClient.waitForTransactionReceipt({ hash: createHash })
     const safeAddress = extractEventAddress(
@@ -395,6 +514,13 @@ describe('hedger-bot setup core (mainnet fork)', () => {
         saltNonce: 987654n,
         log: () => {},
       })
+    const sfpm = await resolveSfpmSwap({
+      chainId: CHAIN_ID,
+      poolAddress: POOL_ADDRESS,
+      publicClient,
+      multiSendCallOnly: addresses.multiSend,
+    })
+    if (!sfpm) throw new Error('expected a registry sfpmSwap entry for mainnet')
 
     // Helper: the owner executes each printed configure call as a plain CALL.
     const execAsOwner = async (calls: ReturnType<typeof buildConfigureCalls>): Promise<void> => {
@@ -419,6 +545,8 @@ describe('hedger-bot setup core (mainnet fork)', () => {
         botAddress: bot.address,
         roleKey: existingRoleKey,
         poolAddress: POOL_ADDRESS,
+        sfpmSwap: sfpm.configure,
+        fallbackHandler: addresses.compatibilityFallbackHandler,
         includeEnableModule: true,
       }),
     )
@@ -431,6 +559,31 @@ describe('hedger-bot setup core (mainnet fork)', () => {
         poolAddress: POOL_ADDRESS,
         poolId: SYNTHETIC_POOL_ID,
         log: () => {},
+      }),
+    ).resolves.toBeUndefined()
+    await expect(
+      assertSafeCanReceiveErc1155({
+        publicClient,
+        safeAddress,
+        tokenAddress: sfpm.configure.sfpm,
+      }),
+    ).resolves.toBeUndefined()
+    await expect(
+      verifySfpmSwapAuthorization({
+        publicClient,
+        rolesModifierAddress: modifier,
+        deploymentBlock: modifierBlock,
+        roleKey: existingRoleKey,
+        safe: safeAddress,
+        sfpm: sfpm.configure.sfpm,
+        collateralTracker0: sfpm.configure.collateralTracker0,
+        collateralTracker1: sfpm.configure.collateralTracker1,
+        adapter: sfpm.configure.adapter,
+        poolIdPin: sfpm.configure.poolIdPin,
+        multiSendCallOnly: sfpm.configure.multiSendCallOnly,
+        multiSendUnwrapper: sfpm.configure.multiSendUnwrapper,
+        nativeCollateral: sfpm.configure.nativeCollateral,
+        weth9: sfpm.configure.weth9,
       }),
     ).resolves.toBeUndefined()
 

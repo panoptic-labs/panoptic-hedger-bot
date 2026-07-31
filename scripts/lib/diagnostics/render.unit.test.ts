@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { renderDoctor, renderStatus } from './render'
+import { doctorNextCommand, renderDoctor, renderStatus } from './render'
 import type { StatusSnapshot } from './status'
 
 describe('renderDoctor', () => {
@@ -22,6 +22,19 @@ describe('renderDoctor', () => {
         },
       ]),
     ).toBe(true)
+  })
+
+  it('routes permission failures into guided onboarding repair', () => {
+    expect(
+      doctorNextCommand([
+        {
+          id: 'permission-manifest',
+          title: 'Complete Roles permission manifest',
+          status: 'fail',
+          detail: 'unexpected member',
+        },
+      ]),
+    ).toBe('pnpm onboard')
   })
 })
 

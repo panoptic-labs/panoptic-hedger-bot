@@ -1,13 +1,21 @@
 import {
+  type ConditionFlat,
+  type ScopeStep,
   buildDeleveragerDispatchConditions,
   buildLoanOnlyDispatchConditions,
+  buildSfpmSwapVenueSteps,
   DELEVERAGER_ROLE_KEY,
 } from '@panoptic-eng/sdk/zodiac'
 import type { Address, Hex, PublicClient } from 'viem'
 import { encodeAbiParameters, encodeEventTopics, parseAbiItem } from 'viem'
 import { describe, expect, it, vi } from 'vitest'
 
-import { verifyExactAuthorizationManifest } from './authorizationManifest'
+import {
+  formatAuthorizationManifestDiff,
+  inspectExactAuthorizationManifest,
+  verifyExactAuthorizationManifest,
+  verifySfpmSwapAuthorization,
+} from './authorizationManifest'
 
 const MODIFIER: Address = '0x1111111111111111111111111111111111111111'
 const BOT: Address = '0x2222222222222222222222222222222222222222'
@@ -15,6 +23,14 @@ const EXTRA: Address = '0x3333333333333333333333333333333333333333'
 const POOL: Address = '0x4444444444444444444444444444444444444444'
 const ROLE = `0x${'55'.repeat(32)}` as Hex
 const DISPATCH = '0xc25813aa' as const
+const SAFE: Address = '0x7777777777777777777777777777777777777777'
+const SFPM: Address = '0x8888888888888888888888888888888888888888'
+const CT0: Address = '0x9999999999999999999999999999999999999999'
+const CT1: Address = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+const ADAPTER: Address = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+const MULTISEND: Address = '0xcccccccccccccccccccccccccccccccccccccccc'
+const UNWRAPPER: Address = '0xdddddddddddddddddddddddddddddddddddddddd'
+const WETH: Address = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
 
 const assignEvent = parseAbiItem(
   'event AssignRoles(address module, bytes32[] roleKeys, bool[] memberOf)',
@@ -42,6 +58,12 @@ const scopeFunctionEvent = {
     { name: 'options', type: 'uint8', indexed: false },
   ],
 } as const
+const allowFunctionEvent = parseAbiItem(
+  'event AllowFunction(bytes32 roleKey, address targetAddress, bytes4 selector, uint8 options)',
+)
+const setUnwrapAdapterEvent = parseAbiItem(
+  'event SetUnwrapAdapter(address to, bytes4 selector, address adapter)',
+)
 
 function log(topics: readonly (Hex | Hex[] | null)[], data: Hex) {
   // encodeEventTopics returns `[Hex, ...(Hex | Hex[] | null)[]]`; these events
@@ -106,6 +128,85 @@ function scopeTargetFor(role: Hex, target = POOL) {
   )
 }
 
+function scopeFunctionFor(
+  role: Hex,
+  target: Address,
+  selector: Hex,
+  conditions: readonly ConditionFlat[],
+  options: number,
+) {
+  return log(
+    encodeEventTopics({ abi: [scopeFunctionEvent], eventName: 'ScopeFunction' }),
+    encodeAbiParameters(
+      [
+        { type: 'bytes32' },
+        { type: 'address' },
+        { type: 'bytes4' },
+        {
+          type: 'tuple[]',
+          components: [
+            { name: 'parent', type: 'uint8' },
+            { name: 'paramType', type: 'uint8' },
+            { name: 'operator', type: 'uint8' },
+            { name: 'compValue', type: 'bytes' },
+          ],
+        },
+        { type: 'uint8' },
+      ],
+      [role, target, selector.slice(0, 10) as Hex, conditions, options],
+    ),
+  )
+}
+
+function allowFunctionFor(role: Hex, target: Address, selector: Hex, options: number) {
+  return log(
+    encodeEventTopics({ abi: [allowFunctionEvent], eventName: 'AllowFunction' }),
+    encodeAbiParameters(
+      [{ type: 'bytes32' }, { type: 'address' }, { type: 'bytes4' }, { type: 'uint8' }],
+      [role, target, selector.slice(0, 10) as Hex, options],
+    ),
+  )
+}
+
+function setUnwrapperFor(target: Address, selector: Hex, adapter: Address) {
+  return log(
+    encodeEventTopics({ abi: [setUnwrapAdapterEvent], eventName: 'SetUnwrapAdapter' }),
+    encodeAbiParameters(
+      [{ type: 'address' }, { type: 'bytes4' }, { type: 'address' }],
+      [target, selector.slice(0, 10) as Hex, adapter],
+    ),
+  )
+}
+
+function sfpmStepLog(step: ScopeStep) {
+  switch (step.functionName) {
+    case 'scopeTarget': {
+      const [role, target] = step.args as [Hex, Address]
+      return scopeTargetFor(role, target)
+    }
+    case 'scopeFunction': {
+      const [role, target, selector, conditions, options] = step.args as [
+        Hex,
+        Address,
+        Hex,
+        ConditionFlat[],
+        number,
+      ]
+      return scopeFunctionFor(role, target, selector, conditions, options)
+    }
+    case 'allowFunction': {
+      const [role, target, selector, options] = step.args as [Hex, Address, Hex, number]
+      return allowFunctionFor(role, target, selector, options)
+    }
+    case 'setTransactionUnwrapper': {
+      const [target, selector, adapter] = step.args as [Address, Hex, Address]
+      return setUnwrapperFor(target, selector, adapter)
+    }
+    case 'assignRoles':
+      throw new Error('unexpected role assignment in SFPM steps')
+  }
+}
+
 function deleveragerScopeFunction() {
   return log(
     encodeEventTopics({ abi: [scopeFunctionEvent], eventName: 'ScopeFunction' }),
@@ -160,8 +261,18 @@ describe('exact authorization manifest', () => {
   })
 
   it('rejects an extra member even when the reviewed probes would still pass', async () => {
-    await expect(verify([...reviewed, assign(EXTRA), enabled(EXTRA)])).rejects.toThrow(
-      /does not exactly match/,
+    const logs = [...reviewed, assign(EXTRA), enabled(EXTRA)]
+    await expect(verify(logs)).rejects.toThrow(`unexpected member ${EXTRA.toLowerCase()}`)
+    const diff = await inspectExactAuthorizationManifest({
+      publicClient: client(logs),
+      rolesModifierAddress: MODIFIER,
+      botAddress: BOT,
+      roleKey: ROLE,
+      poolAddress: POOL,
+      deploymentBlock: 10n,
+    })
+    expect(formatAuthorizationManifestDiff(diff)).toContain(
+      `unexpected enabled module ${EXTRA.toLowerCase()}`,
     )
   })
 
@@ -208,5 +319,57 @@ describe('exact authorization manifest', () => {
 
   it('rejects when the deleverager was expected but is absent on-chain', async () => {
     await expect(verifyWithDeleverager(reviewed)).rejects.toThrow(/does not exactly match/)
+  })
+})
+
+describe('SFPM authorization subset', () => {
+  const params = {
+    roleKey: ROLE,
+    safe: SAFE,
+    sfpm: SFPM,
+    collateralTracker0: CT0,
+    collateralTracker1: CT1,
+    adapter: ADAPTER,
+    poolIdPin: 123n,
+    multiSendCallOnly: MULTISEND,
+    multiSendUnwrapper: UNWRAPPER,
+    nativeCollateral: 'token0' as const,
+    weth9: WETH,
+  }
+  const reviewed = buildSfpmSwapVenueSteps(params).map(sfpmStepLog)
+  const verifySfpm = (logs: ReturnType<typeof log>[]) =>
+    verifySfpmSwapAuthorization({
+      publicClient: client(logs),
+      rolesModifierAddress: MODIFIER,
+      deploymentBlock: 10n,
+      ...params,
+    })
+
+  it('accepts the complete event-derived SFPM authorization subset', async () => {
+    await expect(verifySfpm(reviewed)).resolves.toBeUndefined()
+  })
+
+  it('rejects a stale SFPM authorization subset', async () => {
+    await expect(verifySfpm(reviewed.slice(0, -1))).rejects.toThrow(/missing or stale/)
+  })
+
+  it('admits the reviewed SFPM subset in the exact permission manifest', async () => {
+    await expect(
+      verifyExactAuthorizationManifest({
+        publicClient: client([
+          assign(BOT),
+          enabled(BOT),
+          scopeTarget(),
+          scopeFunction(),
+          ...reviewed,
+        ]),
+        rolesModifierAddress: MODIFIER,
+        botAddress: BOT,
+        roleKey: ROLE,
+        poolAddress: POOL,
+        deploymentBlock: 10n,
+        sfpmSwap: params,
+      }),
+    ).resolves.toBeUndefined()
   })
 })

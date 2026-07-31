@@ -1,6 +1,8 @@
 import {
+  type ScopeStep,
   buildDeleveragerDispatchConditions,
   buildLoanOnlyDispatchConditions,
+  buildSfpmSwapVenueSteps,
 } from '@panoptic-eng/sdk/zodiac'
 import type { Address, Hex, PublicClient } from 'viem'
 import { decodeEventLog, getAddress, zeroAddress } from 'viem'
@@ -290,11 +292,92 @@ function comparable(state: ManifestState) {
   }
 }
 
+export interface AuthorizationManifestDiff {
+  missing: string[]
+  unexpected: string[]
+  changed: string[]
+}
+
+function describeEntry(
+  field: keyof ReturnType<typeof comparable>,
+  key: string,
+  value?: unknown,
+): string {
+  const parts = key.split(':')
+  switch (field) {
+    case 'members':
+      return `member ${parts[1]} assigned to role ${parts[0]}`
+    case 'targets':
+      return `target ${parts[1]} under role ${parts[0]}`
+    case 'functions':
+      return `function ${parts[2]} on ${parts[1]} under role ${parts[0]}`
+    case 'enabledModules':
+      return `enabled module ${key}`
+    case 'defaultRoles':
+      return `default role for module ${key}`
+    case 'unwrappers':
+      return `transaction unwrapper for ${parts[0]} selector ${parts[1]}`
+    case 'allowances':
+      return `Roles allowance ${key}`
+    default:
+      return `${field} ${key}${value === undefined ? '' : ` (${JSON.stringify(value)})`}`
+  }
+}
+
+function diffComparable(
+  actual: ReturnType<typeof comparable>,
+  expected: ReturnType<typeof comparable>,
+): AuthorizationManifestDiff {
+  const diff: AuthorizationManifestDiff = { missing: [], unexpected: [], changed: [] }
+  for (const field of Object.keys(expected) as (keyof typeof expected)[]) {
+    const actualEntries = actual[field]
+    const expectedEntries = expected[field]
+    const actualMap = new Map(
+      actualEntries.map((entry) =>
+        Array.isArray(entry) ? [String(entry[0]), entry[1]] : [String(entry), true],
+      ),
+    )
+    const expectedMap = new Map(
+      expectedEntries.map((entry) =>
+        Array.isArray(entry) ? [String(entry[0]), entry[1]] : [String(entry), true],
+      ),
+    )
+    for (const [key, expectedValue] of expectedMap) {
+      if (!actualMap.has(key)) {
+        diff.missing.push(describeEntry(field, key, expectedValue))
+      } else if (JSON.stringify(actualMap.get(key)) !== JSON.stringify(expectedValue)) {
+        diff.changed.push(describeEntry(field, key, actualMap.get(key)))
+      }
+    }
+    for (const [key, actualValue] of actualMap) {
+      if (!expectedMap.has(key)) {
+        diff.unexpected.push(describeEntry(field, key, actualValue))
+      }
+    }
+  }
+  return diff
+}
+
+export function formatAuthorizationManifestDiff(
+  diff: AuthorizationManifestDiff,
+  limit = 6,
+): string {
+  const entries = [
+    ...diff.unexpected.map((entry) => `unexpected ${entry}`),
+    ...diff.changed.map((entry) => `changed ${entry}`),
+    ...diff.missing.map((entry) => `missing ${entry}`),
+  ]
+  const visible = entries.slice(0, limit)
+  const remainder = entries.length - visible.length
+  return `${visible.join('; ')}${remainder > 0 ? `; plus ${remainder} more` : ''}`
+}
+
 function expectedManifest(
   botAddress: Address,
   roleKey: Hex,
   poolAddress: Address,
   deleverager?: { member: Address; roleKey: Hex },
+  sfpmSwap?: SfpmSwapAuthorization,
 ): ManifestState {
   const expected = emptyState()
   expected.members.set(`${roleKey.toLowerCase()}:${address(botAddress)}`, true)
@@ -319,11 +402,163 @@ function expectedManifest(
       conditions: normalizeConditions(buildDeleveragerDispatchConditions()),
     })
   }
+  if (sfpmSwap) {
+    const sfpmExpected = expectedSfpmSwapManifest(sfpmSwap)
+    for (const [key, value] of sfpmExpected.targets) expected.targets.set(key, value)
+    for (const [key, value] of sfpmExpected.functions) expected.functions.set(key, value)
+    for (const [key, value] of sfpmExpected.unwrappers) expected.unwrappers.set(key, value)
+  }
   return expected
 }
 
-/** Compare the complete final Roles event-derived graph to the reviewed in-pool manifest. */
-export async function verifyExactAuthorizationManifest(params: {
+function scopeStepHex(step: ScopeStep, index: number): Hex {
+  const value = step.args[index]
+  if (typeof value !== 'string' || !value.startsWith('0x')) {
+    throw new Error(`invalid ${step.functionName} argument ${index}`)
+  }
+  return value as Hex
+}
+
+function scopeStepNumber(step: ScopeStep, index: number): number {
+  const value = step.args[index]
+  if (typeof value !== 'number') {
+    throw new Error(`invalid ${step.functionName} argument ${index}`)
+  }
+  return value
+}
+
+function scopeStepConditions(
+  step: ScopeStep,
+  index: number,
+): readonly { parent: number; paramType: number; operator: number; compValue: Hex }[] {
+  const value = step.args[index]
+  if (!Array.isArray(value)) {
+    throw new Error(`invalid ${step.functionName} conditions`)
+  }
+  return value.map((condition) => {
+    if (!condition || typeof condition !== 'object') {
+      throw new Error(`invalid ${step.functionName} condition`)
+    }
+    const record = condition as Record<string, unknown>
+    if (
+      typeof record.parent !== 'number' ||
+      typeof record.paramType !== 'number' ||
+      typeof record.operator !== 'number' ||
+      typeof record.compValue !== 'string' ||
+      !record.compValue.startsWith('0x')
+    ) {
+      throw new Error(`invalid ${step.functionName} condition fields`)
+    }
+    return {
+      parent: record.parent,
+      paramType: record.paramType,
+      operator: record.operator,
+      compValue: record.compValue as Hex,
+    }
+  })
+}
+
+export interface SfpmSwapAuthorization {
+  roleKey: Hex
+  safe: Address
+  sfpm: Address
+  collateralTracker0: Address
+  collateralTracker1: Address
+  adapter: Address
+  poolIdPin: bigint
+  multiSendCallOnly: Address
+  multiSendUnwrapper: Address
+  nativeCollateral?: 'token0' | 'token1' | 'none'
+  weth9?: Address
+}
+
+function expectedSfpmSwapManifest(params: SfpmSwapAuthorization): ManifestState {
+  const expected = emptyState()
+  const steps = buildSfpmSwapVenueSteps(params)
+  for (const step of steps) {
+    switch (step.functionName) {
+      case 'scopeTarget': {
+        const roleKey = scopeStepHex(step, 0)
+        const target = scopeStepHex(step, 1)
+        expected.targets.set(roleTarget(roleKey, target), {
+          clearance: 'function',
+          options: 0,
+        })
+        break
+      }
+      case 'scopeFunction': {
+        const roleKey = scopeStepHex(step, 0)
+        const target = scopeStepHex(step, 1)
+        const selector = scopeStepHex(step, 2)
+        expected.functions.set(roleFunction(roleKey, target, selector), {
+          options: scopeStepNumber(step, 4),
+          conditions: normalizeConditions(scopeStepConditions(step, 3)),
+        })
+        break
+      }
+      case 'allowFunction': {
+        const roleKey = scopeStepHex(step, 0)
+        const target = scopeStepHex(step, 1)
+        const selector = scopeStepHex(step, 2)
+        expected.functions.set(roleFunction(roleKey, target, selector), {
+          options: scopeStepNumber(step, 3),
+          conditions: 'wildcard',
+        })
+        break
+      }
+      case 'setTransactionUnwrapper': {
+        const target = scopeStepHex(step, 0)
+        const selector = scopeStepHex(step, 1)
+        expected.unwrappers.set(
+          `${address(target)}:${selector.toLowerCase()}`,
+          address(scopeStepHex(step, 2)),
+        )
+        break
+      }
+      case 'assignRoles':
+        throw new Error('SFPM venue steps must not assign roles')
+    }
+  }
+  return expected
+}
+
+function assertExpectedSubset(
+  actual: ManifestState,
+  expected: ManifestState,
+  field: 'targets' | 'functions' | 'unwrappers',
+): void {
+  for (const [key, expectedValue] of expected[field]) {
+    const actualValue = actual[field].get(key)
+    if (JSON.stringify(actualValue) !== JSON.stringify(expectedValue)) {
+      throw new Error(`SFPM venue authorization is missing or stale: ${field}.${key}`)
+    }
+  }
+}
+
+/**
+ * Verify the complete SFPM-specific authorization subset without requiring the
+ * modifier to be dedicated to one pool. This supports existing Safes whose
+ * Roles modifier legitimately contains other additive pool/keeper scopes.
+ */
+export async function verifySfpmSwapAuthorization(
+  params: {
+    publicClient: PublicClient
+    rolesModifierAddress: Address
+    deploymentBlock: bigint
+  } & SfpmSwapAuthorization,
+): Promise<void> {
+  const actual = await reconstructManifest(
+    params.publicClient,
+    params.rolesModifierAddress,
+    params.deploymentBlock,
+  )
+  const expected = expectedSfpmSwapManifest(params)
+  assertExpectedSubset(actual, expected, 'targets')
+  assertExpectedSubset(actual, expected, 'functions')
+  assertExpectedSubset(actual, expected, 'unwrappers')
+}
+
+export interface ExactAuthorizationManifestParams {
   publicClient: PublicClient
   rolesModifierAddress: Address
   botAddress: Address
@@ -333,7 +568,15 @@ export async function verifyExactAuthorizationManifest(params: {
   // When set, the reviewed manifest additionally admits the burn-only
   // deleverager role for this member (and nothing else).
   deleverager?: { member: Address; roleKey: Hex }
-}): Promise<void> {
+  // When enabled, the exact reviewed graph additionally admits the canonical
+  // SFPM venue subset (and no unrelated targets/functions).
+  sfpmSwap?: SfpmSwapAuthorization
+}
+
+/** Return the exact event-derived difference from the reviewed permission graph. */
+export async function inspectExactAuthorizationManifest(
+  params: ExactAuthorizationManifestParams,
+): Promise<AuthorizationManifestDiff> {
   const actual = comparable(
     await reconstructManifest(
       params.publicClient,
@@ -342,13 +585,28 @@ export async function verifyExactAuthorizationManifest(params: {
     ),
   )
   const expected = comparable(
-    expectedManifest(params.botAddress, params.roleKey, params.poolAddress, params.deleverager),
+    expectedManifest(
+      params.botAddress,
+      params.roleKey,
+      params.poolAddress,
+      params.deleverager,
+      params.sfpmSwap,
+    ),
   )
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+  return diffComparable(actual, expected)
+}
+
+/** Compare the complete final Roles event-derived graph to the reviewed in-pool manifest. */
+export async function verifyExactAuthorizationManifest(
+  params: ExactAuthorizationManifestParams,
+): Promise<void> {
+  const diff = await inspectExactAuthorizationManifest(params)
+  if (diff.missing.length > 0 || diff.unexpected.length > 0 || diff.changed.length > 0) {
     throw new Error(
       `deployed Roles permission graph does not exactly match the reviewed single-member, ` +
-        `single-pool manifest (loan-only${params.deleverager ? ' + burn-only deleverager' : ''}); ` +
-        `re-onboard with a fresh role/modifier`,
+        `single-pool manifest (loan-only${params.deleverager ? ' + burn-only deleverager' : ''}` +
+        `${params.sfpmSwap ? ' + SFPM venue' : ''}); ` +
+        formatAuthorizationManifestDiff(diff),
     )
   }
 }

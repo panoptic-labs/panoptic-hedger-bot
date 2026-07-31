@@ -1,9 +1,11 @@
 import 'dotenv/config'
 
+import { fileURLToPath } from 'node:url'
+
 import { createMemoryStorage } from '@panoptic-eng/sdk/v2'
 import { createPublicClient, formatUnits, http } from 'viem'
 
-import { parseHedgerBotConfig } from '../src/config'
+import { type HedgerBotConfig, parseHedgerBotConfig, walletWethAddress } from '../src/config'
 import { protocolGenesisBlock } from '../src/constants/genesis'
 import { computeHedgePlan } from '../src/hedge/decision'
 import { assessSafety } from '../src/hedge/safety'
@@ -19,8 +21,14 @@ import { sanitizeError } from '../src/utils/sanitize'
  *
  *   pnpm inspect:hedge
  */
-async function main(): Promise<void> {
-  const config = parseHedgerBotConfig()
+export interface HedgeInspectionReceipt {
+  inspectedAt: string
+  blockNumber: bigint
+  action: string
+  driftBps: bigint
+}
+
+export async function runHedgeInspection(config: HedgerBotConfig): Promise<HedgeInspectionReceipt> {
   const chain = defineBotChain(config.CHAIN_ID, config.RPC_URL)
   const publicClient = createPublicClient({ chain, transport: http(config.RPC_URL) })
   const chainId = BigInt(config.CHAIN_ID)
@@ -29,6 +37,7 @@ async function main(): Promise<void> {
     poolAddress: config.POOL_ADDRESS,
     chainId,
     safeAddress: config.SAFE_ADDRESS,
+    weth9: walletWethAddress(config),
     storage: createMemoryStorage(),
     fromBlock: config.SYNC_FROM_BLOCK ?? protocolGenesisBlock(config.CHAIN_ID),
     lp: {
@@ -79,6 +88,7 @@ async function main(): Promise<void> {
   const plan = computeHedgePlan({
     pool: snapshot.pool,
     collateral: snapshot.collateral,
+    walletBalances: snapshot.walletBalances,
     signalTick: signal.tick,
     assetIndex: config.ASSET_INDEX as 0n | 1n,
     deltaThresholdBps: config.DELTA_THRESHOLD_BPS,
@@ -119,6 +129,9 @@ async function main(): Promise<void> {
   console.log(
     `collateral      token0.assets=${b.collateralToken0Assets}  token1.assets=${b.collateralToken1Assets}`,
   )
+  console.log(
+    `safe wallet     token0.assets=${b.walletToken0Assets}  token1.assets=${b.walletToken1Assets}`,
+  )
   console.log(`collateralDelta (asset-side, vault frame)            = ${h(b.collateralDelta)}`)
   const lpCount = snapshot.lp?.positions.length ?? 0
   const lpFresh = snapshot.lp?.fresh ?? false
@@ -157,9 +170,18 @@ async function main(): Promise<void> {
     closeTokenIds: plan.intent.closeTokenIds.map((id) => id.toString()),
     swapAtMint: plan.intent.swapAtMint,
   })
+  return {
+    inspectedAt: new Date().toISOString(),
+    blockNumber: snapshot.blockNumber,
+    action: plan.action,
+    driftBps: plan.driftBps,
+  }
 }
 
-main().catch((err) => {
-  console.error(sanitizeError(err))
-  process.exit(1)
-})
+const entrypoint = process.argv[1]
+if (entrypoint && fileURLToPath(import.meta.url) === entrypoint) {
+  runHedgeInspection(parseHedgerBotConfig()).catch((err) => {
+    console.error(sanitizeError(err))
+    process.exit(1)
+  })
+}

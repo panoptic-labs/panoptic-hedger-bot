@@ -12,6 +12,7 @@ import {
 } from './frame'
 import type { LpPositionForHedge } from './lpPositions'
 import type { HedgeSnapshot } from './snapshot'
+import { type SafeWalletBalances, EMPTY_SAFE_WALLET_BALANCES } from './walletBalances'
 
 /** A hedge loan position reduced to the fields the planner needs. `size` is a positive magnitude in vault-asset units. */
 export interface HedgeItem {
@@ -227,6 +228,8 @@ export function planHedge(
 export interface ComputeHedgePlanDeps {
   pool: HedgeSnapshot['pool']
   collateral: HedgeSnapshot['collateral']
+  /** Loose collateral assets held by the Safe at the snapshot block. */
+  walletBalances?: SafeWalletBalances
   /** Reference tick used to choose a collision-free loan strike. */
   signalTick: bigint
   assetIndex: 0n | 1n
@@ -261,7 +264,10 @@ export interface HedgeDeltaBreakdown {
   /** Raw CT collateral assets on each side (smallest units). */
   collateralToken0Assets: bigint
   collateralToken1Assets: bigint
-  /** Asset-side collateral in the vault frame (the delta it adds). */
+  /** Loose Safe balances, with ETH + WETH combined on a native side. */
+  walletToken0Assets: bigint
+  walletToken1Assets: bigint
+  /** Asset-side CT + loose-wallet collateral in the vault frame. */
   collateralDelta: bigint
   /** Delta of same-pair Uniswap LP positions (vault-asset frame). */
   lpDelta: bigint
@@ -298,10 +304,18 @@ export function computeHedgePlan(deps: ComputeHedgePlanDeps): HedgePlan {
   const markTick = pool.currentTick
   const collateralAssetSide =
     assetIndex === 0n ? collateral.token0.assets : collateral.token1.assets
+  const walletBalances = deps.walletBalances ?? EMPTY_SAFE_WALLET_BALANCES
+  const walletAssetSide =
+    assetIndex === 0n ? walletBalances.token0.total : walletBalances.token1.total
   // Delta is taken with respect to the vault asset, so the opposite collateral
   // balance is numeraire. The selected balance is already in the vault asset
   // frame; this identity conversion is therefore independent of markTick.
-  const collateralDelta = toVaultFrameAtTick(collateralAssetSide, assetIndex, assetIndex, markTick)
+  const collateralDelta = toVaultFrameAtTick(
+    collateralAssetSide + walletAssetSide,
+    assetIndex,
+    assetIndex,
+    markTick,
+  )
 
   const portfolioDelta = computePortfolioDeltaDetailed(
     deps.positions,
@@ -419,6 +433,8 @@ export function computeHedgePlan(deps: ComputeHedgePlanDeps): HedgePlan {
     positionsDelta,
     collateralToken0Assets: collateral.token0.assets,
     collateralToken1Assets: collateral.token1.assets,
+    walletToken0Assets: walletBalances.token0.total,
+    walletToken1Assets: walletBalances.token1.total,
     collateralDelta,
     lpDelta,
     lpIncluded,

@@ -11,7 +11,7 @@ import {
   getPoolMetadata,
   isSupportedChain,
 } from '@panoptic-eng/sdk/v2'
-import { DELEVERAGER_ROLE_KEY } from '@panoptic-eng/sdk/zodiac'
+import { CANONICAL_ADAPTERS, DELEVERAGER_ROLE_KEY } from '@panoptic-eng/sdk/zodiac'
 import {
   type PublicClient,
   createPublicClient,
@@ -31,12 +31,16 @@ import {
   parseHedgerBotConfig,
 } from '../src/config'
 import { readSafeLpPositions } from '../src/hedge/lpPositions'
+import { clearActivation } from '../src/runtime/activation'
+import { writeDeactivation } from '../src/runtime/deactivation'
 import {
   readSecureJson,
+  readSecureText,
   removeSecureFile,
   writeSecureJson,
   writeSecureText,
 } from '../src/runtime/secureFile'
+import { resolveBotAccount } from '../src/safe/resolveBotAccount'
 import { assertBotIsNotSafeOwner, BotIsSafeOwnerError } from '../src/security/safeOwnerInvariant'
 import { defineBotChain } from '../src/utils/chain'
 import { deriveBotPrivateKey } from '../src/utils/entropy'
@@ -52,15 +56,19 @@ import { runGenerateIdea } from './generateIdea'
 import {
   type ExtraRoleKind,
   type ExtraRoleSpec,
+  type SfpmSwapConfigureInput,
   buildSafeSetupInitializer,
   deploySafeAndRoles,
 } from './lib/deployCore'
+import { type EnvFileValue, updateEnvFile } from './lib/envFile'
 import { configureExistingSafe, readSafeOwners } from './lib/existingSafe'
+import { runGuidedActivation } from './lib/guidedActivation'
 import { loadKeystorePrivateKey } from './lib/loadKeystorePrivateKey'
 import { Prompter, validateAddress, validatePrivateKey, validateUrl } from './lib/prompts'
 import { type EnvValues, renderEnvFile } from './lib/renderEnv'
 import {
   getSafeZodiacAddresses,
+  MULTISEND_UNWRAPPER,
   SAFE_ZODIAC_ADDRESSES,
   verifySafeZodiacBytecode,
 } from './lib/safeZodiacRegistry'
@@ -119,6 +127,8 @@ interface DeployState {
   uniswapLpOwner?: `0x${string}`
   /** Fold Uniswap LP delta into the hedge (vs observe-only). */
   hedgeIncludeLp: boolean
+  /** Explicit consent to install the expanded SFPM swap authorization surface. */
+  sfpmSwapProvisioned: boolean
   storage: 'keystore' | 'plaintext'
   extraRoles: { kind: ExtraRoleKind; member: `0x${string}`; sizeCap?: string }[]
   /** Filled in by onDeployed as each contract lands, for a clean resume. */
@@ -154,6 +164,7 @@ export const deployStateSchema: z.ZodType<DeployState, z.ZodTypeDef, unknown> = 
     // Optional for resume compatibility: a version-1 state file written before
     // LP hedging existed has no hedgeIncludeLp; default it to observe-only.
     hedgeIncludeLp: z.boolean().optional().default(false),
+    sfpmSwapProvisioned: z.boolean().optional().default(false),
     storage: z.enum(['keystore', 'plaintext']),
     extraRoles: z.array(
       z
@@ -349,7 +360,7 @@ function fail(
   if (opts.keyPersisted) {
     console.error(
       `\n  ✓ The bot key IS saved (${KEYSTORE_PATH} / ${STATE_PATH}) — no funds can be lost.` +
-        `\n  Once any pending tx confirms, resume with:  pnpm onboard --resume` +
+        `\n  Once any pending tx confirms, resume with:  pnpm onboard` +
         `\n  (reuses the same key + salt, skips work already done on-chain).`,
     )
   } else if (opts.funded) {
@@ -363,29 +374,134 @@ function fail(
   process.exit(1)
 }
 
+function envUpdates(values: Partial<EnvValues>): Record<string, EnvFileValue> {
+  const updates: Record<string, EnvFileValue> = {}
+  for (const [key, value] of Object.entries(values)) {
+    if (
+      typeof value === 'string' ||
+      typeof value === 'number' ||
+      typeof value === 'bigint' ||
+      typeof value === 'boolean'
+    ) {
+      updates[key] = value
+    }
+  }
+  return updates
+}
+
+async function repairConfiguredBot(p: Prompter, envPath: string): Promise<void> {
+  const sfpmAlreadyRequested =
+    process.env.SFPM_SWAP_PROVISIONED?.toLowerCase() === 'true' ||
+    process.env.SFPM_SWAP_ENABLED?.toLowerCase() === 'true'
+  const config = parseHedgerBotConfig({
+    ...process.env,
+    // Repair must be able to start from inconsistent SFPM execution flags.
+    SFPM_SWAP_PROVISIONED: 'false',
+    SFPM_SWAP_ENABLED: 'false',
+  })
+  const account = await resolveBotAccount(config)
+  const chain = defineBotChain(config.CHAIN_ID, config.RPC_URL)
+  const publicClient = createPublicClient({ chain, transport: http(config.RPC_URL) })
+  const walletClient = createWalletClient({
+    account,
+    chain,
+    transport: http(config.RPC_URL),
+  })
+  const addresses = getSafeZodiacAddresses(config.CHAIN_ID)
+  await verifySafeZodiacBytecode(publicClient, addresses)
+  const metadata = await getPoolMetadata({
+    client: asSdkClient<typeof getPoolMetadata>(publicClient),
+    poolAddress: config.POOL_ADDRESS,
+  })
+  const sfpmRequested =
+    sfpmAlreadyRequested ||
+    (await p.confirm(
+      ' Provision the reviewed optional SFPM off-venue route during this repair?',
+      false,
+    ))
+  const sfpmSwap = sfpmRequested
+    ? await resolveSfpmSwap({
+        chainId: config.CHAIN_ID,
+        poolAddress: config.POOL_ADDRESS,
+        publicClient,
+        multiSendCallOnly: addresses.multiSend,
+      })
+    : undefined
+  if (sfpmRequested && !sfpmSwap) {
+    throw new Error(`no reviewed SFPM venue is available for chain ${config.CHAIN_ID}`)
+  }
+
+  // A repair can change the permission identity. Stop every send first and
+  // keep execution dry until the operator completes guided activation.
+  writeDeactivation()
+  clearActivation()
+  updateEnvFile(envPath, { DRY_RUN: true, SFPM_SWAP_ENABLED: false })
+
+  const wired = await configureExistingSafe({
+    publicClient,
+    chainId: config.CHAIN_ID,
+    walletClient,
+    prompter: p,
+    addresses,
+    safeAddress: config.SAFE_ADDRESS,
+    rolesModifierAddress: config.ROLES_MODIFIER_ADDRESS,
+    botAddress: account.address,
+    roleKey: config.ROLE_KEY,
+    poolAddress: config.POOL_ADDRESS,
+    poolId: metadata.poolId,
+    extraRoles: config.DELEVERAGER_ENABLED
+      ? [{ kind: 'deleverager', member: account.address }]
+      : [],
+    sfpmSwap: sfpmSwap?.configure,
+    saltNonce: randomSaltNonce(),
+    onModifierDeployed: (rolesModifierAddress) => {
+      updateEnvFile(envPath, {
+        ROLES_MODIFIER_ADDRESS: rolesModifierAddress,
+        DRY_RUN: true,
+        SFPM_SWAP_ENABLED: false,
+      })
+    },
+  })
+  updateEnvFile(envPath, {
+    ROLES_MODIFIER_ADDRESS: wired.rolesModifierAddress,
+    DRY_RUN: true,
+    SFPM_SWAP_ENABLED: false,
+    ...envUpdates(sfpmSwap?.env ?? {}),
+  })
+  console.log('\n✓ Existing Safe repaired and verified. Live trading remains disabled.')
+  if (await p.confirm(' Run guided validation and activation now?', false)) {
+    await runGuidedActivation({
+      config: parseHedgerBotConfig(dotenvObject(readSecureText(envPath, 1_048_576))),
+      envPath,
+      prompter: p,
+    })
+  } else {
+    console.log('  Next: run `pnpm activate` for guided validation and activation.')
+  }
+}
+
 async function main(): Promise<void> {
   const force = process.argv.includes('--force')
   const resume = process.argv.includes('--resume')
   const envPath = path.resolve(process.cwd(), '.env')
-
-  if (existsSync(envPath) && !force && !resume) {
-    console.error(`.env already exists at ${envPath}. Re-run with --force to overwrite.`)
-    process.exit(1)
-  }
-
   const p = new Prompter()
 
-  // ---- Resume path: continue an interrupted run from deploy-state.json --------
+  // ---- Resume path: continue an interrupted run from deploy-state.json ------
+  // Check this before rejecting an existing .env: repairing/re-onboarding an
+  // existing installation intentionally has both files present.
   if (resume || (existsSync(STATE_PATH) && !force)) {
     if (!existsSync(STATE_PATH)) {
-      console.error(`No ${STATE_PATH} to resume from. Run without --resume for a fresh setup.`)
+      console.error(`No interrupted onboarding was found. Run \`pnpm onboard\` to start setup.`)
       process.exit(1)
     }
     if (!resume) {
-      console.log(`\n Found an interrupted deployment (${STATE_PATH}).`)
-      if (!(await p.confirm(' Resume it (reuses the saved key + salt)?', true))) {
+      console.log(
+        '\n Found unfinished onboarding. Your saved key, addresses, and progress are intact.',
+      )
+      if (!(await p.confirm(' Continue where you left off?', true))) {
         console.error(
-          ' Not resuming. Delete deploy-state.json to start fresh, or pass --resume to continue.',
+          ' Nothing changed. Run `pnpm onboard` to continue, or ' +
+            '`pnpm onboard:cleanup --confirm` to discard the saved setup.',
         )
         p.close()
         process.exit(1)
@@ -399,6 +515,26 @@ async function main(): Promise<void> {
       p.close()
       fail('resume', err, { keyPersisted: true, funded: true })
     }
+  }
+
+  if (existsSync(envPath) && !force) {
+    console.log(`\n Found an existing hedger-bot configuration at ${envPath}.`)
+    console.log(
+      ' Repair keeps the Safe and bot key, pauses live trading, and verifies permissions.',
+    )
+    if (await p.confirm(' Inspect and repair this setup?', true)) {
+      try {
+        await repairConfiguredBot(p, envPath)
+        p.close()
+        return
+      } catch (err) {
+        p.close()
+        fail('repair existing setup', err, { keyPersisted: true, funded: true })
+      }
+    }
+    console.log(' Nothing changed. Run `pnpm status` to inspect the configured bot.')
+    p.close()
+    return
   }
 
   let keyPersisted = false
@@ -470,6 +606,18 @@ async function main(): Promise<void> {
     const extraRoles: ExtraRoleSpec[] = withDeleverager
       ? [{ kind: 'deleverager', member: botAccount.address }]
       : []
+    const registrySfpm = getChainDeployment(chainId)?.sfpmSwap
+    const sfpmSwapProvisioned =
+      registrySfpm?.version === 'v3'
+        ? await p.confirm(
+            'Provision the optional v3 SFPM off-venue swap surface? ' +
+              '(adds narrowly scoped swap/deposit permissions and token approvals)',
+            false,
+          )
+        : false
+    if (registrySfpm && registrySfpm.version !== 'v3') {
+      console.log('  → SFPM off-venue swap not offered: v4 PoolManager custody is not supported.')
+    }
 
     // Optional: mine a vanity Safe address. The Safe is a CREATE2 proxy whose
     // address is fixed by the saltNonce (given this deployer + chain), so salts
@@ -638,7 +786,10 @@ async function main(): Promise<void> {
         publicClient,
         addresses.safeProxyFactory,
       )
-      const initializer = buildSafeSetupInitializer(botAccount.address)
+      const initializer = buildSafeSetupInitializer(
+        botAccount.address,
+        addresses.compatibilityFallbackHandler,
+      )
       const startedAt = Date.now()
       const mined = await mineVanitySafeSalt({
         factory: addresses.safeProxyFactory,
@@ -698,6 +849,9 @@ async function main(): Promise<void> {
           : '   • LP delta is OBSERVE-ONLY (logged, not hedged) — flip HEDGE_INCLUDE_LP later to apply',
       )
     }
+    console.log(
+      `\n SFPM off-venue surface: ${sfpmSwapProvisioned ? 'PROVISION (execution remains disabled)' : 'not provisioned'}`,
+    )
     if (!(await p.confirm('\n Proceed?', false))) {
       console.log('Aborted. Nothing was deployed.')
       p.close()
@@ -738,6 +892,7 @@ async function main(): Promise<void> {
       dryRun,
       uniswapLpOwner,
       hedgeIncludeLp,
+      sfpmSwapProvisioned,
       storage: botStorage,
       extraRoles: extraRoles.map((r) => ({
         kind: r.kind,
@@ -846,6 +1001,74 @@ async function runResume(p: Prompter, state: DeployState, envPath: string): Prom
  * Shared tail for the fresh + resume paths: run the (resumable, batched) deploy,
  * verify the loan-only boundary, write `.env`, and clear the resume state.
  */
+const NATIVE_ASSET = '0x0000000000000000000000000000000000000000'
+
+/**
+ * Resolve the off-venue SFPM swap wiring for a chain from the deployments
+ * registry (zero-touch: all addresses come from the registry / SDK canonicals).
+ * Returns the configure-batch input (scope + approvals) and the prefilled env
+ * block, or undefined when the chain has no swap venue configured.
+ */
+export async function resolveSfpmSwap(args: {
+  chainId: number
+  poolAddress: `0x${string}`
+  publicClient: PublicClient
+  multiSendCallOnly: `0x${string}`
+}): Promise<{ configure: SfpmSwapConfigureInput; env: Partial<EnvValues> } | undefined> {
+  const market = getChainDeployment(args.chainId)?.sfpmSwap
+  if (!market) return undefined
+  if (market.version !== 'v3') return undefined
+
+  const metadata = await getPoolMetadata({
+    client: asSdkClient<typeof getPoolMetadata>(args.publicClient),
+    poolAddress: args.poolAddress,
+  })
+  const sides = [
+    { asset: metadata.token0Asset, ct: metadata.collateralToken0Address, key: 'token0' as const },
+    { asset: metadata.token1Asset, ct: metadata.collateralToken1Address, key: 'token1' as const },
+  ]
+  const nativeSide = sides.find((s) => s.asset.toLowerCase() === NATIVE_ASSET)
+  const nativeCollateral = nativeSide?.key ?? 'none'
+
+  // Approvals: each ERC20 collateral -> SFPM (swap input) + -> its CT (deposit
+  // leg). A native side deposits by value (no CT approval) but the SFPM pulls
+  // its wrapped form, so approve WETH -> SFPM when any side is native.
+  const approvals: Array<{ token: `0x${string}`; spender: `0x${string}` }> = []
+  for (const s of sides) {
+    if (s.asset.toLowerCase() === NATIVE_ASSET) continue
+    approvals.push({ token: s.asset, spender: market.sfpm })
+    approvals.push({ token: s.asset, spender: s.ct })
+  }
+  if (nativeSide) approvals.push({ token: market.weth, spender: market.sfpm })
+
+  const configure: SfpmSwapConfigureInput = {
+    sfpm: market.sfpm,
+    collateralTracker0: metadata.collateralToken0Address,
+    collateralTracker1: metadata.collateralToken1Address,
+    adapter: CANONICAL_ADAPTERS.SfpmSwapCondition,
+    poolIdPin: BigInt(market.poolId),
+    multiSendCallOnly: args.multiSendCallOnly,
+    multiSendUnwrapper: MULTISEND_UNWRAPPER,
+    nativeCollateral,
+    weth9: market.weth,
+    approvals,
+  }
+  const env: Partial<EnvValues> = {
+    // Off until the operator has run a DRY_RUN validation.
+    SFPM_SWAP_PROVISIONED: true,
+    SFPM_SWAP_ENABLED: false,
+    SFPM_SWAP_POOL_VERSION: 'v3',
+    SFPM_SWAP_ADDRESS_V3: market.sfpm,
+    SFPM_SWAP_POOL_ADDRESS: market.poolAddress,
+    SFPM_SWAP_POOL_ID: market.poolId,
+    SFPM_SWAP_FEE: market.fee,
+    WETH_ADDRESS: market.weth,
+    MULTISEND_CALL_ONLY_ADDRESS: args.multiSendCallOnly,
+    MULTISEND_UNWRAPPER_ADDRESS: MULTISEND_UNWRAPPER,
+  }
+  return { configure, env }
+}
+
 async function finalizeDeployment(args: {
   state: DeployState
   botKey: `0x${string}`
@@ -874,10 +1097,25 @@ async function finalizeDeployment(args: {
     rolesTxHash?: `0x${string}`
     configureTxHash?: `0x${string}`
   }
+  // Zero-touch off-venue SFPM swap: resolve scoping + approvals + prefilled env
+  // from the deployments registry (undefined when the chain has no swap venue).
+  const sfpmSwap = state.sfpmSwapProvisioned
+    ? await resolveSfpmSwap({
+        chainId: state.chainId,
+        poolAddress: state.poolAddress,
+        publicClient,
+        multiSendCallOnly: addresses.multiSend,
+      })
+    : undefined
+  if (state.sfpmSwapProvisioned && !sfpmSwap) {
+    throw new Error('explicit SFPM provisioning was requested, but no supported v3 venue exists')
+  }
+
   if (state.safeMode === 'existing') {
     if (!state.safeAddress) throw new Error('existing-Safe resume state missing safeAddress')
     const wired = await configureExistingSafe({
       publicClient,
+      chainId: state.chainId,
       walletClient,
       prompter,
       addresses,
@@ -888,6 +1126,7 @@ async function finalizeDeployment(args: {
       poolAddress: state.poolAddress,
       poolId,
       extraRoles: toExtraRoleSpecs(state),
+      sfpmSwap: sfpmSwap?.configure,
       saltNonce: BigInt(state.saltNonce),
       // Persist the modifier address as soon as it lands, for a clean resume.
       onModifierDeployed: async (rolesModifierAddress) => {
@@ -911,6 +1150,7 @@ async function finalizeDeployment(args: {
       addresses,
       saltNonce: BigInt(state.saltNonce),
       extraRoles: toExtraRoleSpecs(state),
+      sfpmSwap: sfpmSwap?.configure,
       finalSafeOwner: state.finalSafeOwner,
       known: { safeAddress: state.safeAddress, rolesModifierAddress: state.rolesModifierAddress },
       // Persist each address as it lands so a later failure resumes cleanly.
@@ -964,11 +1204,12 @@ async function finalizeDeployment(args: {
     UNISWAP_LP_OWNER: state.uniswapLpOwner,
     HEDGE_INCLUDE_LP: state.hedgeIncludeLp,
     DELEVERAGER_ENABLED: deleveragerSpec ? true : undefined,
+    ...sfpmSwap?.env,
   }
   const body = renderEnvFile(values)
 
   // Re-validate before writing, so a schema mismatch surfaces now.
-  parseHedgerBotConfig(dotenvObject(body))
+  const configured = parseHedgerBotConfig(dotenvObject(body))
 
   writeSecureText(envPath, body)
   console.log(`✓ Wrote ${envPath}`)
@@ -1012,7 +1253,7 @@ async function finalizeDeployment(args: {
     }
   }
 
-  console.log('\nNext steps:')
+  console.log('\nOperator notes:')
   console.log(`  Safe ${result.safeAddress} is owned by ${result.safeOwner}.`)
   console.log(
     `  1. (optional) Monitor this Safe on Telegram — open @panopticMonitorBot\n` +
@@ -1024,12 +1265,9 @@ async function finalizeDeployment(args: {
   console.log(
     `  3. As the Safe owner (${result.safeOwner}), buy options into the Safe + deposit collateral.`,
   )
-  console.log('  4. pnpm preflight          # read-only release checks')
-  console.log('  5. pnpm inspect:hedge      # dry-run one cycle')
-  console.log('  6. DRY_RUN=true pnpm start # full loop, simulated')
-  console.log('  7. pnpm activate           # bind approval to policy + artifact')
-  console.log('  8. pnpm start              # live only after activation')
-  console.log('  9. pnpm status && pnpm health')
+  console.log('  4. pnpm activate           # guided checks, inspection, and live approval')
+  console.log('  5. pnpm start              # live only after activation')
+  console.log('  6. pnpm status && pnpm health')
   if (state.uniswapLpOwner || state.hedgeIncludeLp) {
     console.log(
       '\n  Uniswap LP hedging is configured. In `pnpm inspect:hedge`, check the\n' +
@@ -1071,6 +1309,12 @@ async function finalizeDeployment(args: {
   } catch (err) {
     // Idea generation is a convenience — never let it fail a completed setup.
     console.warn(`  ⚠️  Could not generate a first-position idea: ${sanitizeError(err)}`)
+  }
+
+  if (await prompter.confirm('\nRun guided validation and activation now?', false)) {
+    await runGuidedActivation({ config: configured, envPath, prompter })
+  } else {
+    console.log('  The bot remains dry-run. Run `pnpm activate` when you are ready.')
   }
 }
 

@@ -7,12 +7,15 @@ import type { HedgeExecutor } from './types'
 
 export { createSamePoolLoanExecutor } from './samePoolLoanExecutor'
 export type {
+  CollateralSwapRequest,
+  CollateralSwapResult,
   HedgeAction,
   HedgeContext,
   HedgeExecutionResult,
   HedgeExecutor,
   HedgeFinalStatePreview,
   HedgeIntent,
+  HedgeSwapRequirement,
 } from './types'
 
 export interface CreateHedgeExecutorDeps {

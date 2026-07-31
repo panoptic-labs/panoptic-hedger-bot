@@ -137,6 +137,77 @@ describe('samePoolLoanExecutor.execute — FLIP (mint + burns)', () => {
   })
 })
 
+describe('samePoolLoanExecutor.executeOffVenue — replacement hedge', () => {
+  it('orders the no-swap mint before burns so borrowed tokens can fund repayment', async () => {
+    const roles = fakeRoles()
+    const exec = createSamePoolLoanExecutor({
+      poolAddress: POOL,
+      publicClient: PUBLIC_CLIENT,
+      safeAddress: SAFE,
+      rolesExecutor: roles,
+      dryRun: false,
+    })
+    await exec.executeOffVenue({
+      ...baseIntent,
+      action: 'shrink',
+      openTokenId: 99n,
+      openPositionSize: 500n,
+      closeTokenIds: [11n, 22n],
+    })
+    const d = decodeDispatch(roles.send.mock.calls[0][0].data)
+    expect(d.positionIdList).toEqual([99n, 11n, 22n])
+    expect(d.positionSizes).toEqual([500n, 0n, 0n])
+    expect(d.tickLimits).toEqual([
+      [MIN_TICK, MAX_TICK, 0],
+      [MIN_TICK, MAX_TICK, 0],
+      [MIN_TICK, MAX_TICK, 0],
+    ])
+  })
+})
+
+describe('samePoolLoanExecutor.executeCollateralSwap — balance-first exact input', () => {
+  it('mints a no-swap temporary loan then burns it with swapAtMint in one dispatch', async () => {
+    const roles = fakeRoles()
+    const exec = createSamePoolLoanExecutor({
+      poolAddress: POOL,
+      publicClient: PUBLIC_CLIENT,
+      safeAddress: SAFE,
+      rolesExecutor: roles,
+      builderCode: 7n,
+      dryRun: false,
+    })
+    const request = {
+      sellTokenType: 1 as const,
+      amountIn: 200_000_000n,
+      existingPositionIds: [11n, 22n],
+      poolId: 1n,
+      tickSpacing: 10n,
+      currentTick: 100n,
+      slippageBps: 30n,
+    }
+
+    await exec.simulateCollateralSwap?.(request)
+    const result = await exec.executeCollateralSwap?.(request)
+
+    expect(roles.simulate).toHaveBeenCalledTimes(1)
+    expect(roles.send).toHaveBeenCalledTimes(1)
+    const decoded = decodeDispatch(roles.send.mock.calls[0][0].data)
+    expect(decoded.positionIdList).toHaveLength(2)
+    expect(decoded.positionIdList[0]).toBe(decoded.positionIdList[1])
+    expect(decoded.finalPositionIdList).toEqual([11n, 22n])
+    expect(decoded.positionSizes).toEqual([200_000_000n, 0n])
+    expect(decoded.tickLimits).toEqual([
+      [MIN_TICK, MAX_TICK, 0],
+      [130, 70, 0],
+    ])
+    expect(result).toMatchObject({
+      transactionHash: '0xhash',
+      amountIn: 200_000_000n,
+      dryRun: false,
+    })
+  })
+})
+
 describe('samePoolLoanExecutor.execute — capacity overlay (no swap)', () => {
   it('uses full-range ascending limits when swapAtMint=false', async () => {
     const roles = fakeRoles()

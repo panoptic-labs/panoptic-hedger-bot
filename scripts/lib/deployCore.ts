@@ -4,6 +4,7 @@ import {
   buildLoanOnlyDispatchConditions,
   buildMaintenanceRoleSteps,
   buildRollerRoleSteps,
+  buildSfpmSwapVenueSteps,
   buildSizeAdjusterRoleSteps,
   CANONICAL_ADAPTERS,
   rolesV2Abi,
@@ -67,6 +68,13 @@ const safeAbi = [
     name: 'enableModule',
     stateMutability: 'nonpayable',
     inputs: [{ name: 'module', type: 'address' }],
+    outputs: [],
+  },
+  {
+    type: 'function',
+    name: 'setFallbackHandler',
+    stateMutability: 'nonpayable',
+    inputs: [{ name: 'handler', type: 'address' }],
     outputs: [],
   },
   {
@@ -168,18 +176,36 @@ const rolesSetUpAbi = [
   },
 ] as const
 
+const erc20ApproveAbi = [
+  {
+    type: 'function',
+    name: 'approve',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'spender', type: 'address' },
+      { name: 'amount', type: 'uint256' },
+    ],
+    outputs: [{ name: '', type: 'bool' }],
+  },
+] as const
+const MAX_UINT256 = (1n << 256n) - 1n
+
 /**
  * Encode the Safe `setup` initializer used at proxy creation: a single owner
- * (the deployer), threshold 1, and no module/fallback/payment. This is the
+ * (the deployer), threshold 1, the reviewed compatibility fallback handler,
+ * and no module/payment. This is the
  * `initializer` byte-string passed to `createProxyWithNonce`, so it must stay
  * byte-identical to the deploy call for CREATE2 address prediction (see
  * lib/vanitySafe.ts) to match the address the factory actually produces.
  */
-export function buildSafeSetupInitializer(owner: `0x${string}`): `0x${string}` {
+export function buildSafeSetupInitializer(
+  owner: `0x${string}`,
+  fallbackHandler: `0x${string}`,
+): `0x${string}` {
   return encodeFunctionData({
     abi: safeAbi,
     functionName: 'setup',
-    args: [[owner], 1n, zeroAddress, '0x', zeroAddress, zeroAddress, 0n, zeroAddress],
+    args: [[owner], 1n, zeroAddress, '0x', fallbackHandler, zeroAddress, 0n, zeroAddress],
   })
 }
 
@@ -335,6 +361,82 @@ export interface ConfigureCall {
  * these through a 1-of-1 Safe it transiently owns; the existing-Safe flow prints
  * them for the real owner to execute in the Safe UI.
  */
+/**
+ * Off-venue SFPM swap wiring for the configure batch: registers the MultiSend
+ * unwrapper, scopes SFPM.multicall + both CT withdraw/deposit (+ WETH9 wrap/unwrap
+ * for a native-ETH collateral) under the bot role, and appends Safe-authorized
+ * `ERC20.approve(SFPM, max)` so the SFPM can pull the Safe's tokens during the swap.
+ */
+export interface SfpmSwapConfigureInput {
+  sfpm: `0x${string}`
+  collateralTracker0: `0x${string}`
+  collateralTracker1: `0x${string}`
+  adapter: `0x${string}`
+  poolIdPin: bigint
+  multiSendCallOnly: `0x${string}`
+  multiSendUnwrapper: `0x${string}`
+  /** Which collateral asset is native ETH (its CT deposit is payable). */
+  nativeCollateral?: 'token0' | 'token1' | 'none'
+  /** WETH9 address — required when nativeCollateral is set. */
+  weth9?: `0x${string}`
+  /**
+   * Safe-authorized `approve(spender, max)` calls needed for the swap: the swap
+   * ERC20s -> SFPM (pulled during the Uniswap callback), and each non-native
+   * collateral asset -> its CollateralTracker (pulled by the deposit leg). The
+   * caller states these explicitly so no token-ordering is inferred here.
+   */
+  approvals: Array<{ token: `0x${string}`; spender: `0x${string}` }>
+}
+
+/**
+ * Build the complete, idempotent owner-authorized SFPM venue batch. Shared by
+ * initial onboarding and the existing-Safe migration command so neither path
+ * can drift to a partial permission/approval set.
+ */
+export function buildSfpmSwapConfigureCalls(params: {
+  safeAddress: `0x${string}`
+  rolesModifierAddress: `0x${string}`
+  roleKey: `0x${string}`
+  sfpmSwap: SfpmSwapConfigureInput
+}): ConfigureCall[] {
+  const steps = buildSfpmSwapVenueSteps({
+    roleKey: params.roleKey,
+    safe: params.safeAddress,
+    sfpm: params.sfpmSwap.sfpm,
+    collateralTracker0: params.sfpmSwap.collateralTracker0,
+    collateralTracker1: params.sfpmSwap.collateralTracker1,
+    adapter: params.sfpmSwap.adapter,
+    poolIdPin: params.sfpmSwap.poolIdPin,
+    multiSendCallOnly: params.sfpmSwap.multiSendCallOnly,
+    multiSendUnwrapper: params.sfpmSwap.multiSendUnwrapper,
+    nativeCollateral: params.sfpmSwap.nativeCollateral,
+    weth9: params.sfpmSwap.weth9,
+  })
+  const calls: ConfigureCall[] = steps.map((step) => ({
+    description: `${step.name} on the Roles modifier`,
+    to: params.rolesModifierAddress,
+    value: 0n,
+    data: encodeFunctionData({
+      abi: rolesV2Abi,
+      functionName: step.functionName,
+      args: step.args as never,
+    }),
+  }))
+  for (const { token, spender } of params.sfpmSwap.approvals) {
+    calls.push({
+      description: `approve(${spender}, max) for ${token} from the Safe`,
+      to: token,
+      value: 0n,
+      data: encodeFunctionData({
+        abi: erc20ApproveAbi,
+        functionName: 'approve',
+        args: [spender, MAX_UINT256],
+      }),
+    })
+  }
+  return calls
+}
+
 export function buildConfigureCalls(params: {
   safeAddress: `0x${string}`
   rolesModifierAddress: `0x${string}`
@@ -342,6 +444,9 @@ export function buildConfigureCalls(params: {
   roleKey: `0x${string}`
   poolAddress: `0x${string}`
   extraRoles?: ExtraRoleSpec[]
+  sfpmSwap?: SfpmSwapConfigureInput
+  /** Existing Safe only: set the reviewed handler when the Safe currently has none. */
+  fallbackHandler?: `0x${string}`
   /** Prepend `enableModule` (skip when the module is already enabled). */
   includeEnableModule: boolean
   /** Fresh deploy only: append `swapOwner` removing this deployer for finalSafeOwner. */
@@ -361,6 +466,19 @@ export function buildConfigureCalls(params: {
         abi: safeAbi,
         functionName: 'enableModule',
         args: [rolesModifierAddress],
+      }),
+    })
+  }
+
+  if (params.fallbackHandler) {
+    calls.push({
+      description: `setFallbackHandler(${params.fallbackHandler}) on the Safe`,
+      to: safeAddress,
+      value: 0n,
+      data: encodeFunctionData({
+        abi: safeAbi,
+        functionName: 'setFallbackHandler',
+        args: [params.fallbackHandler],
       }),
     })
   }
@@ -396,6 +514,17 @@ export function buildConfigureCalls(params: {
         args: step.args as never,
       }),
     })
+  }
+
+  if (params.sfpmSwap) {
+    calls.push(
+      ...buildSfpmSwapConfigureCalls({
+        safeAddress,
+        rolesModifierAddress,
+        roleKey,
+        sfpmSwap: params.sfpmSwap,
+      }),
+    )
   }
 
   if (
@@ -435,6 +564,8 @@ export interface DeploySafeAndRolesParams {
   saltNonce: bigint
   /** Optional extra keeper roles to scope (deleverager/maintenance/roller/size-adjuster). */
   extraRoles?: ExtraRoleSpec[]
+  /** Optional off-venue SFPM swap scoping + approvals to include in the configure batch. */
+  sfpmSwap?: SfpmSwapConfigureInput
   /**
    * Optional EOA to hand Safe ownership to at the end (dropping the deployer).
    * Lets a throwaway burner deploy + pay gas while the real owner — e.g. a
@@ -586,7 +717,10 @@ export async function deploySafeAndRoles(
     log(`→ Safe already deployed (${safeAddress}) — skipping`)
   } else {
     log('→ deploy Safe')
-    const safeSetup = buildSafeSetupInitializer(deployer.address)
+    const safeSetup = buildSafeSetupInitializer(
+      deployer.address,
+      addresses.compatibilityFallbackHandler,
+    )
     const safeReceipt = await write(
       addresses.safeProxyFactory,
       safeProxyFactoryAbi,
@@ -674,6 +808,7 @@ export async function deploySafeAndRoles(
       roleKey,
       poolAddress,
       extraRoles,
+      sfpmSwap: params.sfpmSwap,
       includeEnableModule: true,
       swapOwnerFrom: deployer.address,
       finalSafeOwner,

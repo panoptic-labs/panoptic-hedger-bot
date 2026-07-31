@@ -15,6 +15,7 @@ describe('getSafeZodiacAddresses', () => {
     expect(addrs.rolesMastercopy).toBe(ROLES_V2_1_MASTERCOPY)
     expect(addrs.safeProxyFactory).toMatch(/^0x[a-fA-F0-9]{40}$/)
     expect(addrs.safeSingleton).toMatch(/^0x[a-fA-F0-9]{40}$/)
+    expect(addrs.compatibilityFallbackHandler).toMatch(/^0x[a-fA-F0-9]{40}$/)
     expect(addrs.moduleProxyFactory).toMatch(/^0x[a-fA-F0-9]{40}$/)
     expect(addrs.multiSend).toMatch(/^0x[a-fA-F0-9]{40}$/)
   })
@@ -30,14 +31,16 @@ describe('getSafeZodiacAddresses', () => {
     const env = {
       SAFE_PROXY_FACTORY: A(1),
       SAFE_SINGLETON: A(2),
-      ZODIAC_MODULE_PROXY_FACTORY: A(3),
-      ROLES_MASTERCOPY: A(4),
-      SAFE_MULTISEND: A(5),
+      SAFE_COMPATIBILITY_FALLBACK_HANDLER: A(3),
+      ZODIAC_MODULE_PROXY_FACTORY: A(4),
+      ROLES_MASTERCOPY: A(5),
+      SAFE_MULTISEND: A(6),
     } as NodeJS.ProcessEnv
     const addrs = getSafeZodiacAddresses(999999, {}, env)
     expect(addrs.safeProxyFactory).toBe(A(1))
-    expect(addrs.rolesMastercopy).toBe(A(4))
-    expect(addrs.multiSend).toBe(A(5))
+    expect(addrs.compatibilityFallbackHandler).toBe(A(3))
+    expect(addrs.rolesMastercopy).toBe(A(5))
+    expect(addrs.multiSend).toBe(A(6))
   })
 
   it('throws listing the missing env vars for an unlisted chain', () => {
