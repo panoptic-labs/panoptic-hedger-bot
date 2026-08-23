@@ -2,7 +2,7 @@ import type { Account, PublicClient } from 'viem'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { HedgerBotConfig } from './config'
-import type { HedgeExecutionResult, HedgeExecutor } from './executor/types'
+import type { CollateralSwapRequest, HedgeExecutionResult, HedgeExecutor } from './executor/types'
 import { computeHedgePlan } from './hedge/decision'
 import { assessSafety } from './hedge/safety'
 import { readHedgeSnapshot } from './hedge/snapshot'
@@ -14,6 +14,7 @@ vi.mock('@panoptic-eng/sdk/v2', () => ({
   getPool: vi.fn(async () => ({
     healthStatus: 'active',
     poolKey: { tickSpacing: 10 },
+    tickSpacing: 10n,
     poolId: 1n,
     currentTick: 0n,
     metadata: {
@@ -74,6 +75,7 @@ const CONFIG = {
   DELEVERAGE_TARGET_MARGIN_BPS: 1_500n,
   DELEVERAGE_SLIPPAGE_BPS: 300,
   DELEVERAGE_COOLDOWN_MS: 300_000,
+  BALANCE_FIRST_ENABLED: true,
 } as unknown as HedgerBotConfig
 
 /** A permissive gas policy stub: never defers, never alerts. */
@@ -114,8 +116,10 @@ const snapshot = (
     positions,
     hedgePositions,
     pool: {
+      poolId: 1n,
       healthStatus: 'active',
       currentTick: 0n,
+      tickSpacing: 10n,
       poolKey: { tickSpacing: 10 },
       metadata: {
         token0Decimals: 18n,
@@ -124,6 +128,7 @@ const snapshot = (
         token1Symbol: 'USDC',
       },
     },
+    safeMode: { level: 0n, mode: 'normal' },
     buyingPower,
     collateral: { token0: { assets: 0n }, token1: { assets: 0n } },
     liquidation: {
@@ -145,7 +150,7 @@ const closeSevenPlan = {
   H: -20n,
   Hstar: 0n,
   driftBps: 0n,
-  triggers: { drift: false, overCap: false, signFlip: true },
+  triggers: { drift: false, timedDrift: false, overCap: false, signFlip: true },
   netDelta: -20n,
   portfolioSize: 100n,
   intent: {
@@ -170,7 +175,7 @@ const consolidatePlan = {
   H: -20n,
   Hstar: -20n,
   driftBps: 0n,
-  triggers: { drift: false, overCap: true, signFlip: false },
+  triggers: { drift: false, timedDrift: false, overCap: true, signFlip: false },
   netDelta: 0n,
   portfolioSize: 100n,
   intent: {
@@ -194,7 +199,7 @@ const openBalanceFirstPlan = {
   H: 0n,
   Hstar: 100n,
   driftBps: 1_000n,
-  triggers: { drift: true, overCap: false, signFlip: false },
+  triggers: { drift: true, timedDrift: false, overCap: false, signFlip: false },
   netDelta: -100n,
   portfolioSize: 1_000n,
   intent: {
@@ -225,6 +230,7 @@ async function makeBot(
       | 'notifier'
       | 'gasPolicy'
       | 'hedgeJournal'
+      | 'recordDeltaHedge'
     >
   > = {},
 ) {
@@ -279,11 +285,13 @@ async function makeBot(
     hedgeJournal: overrides.hedgeJournal ?? {
       begin: vi.fn(() => '00000000-0000-4000-8000-000000000001'),
       observeTransaction: vi.fn(),
+      recordBroadcastAttempt: vi.fn(),
       confirm: vi.fn(),
       fail: vi.fn(),
       recover: vi.fn(async () => undefined),
       checkpoint: () => ({}),
     },
+    recordDeltaHedge: overrides.recordDeltaHedge,
   })
   await bot.init()
   vi.mocked(notifier.notify).mockClear()
@@ -370,6 +378,57 @@ describe('HedgerBot gas deferral gate', () => {
     const { bot, execute } = await makeBot(deferResult, 'success') // driftBps=0
     await bot.runCycle('c1')
     expect(execute.mock.calls[0][1]).toMatchObject({ urgent: false })
+  })
+
+  it('keeps a timed-drift hedge on the routine gas policy', async () => {
+    const assess = vi.fn(openGasPolicy.assess)
+    vi.mocked(computeHedgePlan).mockReturnValue({
+      ...(closeSevenPlan as object),
+      driftBps: 150n,
+      triggers: { drift: false, timedDrift: true, overCap: false, signFlip: false },
+    } as never)
+    const { bot } = await makeBot(deferResult, 'success', {
+      gasPolicy: { ...openGasPolicy, assess },
+    })
+    await bot.runCycle('timed')
+    expect(assess).toHaveBeenCalledWith(false)
+  })
+})
+
+describe('HedgerBot timed cadence checkpoint', () => {
+  const live = {
+    transactionHash: '0x01',
+    receipt: null,
+    openedTokenId: null,
+    closedTokenIds: [7n],
+    dryRun: false,
+  } as unknown as HedgeExecutionResult
+
+  it('advances only after a confirmed delta-changing live action', async () => {
+    const recordDeltaHedge = vi.fn()
+    const { bot } = await makeBot(live, 'success', { recordDeltaHedge })
+    await bot.runCycle('c1')
+    expect(recordDeltaHedge).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not advance for a dry run or state-preserving consolidation', async () => {
+    const recordDeltaHedge = vi.fn()
+    const dry = { ...live, dryRun: true }
+    const dryBot = await makeBot(dry, 'success', { recordDeltaHedge })
+    await dryBot.bot.runCycle('dry')
+    expect(recordDeltaHedge).not.toHaveBeenCalled()
+
+    vi.mocked(computeHedgePlan).mockReturnValue(consolidatePlan)
+    const consolidateBot = await makeBot(live, 'success', {
+      recordDeltaHedge,
+      executor: {
+        kind: 'same-pool-loan',
+        previewFinalState: vi.fn(async () => ({ success: true, margin: defaultBuyingPower })),
+        execute: vi.fn(async () => live),
+      } as unknown as HedgeExecutor,
+    })
+    await consolidateBot.bot.runCycle('consolidate')
+    expect(recordDeltaHedge).not.toHaveBeenCalled()
   })
 })
 
@@ -459,6 +518,7 @@ describe('HedgerBot balance-first collateral swaps', () => {
       pool: {
         ...snapshot().pool,
         poolId: 1n,
+        tickSpacing: 10n,
         poolKey: { tickSpacing: 10 },
       },
       collateral: { token0: { assets: 0n }, token1: { assets: 200n } },
@@ -480,10 +540,20 @@ describe('HedgerBot balance-first collateral swaps', () => {
       amountIn: 200n,
       dryRun: false,
     }))
+    const previewFinalState = vi.fn(async () => ({
+      success: true as const,
+      margin: {
+        collateralBalance0: 10_000n,
+        requiredCollateral0: 0n,
+        collateralBalance1: 10_000n,
+        requiredCollateral1: 0n,
+      },
+    }))
     const { bot } = await makeBot({} as HedgeExecutionResult, 'success', {
       executor: {
         kind: 'same-pool-loan',
         execute,
+        previewFinalState,
         deriveSwapRequirement,
         simulateCollateralSwap,
         executeCollateralSwap,
@@ -492,7 +562,7 @@ describe('HedgerBot balance-first collateral swaps', () => {
 
     expect(await bot.runCycle('c1')).toBe('complete')
     expect(simulateCollateralSwap).toHaveBeenCalledWith(
-      expect.objectContaining({ sellTokenType: 1, amountIn: 199n }),
+      expect.objectContaining({ kind: 'exactIn', tokenType: 1, amountIn: 199n }),
     )
     expect(executeCollateralSwap).toHaveBeenCalledTimes(1)
     expect(execute).not.toHaveBeenCalled()
@@ -504,6 +574,7 @@ describe('HedgerBot balance-first collateral swaps', () => {
       pool: {
         ...snapshot().pool,
         poolId: 1n,
+        tickSpacing: 10n,
         poolKey: { tickSpacing: 10 },
       },
       collateral: { token0: { assets: 0n }, token1: { assets: 0n } },
@@ -525,6 +596,10 @@ describe('HedgerBot balance-first collateral swaps', () => {
       executor: {
         kind: 'same-pool-loan',
         execute,
+        previewFinalState: vi.fn(async () => ({
+          success: true as const,
+          margin: { token0: { free: 10_000n }, token1: { free: 10_000n } },
+        })),
         deriveSwapRequirement: vi.fn(async () => ({
           sellTokenType: 1 as const,
           amountIn: 200n,
@@ -567,6 +642,7 @@ describe('HedgerBot balance-first collateral swaps', () => {
       pool: {
         ...snapshot().pool,
         poolId: 1n,
+        tickSpacing: 10n,
         poolKey: { tickSpacing: 10 },
       },
       collateral: { token0: { assets: 0n }, token1: { assets: 200n } },
@@ -620,6 +696,145 @@ describe('HedgerBot balance-first collateral swaps', () => {
     expect(execute).toHaveBeenCalledTimes(1)
     expect(executeCollateralSwap).not.toHaveBeenCalled()
     expect(sfpmExecute).not.toHaveBeenCalled()
+  })
+})
+
+describe('HedgerBot SafeMode=1 credit-swap fallback', () => {
+  const receipt = {
+    status: 'success',
+    transactionHash: '0x05',
+    blockNumber: 126n,
+    blockHash: `0x${'12'.repeat(32)}`,
+  } as never
+
+  beforeEach(() => {
+    vi.mocked(computeHedgePlan).mockReturnValue(openBalanceFirstPlan)
+    vi.mocked(readHedgeSnapshot).mockResolvedValue({
+      ...snapshot(),
+      safeMode: { level: 1n, mode: 'restricted' },
+      pool: { ...snapshot().pool, healthStatus: 'low_liquidity' },
+      collateral: { token0: { assets: 1_000n }, token1: { assets: 0n } },
+    } as never)
+  })
+
+  it('buys the full hedge asset exact-out after the persistent loan simulation fails', async () => {
+    const execute = vi.fn()
+    const simulateCollateralSwap = vi.fn(async () => ({ amountIn: 500n, amountOut: 100n }))
+    const executeCollateralSwap = vi.fn(async () => ({
+      transactionHash: receipt.transactionHash,
+      receipt,
+      amountIn: 500n,
+      dryRun: false,
+    }))
+    const { bot } = await makeBot({} as HedgeExecutionResult, 'success', {
+      executor: {
+        kind: 'same-pool-loan',
+        execute,
+        previewFinalState: vi.fn(async () => ({ success: false as const, reason: 'SafeMode' })),
+        simulateCollateralSwap,
+        executeCollateralSwap,
+      } as unknown as HedgeExecutor,
+    })
+
+    expect(await bot.runCycle('safe-mode')).toBe('complete')
+    expect(simulateCollateralSwap).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'exactOut', tokenType: 1, amountOut: 100n }),
+    )
+    expect(executeCollateralSwap).toHaveBeenCalledTimes(1)
+    expect(execute).not.toHaveBeenCalled()
+  })
+
+  it('uses a collateral-limited exact-in partial hedge when full exact-out is unaffordable', async () => {
+    const simulateCollateralSwap = vi.fn(async (request: CollateralSwapRequest) =>
+      request.kind === 'exactOut'
+        ? { amountIn: 2_000n, amountOut: request.amountOut }
+        : { amountIn: request.amountIn, amountOut: 50n },
+    )
+    const executeCollateralSwap = vi.fn(async () => ({
+      transactionHash: receipt.transactionHash,
+      receipt,
+      amountIn: 995n,
+      dryRun: false,
+    }))
+    const { bot } = await makeBot({} as HedgeExecutionResult, 'success', {
+      executor: {
+        kind: 'same-pool-loan',
+        execute: vi.fn(),
+        previewFinalState: vi.fn(async () => ({ success: false as const, reason: 'SafeMode' })),
+        simulateCollateralSwap,
+        executeCollateralSwap,
+      } as unknown as HedgeExecutor,
+    })
+
+    expect(await bot.runCycle('safe-mode')).toBe('complete')
+    expect(executeCollateralSwap).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'exactIn', tokenType: 0, amountIn: 995n }),
+      expect.any(Object),
+    )
+  })
+
+  it('does not spend the full balance when the exact-out simulation fails', async () => {
+    const simulateCollateralSwap = vi.fn(async () => {
+      throw new Error('quote unavailable')
+    })
+    const executeCollateralSwap = vi.fn()
+    const execute = vi.fn()
+    const { bot } = await makeBot({} as HedgeExecutionResult, 'success', {
+      executor: {
+        kind: 'same-pool-loan',
+        execute,
+        previewFinalState: vi.fn(async () => ({ success: false as const, reason: 'SafeMode' })),
+        simulateCollateralSwap,
+        executeCollateralSwap,
+      } as unknown as HedgeExecutor,
+    })
+
+    expect(await bot.runCycle('safe-mode')).toBe('complete')
+    expect(simulateCollateralSwap).toHaveBeenCalledTimes(1)
+    expect(simulateCollateralSwap).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'exactOut' }),
+    )
+    expect(executeCollateralSwap).not.toHaveBeenCalled()
+    expect(execute).not.toHaveBeenCalled()
+  })
+
+  it('sells the hedge asset exact-in when the correction is negative', async () => {
+    vi.mocked(computeHedgePlan).mockReturnValue({
+      ...openBalanceFirstPlan,
+      H: 100n,
+      Hstar: 0n,
+    } as never)
+    vi.mocked(readHedgeSnapshot).mockResolvedValue({
+      ...snapshot(),
+      safeMode: { level: 1n, mode: 'restricted' },
+      pool: { ...snapshot().pool, healthStatus: 'low_liquidity' },
+      collateral: { token0: { assets: 0n }, token1: { assets: 1_000n } },
+    } as never)
+    const simulateCollateralSwap = vi.fn(async (request: CollateralSwapRequest) => ({
+      amountIn: request.kind === 'exactIn' ? request.amountIn : 0n,
+      amountOut: 80n,
+    }))
+    const executeCollateralSwap = vi.fn(async () => ({
+      transactionHash: receipt.transactionHash,
+      receipt,
+      amountIn: 100n,
+      dryRun: false,
+    }))
+    const { bot } = await makeBot({} as HedgeExecutionResult, 'success', {
+      executor: {
+        kind: 'same-pool-loan',
+        execute: vi.fn(),
+        previewFinalState: vi.fn(async () => ({ success: false as const, reason: 'SafeMode' })),
+        simulateCollateralSwap,
+        executeCollateralSwap,
+      } as unknown as HedgeExecutor,
+    })
+
+    expect(await bot.runCycle('safe-mode')).toBe('complete')
+    expect(executeCollateralSwap).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'exactIn', tokenType: 1, amountIn: 100n }),
+      expect.any(Object),
+    )
   })
 })
 
@@ -696,6 +911,7 @@ describe('HedgerBot off-venue transaction journal', () => {
           : '00000000-0000-4000-8000-000000000001'
       }),
       observeTransaction: vi.fn(),
+      recordBroadcastAttempt: vi.fn(),
       confirm: vi.fn((receipt) => order.push(`confirm:${receipt.transactionHash}`)),
       fail: vi.fn(),
       recover: vi.fn(async () => undefined),
@@ -860,6 +1076,7 @@ describe('HedgerBot off-venue transaction journal', () => {
         .mockReturnValueOnce('00000000-0000-4000-8000-000000000001')
         .mockReturnValueOnce('00000000-0000-4000-8000-000000000002'),
       observeTransaction: vi.fn(),
+      recordBroadcastAttempt: vi.fn(),
       confirm: vi.fn(),
       fail: vi.fn(),
       recover: vi.fn(async () => undefined),
@@ -910,6 +1127,7 @@ describe('HedgerBot off-venue transaction journal', () => {
   })
 
   it('finishes a durable swap obligation before planning another hedge', async () => {
+    const recordDeltaHedge = vi.fn()
     const dispatchIntentId = '00000000-0000-4000-8000-000000000001'
     const swapIntentId = '00000000-0000-4000-8000-000000000002'
     let pending: {
@@ -932,6 +1150,7 @@ describe('HedgerBot off-venue transaction journal', () => {
     const journal = {
       begin: vi.fn(() => swapIntentId),
       observeTransaction: vi.fn(),
+      recordBroadcastAttempt: vi.fn(),
       confirm: vi.fn(),
       fail: vi.fn(),
       recover: vi.fn(async () => undefined),
@@ -962,6 +1181,7 @@ describe('HedgerBot off-venue transaction journal', () => {
       dryRun: false,
     } as HedgeExecutionResult
     const { bot } = await makeBot(dispatchResult, 'success', {
+      recordDeltaHedge,
       pendingSwapStore: store,
       hedgeJournal: journal,
       sfpmVenue: {
@@ -986,6 +1206,7 @@ describe('HedgerBot off-venue transaction journal', () => {
     expect(vi.mocked(computeHedgePlan)).not.toHaveBeenCalled()
     expect(store.clear).toHaveBeenCalledOnce()
     expect(journal.begin).toHaveBeenCalledWith('sfpm_swap')
+    expect(recordDeltaHedge).toHaveBeenCalledOnce()
   })
 })
 
@@ -1004,6 +1225,7 @@ describe('HedgerBot hedge classification', () => {
         hedgeJournal: {
           begin: vi.fn(),
           observeTransaction: vi.fn(),
+          recordBroadcastAttempt: vi.fn(),
           confirm: vi.fn(),
           fail: vi.fn(),
           recover: vi.fn(async () => undefined),

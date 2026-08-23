@@ -14,7 +14,8 @@ import { diffTuneAnswers, dotenvObject, TUNE_KNOBS } from './lib/tuneKnobs'
  * effective values as defaults and patch `.env` in place. Touches nothing
  * on-chain and never changes the permission surface (DRY_RUN, activation, and
  * SFPM provisioning stay exactly as they are), so it needs no repair or
- * re-activation — just restart the bot to pick the new values up.
+ * re-activation permissions. Strategy changes do invalidate the activation
+ * fingerprint and therefore require inspection followed by `pnpm activate`.
  *
  * For permission changes (adding the SFPM venue or deleverager role, replacing
  * the Roles modifier), run `pnpm onboard` instead — with an existing `.env` it
@@ -42,7 +43,7 @@ export async function runTune(
 
   log(
     '\n Hedger-bot tune — strategy/gas/cadence only. Enter keeps the shown value.\n' +
-      ' (Permissions, DRY_RUN, and activation are untouched; use `pnpm onboard` for those.)\n',
+      ' (Permissions and DRY_RUN are untouched. A changed policy requires fresh inspection and activation.)\n',
   )
 
   const knobs = TUNE_KNOBS.filter((knob) => knob.applies?.(config) ?? true)
@@ -85,7 +86,10 @@ export async function runTune(
     for (const [key, value] of Object.entries(updates)) {
       log(`    ${key}: ${env[key] ?? `(default ${currents[key]})`} → ${value}`)
     }
-    log('\n  Restart the bot to pick the new values up.')
+    log(
+      '\n  Strategy changes make the existing activation stale. Inspect the new plan, then run ' +
+        '`pnpm activate`; never edit the activation marker directly.',
+    )
     return
   }
 }

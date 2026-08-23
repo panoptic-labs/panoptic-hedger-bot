@@ -10,6 +10,7 @@ import { formatUnits } from 'viem'
 import { type HedgerBotConfig, walletWethAddress } from './config'
 import { protocolGenesisBlock } from './constants/genesis'
 import type {
+  CollateralSwapQuote,
   CollateralSwapRequest,
   HedgeContext,
   HedgeExecutionResult,
@@ -35,6 +36,7 @@ import { assessSafety } from './hedge/safety'
 import type { SfpmSwapQuote, SfpmVenueDecision } from './hedge/sfpmVenueCoordinator'
 import { isSfpmVenueEligible } from './hedge/sfpmVenueRouter'
 import { type HedgeSnapshot, readHedgeSnapshot } from './hedge/snapshot'
+import { timedHedgeCadence } from './hedge/timedCadence'
 import { EMPTY_SAFE_WALLET_BALANCES, spendableAfterCollateralReserve } from './hedge/walletBalances'
 import type { Notifier } from './notify/telegram'
 import {
@@ -104,7 +106,11 @@ export interface HedgerBotDeps {
   vaultAsset: { decimals: number; symbol: string }
   /** Heartbeat hooks so a status command can see last poll / last hedge. */
   recordPoll?: (trigger: string) => void
+  recordSafeMode?: (level: number) => void
   recordHedge?: (action: string, tx?: Hex) => void
+  /** Trusted persisted cadence history, already identity-checked by startup. */
+  lastDeltaHedgeAt?: string
+  recordDeltaHedge?: (at: string) => void
   recordDeleverage?: (
     stage: DeleverageStage,
     bufferBps: bigint,
@@ -140,6 +146,11 @@ type BalanceFirstSwap =
     }
 
 type BalanceFirstSwapDecision = BalanceFirstSwap | 'deferred' | null
+
+interface SafeModeCreditSwap {
+  request: CollateralSwapRequest
+  quote: CollateralSwapQuote
+}
 
 function successfulReceipt(
   result: { transactionHash: Hex | null; receipt: TransactionReceipt | null },
@@ -178,9 +189,11 @@ export class HedgerBot {
   private lastDispatchTxHash?: Hex
   private readonly incident?: DeleverageIncident
   private lastWalletRedepositCheckAt = 0
+  private lastDeltaHedgeAt?: string
 
   constructor(deps: HedgerBotDeps) {
     this.deps = deps
+    this.lastDeltaHedgeAt = deps.lastDeltaHedgeAt
     if (deps.config.DELEVERAGER_ENABLED) {
       this.incident = new DeleverageIncident(
         deps.config.DELEVERAGE_TARGET_MARGIN_BPS,
@@ -297,6 +310,10 @@ export class HedgerBot {
           }
         : undefined,
     })
+    // Unit/custom snapshot adapters predating the raw level are treated as
+    // normal; the production reader always supplies the field.
+    const safeModeLevel = snapshot.safeMode?.level ?? 0n
+    this.deps.recordSafeMode?.(Number(safeModeLevel))
     if (await this.recoverPendingSfpmSwap(snapshot, trigger)) return
     const { pool, buyingPower: bp } = snapshot
     const walletBalances = snapshot.walletBalances ?? EMPTY_SAFE_WALLET_BALANCES
@@ -386,6 +403,7 @@ export class HedgerBot {
       return
     }
 
+    const cadence = timedHedgeCadence(config.TIMED_HEDGE_INTERVAL_MS, this.lastDeltaHedgeAt)
     const plan = computeHedgePlan({
       pool,
       collateral: snapshot.collateral,
@@ -393,6 +411,8 @@ export class HedgerBot {
       signalTick: signal.tick,
       assetIndex: config.ASSET_INDEX as 0n | 1n,
       deltaThresholdBps: config.DELTA_THRESHOLD_BPS,
+      timedHedgeMinDriftBps: config.TIMED_HEDGE_MIN_DRIFT_BPS,
+      timedHedgeDue: cadence.due,
       deltaOffsetBps: config.DELTA_OFFSET_BPS,
       absoluteMaxHedgeCount: config.MAX_HEDGE_SLOTS,
       slippageBps: BigInt(config.SLIPPAGE_BPS),
@@ -401,7 +421,10 @@ export class HedgerBot {
       lpPositions: snapshot.lp?.positions,
       includeLp: config.HEDGE_INCLUDE_LP && (snapshot.lp?.fresh ?? false),
     })
-    const balanceFirstSwap = await this.planBalanceFirstSwap(plan, snapshot)
+    // SafeMode=1 fallback is deliberately attempted only after the ordinary
+    // persistent-loan dispatch fails its exact final-state simulation.
+    const balanceFirstSwap =
+      safeModeLevel === 1n ? null : await this.planBalanceFirstSwap(plan, snapshot)
 
     // Surface the Uniswap LP delta contribution (observed vs applied).
     if (snapshot.lp) {
@@ -423,7 +446,12 @@ export class HedgerBot {
 
     if (balanceFirstSwap === 'deferred') return
 
-    if (plan.intent.openTokenId !== null && balanceFirstSwap === null) {
+    let safeModeCreditSwap: SafeModeCreditSwap | null = null
+    if (
+      balanceFirstSwap === null &&
+      plan.action !== 'none' &&
+      (plan.intent.openTokenId !== null || safeModeLevel === 1n)
+    ) {
       const margin = await assessFinalStateReserve(
         executor,
         plan.intent,
@@ -431,21 +459,41 @@ export class HedgerBot {
         config.MIN_MARGIN_RESERVE_BPS,
       )
       if (!margin.sufficient) {
-        if (
-          hasLooseCollateral &&
-          !config.DRY_RUN &&
-          (await this.maybeRedepositWalletBalances(trigger, true))
-        ) {
-          botLog(
-            '[hedger-bot] loose collateral was redeposited for protocol margin; replanning next cycle',
+        if (safeModeLevel === 1n) {
+          safeModeCreditSwap = await this.planSafeModeCreditSwap(plan, snapshot)
+          if (safeModeCreditSwap) {
+            botWarn(
+              `[hedger-bot] SafeMode=1 blocked the persistent loan; ` +
+                `using an atomic credit swap (${trigger})`,
+            )
+          }
+        }
+        if (safeModeCreditSwap) {
+          // Continue through the ordinary urgency and gas gates before sending.
+        } else {
+          const blockedReasons =
+            safeModeLevel === 1n
+              ? [
+                  ...margin.reasons,
+                  'SafeMode credit-swap fallback unavailable; persistent loan was not attempted',
+                ]
+              : margin.reasons
+          if (
+            hasLooseCollateral &&
+            !config.DRY_RUN &&
+            (await this.maybeRedepositWalletBalances(trigger, true))
+          ) {
+            botLog(
+              '[hedger-bot] loose collateral was redeposited for protocol margin; replanning next cycle',
+            )
+            return
+          }
+          botWarn(
+            `[hedger-bot] final-state preflight blocked (${trigger}): ${blockedReasons.join('; ')}`,
           )
+          await notifier.notify(formatSkip(trigger, blockedReasons))
           return
         }
-        botWarn(
-          `[hedger-bot] final-state preflight blocked (${trigger}): ${margin.reasons.join('; ')}`,
-        )
-        await notifier.notify(formatSkip(trigger, margin.reasons))
-        return
       }
     }
 
@@ -488,6 +536,10 @@ export class HedgerBot {
       // Preflight rejected the standalone swap (e.g. ExceedsMaximumRedemption
       // when CT liquidity/utilization cannot fund the withdrawal). Fall through
       // to the loan hedge, which needs no collateral withdrawal.
+    }
+    if (safeModeCreditSwap !== null) {
+      await this.executeSafeModeCreditSwap(safeModeCreditSwap, plan, trigger, ctx)
+      return
     }
     let execution: IntentExecutionResult
     let activeJournal: HedgeJournalAction | null = null
@@ -604,7 +656,11 @@ export class HedgerBot {
         this.deps.hedgeJournal.fail()
         activeJournal = null
       }
-      this.deps.recordHedge?.(plan.action, receipt.transactionHash)
+      this.recordConfirmedHedge(
+        plan.action,
+        receipt.transactionHash,
+        plan.intent.swapAtMint && (execution.venue === null || execution.venue.swap !== null),
+      )
     }
 
     // Same message to the console and Telegram, so an executed hedge is easy to
@@ -632,6 +688,7 @@ export class HedgerBot {
     const { intent } = plan
     const executor = this.deps.executor
     if (
+      !this.deps.config.BALANCE_FIRST_ENABLED ||
       (plan.action !== 'open' && plan.action !== 'grow') ||
       !intent.swapAtMint ||
       intent.openTokenId === null ||
@@ -699,7 +756,7 @@ export class HedgerBot {
       }
     }
 
-    // The temporary-loan in-pool swap can spend CollateralTracker assets, not
+    // The temporary-credit in-pool swap can spend CollateralTracker assets, not
     // loose Safe tokens. When loose inventory is the difference, redeposit it
     // first and let the next pinned snapshot size the swap.
     const spendableCollateral = collateralInput < spendableInput ? collateralInput : spendableInput
@@ -721,14 +778,139 @@ export class HedgerBot {
       route: 'in-pool',
       requirement,
       request: {
-        sellTokenType: requirement.sellTokenType,
+        kind: 'exactIn',
+        tokenType: requirement.sellTokenType,
         amountIn: amount,
         existingPositionIds: snapshot.positions.map((position) => position.tokenId),
         poolId: snapshot.pool.poolId,
-        tickSpacing: BigInt(snapshot.pool.poolKey.tickSpacing),
+        tickSpacing: BigInt(snapshot.pool.tickSpacing),
         currentTick: snapshot.pool.currentTick,
         slippageBps: BigInt(this.deps.config.SLIPPAGE_BPS),
       },
+    }
+  }
+
+  /**
+   * Replace a SafeMode=1-blocked persistent loan with a credit that is opened
+   * and closed in one dispatch. The correction is expressed in the configured
+   * hedge asset: negative sells asset exact-in; positive buys asset exact-out.
+   * If the exact-out input exceeds spendable collateral, spend the available
+   * numeraire exact-in and leave the residual for the next cycle.
+   */
+  private async planSafeModeCreditSwap(
+    plan: HedgePlan,
+    snapshot: HedgeSnapshot,
+  ): Promise<SafeModeCreditSwap | null> {
+    const executor = this.deps.executor
+    if (!executor.simulateCollateralSwap || !executor.executeCollateralSwap) return null
+
+    const correction = plan.Hstar - plan.H
+    if (correction === 0n) return null
+    const assetTokenType = Number(this.deps.config.ASSET_INDEX) as 0 | 1
+    const numeraireTokenType = assetTokenType === 0 ? 1 : 0
+    const collateral = (tokenType: 0 | 1): bigint =>
+      tokenType === 0 ? snapshot.collateral.token0.assets : snapshot.collateral.token1.assets
+    const base = {
+      existingPositionIds: snapshot.positions.map((position) => position.tokenId),
+      poolId: snapshot.pool.poolId,
+      tickSpacing: BigInt(snapshot.pool.tickSpacing),
+      currentTick: snapshot.pool.currentTick,
+      slippageBps: BigInt(this.deps.config.SLIPPAGE_BPS),
+    }
+
+    if (correction < 0n) {
+      const desired = -correction
+      const spendable = spendableAfterCollateralReserve(collateral(assetTokenType))
+      const amountIn = desired < spendable ? desired : spendable
+      if (amountIn === 0n) return null
+      const request: CollateralSwapRequest = {
+        ...base,
+        kind: 'exactIn',
+        tokenType: assetTokenType,
+        amountIn,
+      }
+      try {
+        const quote = await executor.simulateCollateralSwap(request)
+        return { request, quote }
+      } catch (error) {
+        botWarn(`[hedger-bot] SafeMode credit swap simulation failed: ${sanitizeError(error)}`)
+        return null
+      }
+    }
+
+    const spendable = spendableAfterCollateralReserve(collateral(numeraireTokenType))
+    if (spendable === 0n) return null
+    const exactOut: CollateralSwapRequest = {
+      ...base,
+      kind: 'exactOut',
+      tokenType: assetTokenType,
+      amountOut: correction,
+    }
+    try {
+      const quote = await executor.simulateCollateralSwap(exactOut)
+      if (quote.amountIn <= spendable) {
+        return { request: { ...exactOut, amountIn: quote.amountIn }, quote }
+      }
+    } catch (error) {
+      botWarn(
+        `[hedger-bot] full SafeMode exact-out swap simulation failed: ${sanitizeError(error)}`,
+      )
+      return null
+    }
+
+    const exactIn: CollateralSwapRequest = {
+      ...base,
+      kind: 'exactIn',
+      tokenType: numeraireTokenType,
+      amountIn: spendable,
+    }
+    try {
+      const quote = await executor.simulateCollateralSwap(exactIn)
+      return { request: exactIn, quote }
+    } catch (error) {
+      botWarn(
+        `[hedger-bot] partial SafeMode credit swap simulation failed: ${sanitizeError(error)}`,
+      )
+      return null
+    }
+  }
+
+  private async executeSafeModeCreditSwap(
+    swap: SafeModeCreditSwap,
+    plan: HedgePlan,
+    trigger: string,
+    ctx: HedgeContext,
+  ): Promise<void> {
+    const execute = this.deps.executor.executeCollateralSwap
+    if (!execute) throw new Error('SafeMode credit swap executor is unavailable')
+    let journalActive = false
+    try {
+      if (!this.deps.config.DRY_RUN) {
+        this.deps.hedgeJournal.begin('collateral_swap')
+        journalActive = true
+      }
+      const result = await execute(swap.request, ctx)
+      if (!result.dryRun) {
+        const receipt = successfulReceipt(result, 'SafeMode credit swap')
+        this.deps.hedgeJournal.confirm({
+          transactionHash: receipt.transactionHash,
+          blockNumber: receipt.blockNumber,
+          blockHash: receipt.blockHash,
+        })
+        journalActive = false
+        this.lastDispatchTxHash = receipt.transactionHash
+        this.recordConfirmedHedge('collateral_swap', receipt.transactionHash, true)
+      }
+      const mode = swap.request.kind === 'exactOut' ? 'exact-out' : 'exact-in'
+      const message =
+        `${this.deps.config.DRY_RUN ? '🟡' : '🟢'} SafeMode credit hedge (${trigger}): ` +
+        `${mode} spent ${swap.quote.amountIn}, received ${swap.quote.amountOut}; ` +
+        `no persistent loan opened (planned ${plan.action})`
+      botLog(`[hedger-bot] ${message}`)
+      await this.deps.notifier.notify(message)
+    } catch (error) {
+      if (journalActive && !(error instanceof TxNotMinedError)) this.deps.hedgeJournal.fail()
+      throw error
     }
   }
 
@@ -784,10 +966,15 @@ export class HedgerBot {
         })
         journalActive = false
         this.lastDispatchTxHash = receipt.transactionHash
-        this.deps.recordHedge?.('collateral_swap', receipt.transactionHash)
+        this.recordConfirmedHedge('collateral_swap', receipt.transactionHash, true)
       }
       const side = swap.requirement.sellTokenType === 0 ? 'token0' : 'token1'
-      const amountIn = swap.route === 'sfpm' ? swap.request.amount : swap.request.amountIn
+      const amountIn =
+        swap.route === 'sfpm'
+          ? swap.request.amount
+          : swap.request.kind === 'exactIn'
+            ? swap.request.amountIn
+            : 0n
       const message =
         `${this.deps.config.DRY_RUN ? '🟡' : '🟢'} balance-first hedge (${trigger}): ` +
         `sold ${amountIn} ${side} ${swap.route}; ` +
@@ -799,6 +986,18 @@ export class HedgerBot {
       throw error
     }
     return true
+  }
+
+  private recordConfirmedHedge(action: string, tx: Hex, changesDelta: boolean): void {
+    this.deps.recordHedge?.(action, tx)
+    if (!changesDelta) return
+    this.recordConfirmedDeltaChange()
+  }
+
+  private recordConfirmedDeltaChange(): void {
+    const at = new Date().toISOString()
+    this.lastDeltaHedgeAt = at
+    this.deps.recordDeltaHedge?.(at)
   }
 
   /**
@@ -941,6 +1140,7 @@ export class HedgerBot {
       })
       journalActive = false
       store.clear()
+      this.recordConfirmedDeltaChange()
       botLog(`[hedger-bot] recovered pending off-venue swap: ${receipt.transactionHash}`)
       await this.deps.notifier.notify(
         `✅ recovered pending off-venue SFPM swap (${trigger}): ${receipt.transactionHash}`,
@@ -1153,7 +1353,7 @@ export class HedgerBot {
     const breakdown = computePortfolioDeltaDetailed(
       snapshot.positions,
       snapshot.pool.currentTick,
-      BigInt(snapshot.pool.poolKey.tickSpacing),
+      BigInt(snapshot.pool.tickSpacing),
       assetIndex,
     )
     const absDeltaById = new Map<bigint, bigint>(
@@ -1229,6 +1429,7 @@ export class HedgerBot {
 
         const burnIntent = this.buildBurnIntent('deleverage_options', selection.tokenIds, snapshot)
         const tx = await this.executeBurnStage(deleveragerExecutor, burnIntent)
+        if (tx !== undefined) this.recordConfirmedDeltaChange()
         if (!markedStage) {
           this.incident?.markStageRun('options', nowMs)
           markedStage = true
@@ -1270,6 +1471,7 @@ export class HedgerBot {
     if (loanIds.length > 0 && (this.incident?.canRunStage('loans', nowMs) ?? true)) {
       const intent = this.buildBurnIntent('deleverage_loans', loanIds, snapshot)
       const tx = await this.executeBurnStage(executor, intent)
+      if (tx !== undefined) this.recordConfirmedDeltaChange()
       this.incident?.markStageRun('loans', nowMs)
       this.deps.recordDeleverage?.('loans', bufferBps, tx, this.incident?.active ?? false)
       const msg = formatDeleverageSummary({
@@ -1320,6 +1522,7 @@ export class HedgerBot {
       return
     }
     const tx = await this.executeBurnStage(executor, plan.intent)
+    if (tx !== undefined && plan.intent.swapAtMint) this.recordConfirmedDeltaChange()
     const adjusted = [
       ...plan.intent.closeTokenIds,
       ...(plan.intent.openTokenId !== null ? [plan.intent.openTokenId] : []),

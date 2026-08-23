@@ -5,10 +5,16 @@ import { walletWethAddress } from '../../../src/config'
 import { protocolGenesisBlock } from '../../../src/constants/genesis'
 import { computeHedgePlan } from '../../../src/hedge/decision'
 import { readHedgeSnapshot } from '../../../src/hedge/snapshot'
+import { timedHedgeCadence } from '../../../src/hedge/timedCadence'
 import { createPriceSignalSource } from '../../../src/priceSignal'
 import { resolveCexAssetOrientation } from '../../../src/priceSignal/cexSource'
 import { buildActivationEvidence, isActivated } from '../../../src/runtime/activation'
-import { botVersion, computeRunning, readRuntimeState } from '../../../src/runtime/stateFile'
+import {
+  botVersion,
+  computeRunning,
+  readRuntimeState,
+  trustedLastDeltaHedgeAt,
+} from '../../../src/runtime/stateFile'
 import { botWarn } from '../../../src/utils/log'
 import { sanitizeError } from '../../../src/utils/sanitize'
 import { asSdkClient } from '../../../src/utils/sdkClient'
@@ -38,6 +44,8 @@ export interface StatusSnapshot {
   priceSignal?: string
   lastPoll?: string
   lastHedge?: string
+  oracleRecovery?: string
+  timedHedging?: string
   deleverager?: string
   notes: string[]
 }
@@ -70,6 +78,20 @@ export async function gatherStatus(ctx: StatusDiagnosticsContext): Promise<Statu
     state.version === botVersion()
   const runningMode =
     run.running && stateIdentityMatches ? (state.dryRun ? 'dry-run' : 'live') : undefined
+  const trustedCadence = botAddress
+    ? trustedLastDeltaHedgeAt(state, {
+        chainId: config.CHAIN_ID,
+        safe: config.SAFE_ADDRESS,
+        pool: config.POOL_ADDRESS,
+        signer: botAddress,
+      })
+    : undefined
+  const cadence = timedHedgeCadence(config.TIMED_HEDGE_INTERVAL_MS, trustedCadence)
+  const timedHedging = !cadence.enabled
+    ? 'disabled'
+    : `${config.TIMED_HEDGE_INTERVAL_MS}ms interval, min ${config.TIMED_HEDGE_MIN_DRIFT_BPS}bps; ` +
+      `last delta hedge ${cadence.lastDeltaHedgeAt ? fmtAgo(cadence.lastDeltaHedgeAt) : 'never'}; ` +
+      `${cadence.due ? 'DUE' : `next ${cadence.nextDueAt ?? '?'}`}`
 
   const snap: StatusSnapshot = {
     version: botVersion(),
@@ -89,6 +111,14 @@ export async function gatherStatus(ctx: StatusDiagnosticsContext): Promise<Statu
     lastHedge: state?.lastHedgeAt
       ? `${fmtAgo(state.lastHedgeAt)} (${state.lastHedgeAction ?? '?'}${state.lastHedgeTx ? ` ${state.lastHedgeTx}` : ''})`
       : 'never',
+    oracleRecovery: !config.ORACLE_POKE_ENABLED
+      ? `disabled; SafeMode=${state?.safeModeLevel ?? 'unknown'}`
+      : `enabled; SafeMode=${state?.safeModeLevel ?? 'unknown'}; last ${
+          state?.lastOraclePokeAt ? fmtAgo(state.lastOraclePokeAt) : 'never'
+        } (${state?.lastOraclePokeResult ?? 'none'}${
+          state?.lastOraclePokeTx ? ` ${state.lastOraclePokeTx}` : ''
+        })`,
+    timedHedging,
     deleverager: !config.DELEVERAGER_ENABLED
       ? 'disabled'
       : stateIdentityMatches && state?.lastDeleverageAt
@@ -202,6 +232,8 @@ export async function gatherStatus(ctx: StatusDiagnosticsContext): Promise<Statu
       signalTick,
       assetIndex: config.ASSET_INDEX as 0n | 1n,
       deltaThresholdBps: config.DELTA_THRESHOLD_BPS,
+      timedHedgeMinDriftBps: config.TIMED_HEDGE_MIN_DRIFT_BPS,
+      timedHedgeDue: cadence.due,
       deltaOffsetBps: config.DELTA_OFFSET_BPS,
       absoluteMaxHedgeCount: config.MAX_HEDGE_SLOTS,
       slippageBps: BigInt(config.SLIPPAGE_BPS),

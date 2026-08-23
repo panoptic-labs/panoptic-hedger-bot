@@ -10,8 +10,11 @@ import { protocolGenesisBlock } from '../src/constants/genesis'
 import { computeHedgePlan } from '../src/hedge/decision'
 import { assessSafety } from '../src/hedge/safety'
 import { readHedgeSnapshot } from '../src/hedge/snapshot'
+import { timedHedgeCadence } from '../src/hedge/timedCadence'
 import { createPriceSignalSource } from '../src/priceSignal'
 import { resolveCexAssetOrientation } from '../src/priceSignal/cexSource'
+import { readRuntimeState, trustedLastDeltaHedgeAt } from '../src/runtime/stateFile'
+import { resolveBotAddress } from '../src/safe/resolveBotAccount'
 import { defineBotChain } from '../src/utils/chain'
 import { sanitizeError } from '../src/utils/sanitize'
 
@@ -85,6 +88,17 @@ export async function runHedgeInspection(config: HedgerBotConfig): Promise<Hedge
   })
   console.log('safety:', safety)
 
+  const runtime = readRuntimeState()
+  const botAddress = await resolveBotAddress(config).catch(() => undefined)
+  const trustedCadence = botAddress
+    ? trustedLastDeltaHedgeAt(runtime, {
+        chainId: config.CHAIN_ID,
+        safe: config.SAFE_ADDRESS,
+        pool: config.POOL_ADDRESS,
+        signer: botAddress,
+      })
+    : undefined
+  const cadence = timedHedgeCadence(config.TIMED_HEDGE_INTERVAL_MS, trustedCadence)
   const plan = computeHedgePlan({
     pool: snapshot.pool,
     collateral: snapshot.collateral,
@@ -92,6 +106,8 @@ export async function runHedgeInspection(config: HedgerBotConfig): Promise<Hedge
     signalTick: signal.tick,
     assetIndex: config.ASSET_INDEX as 0n | 1n,
     deltaThresholdBps: config.DELTA_THRESHOLD_BPS,
+    timedHedgeMinDriftBps: config.TIMED_HEDGE_MIN_DRIFT_BPS,
+    timedHedgeDue: cadence.due,
     deltaOffsetBps: config.DELTA_OFFSET_BPS,
     absoluteMaxHedgeCount: config.MAX_HEDGE_SLOTS,
     slippageBps: BigInt(config.SLIPPAGE_BPS),
@@ -157,6 +173,13 @@ export async function runHedgeInspection(config: HedgerBotConfig): Promise<Hedge
   console.log(
     `driftBps = |netDelta| / sizeBasis = ${plan.driftBps}  (threshold ${config.DELTA_THRESHOLD_BPS})`,
   )
+  console.log('timed hedge:', {
+    intervalMs: config.TIMED_HEDGE_INTERVAL_MS,
+    minDriftBps: config.TIMED_HEDGE_MIN_DRIFT_BPS.toString(),
+    lastDeltaHedgeAt: cadence.lastDeltaHedgeAt,
+    due: cadence.due,
+    nextDueAt: cadence.nextDueAt,
+  })
 
   console.log('\nplan:', {
     action: plan.action,

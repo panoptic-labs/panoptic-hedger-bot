@@ -7,6 +7,7 @@ import { readHedgeSnapshot } from './snapshot'
 const sdk = vi.hoisted(() => ({
   getBlockMeta: vi.fn(),
   getPool: vi.fn(),
+  getSafeMode: vi.fn(),
   getAccountBuyingPower: vi.fn(),
   getAccountCollateral: vi.fn(),
   getCollateralAddresses: vi.fn(),
@@ -30,6 +31,7 @@ describe('readHedgeSnapshot', () => {
         token1Asset: '0x4444444444444444444444444444444444444444',
       },
     })
+    sdk.getSafeMode.mockResolvedValue({ level: 0n, mode: 'normal' })
     sdk.getCollateralAddresses.mockReturnValue(['0x01', '0x02'])
     sdk.getAccountBuyingPower.mockResolvedValue({})
     sdk.getAccountCollateral.mockResolvedValue({})
@@ -56,6 +58,7 @@ describe('readHedgeSnapshot', () => {
       sdk.getAccountBuyingPower.mock.calls[0][0],
       sdk.getAccountCollateral.mock.calls[0][0],
       sdk.isLiquidatable.mock.calls[0][0],
+      sdk.getSafeMode.mock.calls[0][0],
     ]) {
       expect(call).toMatchObject({ blockNumber })
     }

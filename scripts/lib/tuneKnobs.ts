@@ -5,7 +5,8 @@ import type { HedgerBotConfig } from '../../src/config'
 /**
  * The strategy/gas/cadence knobs `pnpm tune` re-prompts. Everything here is a
  * pure `.env` value the runtime reads at startup — no knob changes the on-chain
- * permission surface, so tuning never needs repair or re-activation. Keys that
+ * permission surface. Strategy changes are activation-bound, so the operator
+ * must inspect and reactivate before the next live start. Keys that
  * DO affect the safety boundary (DRY_RUN, SFPM_SWAP_ENABLED, the provisioning
  * flags) are deliberately excluded; those go through `pnpm onboard` / `pnpm
  * activate`.
@@ -29,6 +30,16 @@ export const TUNE_KNOBS: readonly TuneKnob[] = [
     key: 'DELTA_THRESHOLD_BPS',
     hint: 'rehedge trigger (drift bps)',
     current: (cfg) => cfg.DELTA_THRESHOLD_BPS.toString(),
+  },
+  {
+    key: 'TIMED_HEDGE_INTERVAL_MS',
+    hint: '0 disables; otherwise 300000–604800000 and >= poll interval',
+    current: (cfg) => String(cfg.TIMED_HEDGE_INTERVAL_MS),
+  },
+  {
+    key: 'TIMED_HEDGE_MIN_DRIFT_BPS',
+    hint: 'inner timed band; must be below the hard threshold',
+    current: (cfg) => cfg.TIMED_HEDGE_MIN_DRIFT_BPS.toString(),
   },
   {
     key: 'DELTA_OFFSET_BPS',

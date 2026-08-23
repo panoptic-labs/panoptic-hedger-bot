@@ -65,6 +65,8 @@ export interface RolesExecutorDeps {
   sleep?: (ms: number) => Promise<void>
   /** Durable write-ahead observer. A rejected write prevents transaction broadcast. */
   observeTransaction: (update: JournalTransactionUpdate) => void | Promise<void>
+  /** Durable write-ahead marker recorded immediately before every broadcast attempt. */
+  recordBroadcastAttempt: () => void | Promise<void>
   /** Fencing/kill-switch assertion evaluated immediately before every broadcast. */
   assertSendAllowed: () => void | Promise<void>
 }
@@ -233,13 +235,15 @@ export function createRolesExecutor(deps: RolesExecutorDeps): RolesExecutor {
         target: rolesModifierAddress,
         calldataHash: keccak256(data),
         submittedAtBlock,
-        hashes,
+        hashes: [...hashes],
       })
     const feeOverrides = await deps.fees?.(opts)
     const { bumpFees, txWait } = deps
     // Pre-1559 chains use a single send without replacement fee escalation.
     if (!feeOverrides || !bumpFees || !txWait) {
       await deps.assertSendAllowed()
+      await observe()
+      await deps.recordBroadcastAttempt()
       try {
         const hash = await walletClient.sendTransaction({
           account,
@@ -297,6 +301,8 @@ export function createRolesExecutor(deps: RolesExecutorDeps): RolesExecutor {
     let canBump = true
     const deadline = now() + txWait.timeoutMs
     await deps.assertSendAllowed()
+    await observe()
+    await deps.recordBroadcastAttempt()
     try {
       hashes.push(await sendAttempt(current))
       await observe()
@@ -334,6 +340,7 @@ export function createRolesExecutor(deps: RolesExecutorDeps): RolesExecutor {
         continue
       }
       await deps.assertSendAllowed()
+      await deps.recordBroadcastAttempt()
       try {
         hashes.push(await sendAttempt(next))
         await observe()

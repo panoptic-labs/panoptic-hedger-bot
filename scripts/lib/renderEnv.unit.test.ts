@@ -13,6 +13,8 @@ const BASE: EnvValues = {
   BOT_PRIVATE_KEY: `0x${'5'.repeat(64)}`,
   ASSET_INDEX: 1,
   DELTA_THRESHOLD_BPS: 200,
+  TIMED_HEDGE_INTERVAL_MS: 14_400_000,
+  TIMED_HEDGE_MIN_DRIFT_BPS: 100,
   PRICE_SIGNAL_SOURCE: 'pool-tick',
   HEDGE_VENUE: 'in-pool',
   DRY_RUN: true,
@@ -38,6 +40,7 @@ describe('renderEnvFile', () => {
     expect(cfg.ASSET_INDEX).toBe(1n)
     expect(cfg.DRY_RUN).toBe(true)
     expect(cfg.HEDGE_VENUE).toBe('in-pool')
+    expect(cfg.TIMED_HEDGE_INTERVAL_MS).toBe(14_400_000)
   })
 
   it('omits undefined optional fields', () => {

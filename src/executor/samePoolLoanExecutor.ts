@@ -1,13 +1,12 @@
 import {
   type BatchOp,
   buildBatchDispatchArgs,
-  panopticPoolV2Abi,
+  buildCreditSwapCall,
   simulateBatchDispatch,
+  simulateWithTokenFlow,
 } from '@panoptic-eng/sdk/v2'
 import type { Address, Hex, PublicClient } from 'viem'
-import { encodeFunctionData } from 'viem'
 
-import { buildUniqueLoan } from '../hedge/frame'
 import { normalizePostDispatchMargin } from '../hedge/marginReserve'
 import type { RolesExecutor } from '../safe/rolesExecutor'
 import { botLog } from '../utils/log'
@@ -17,7 +16,6 @@ import {
   buildHedgeDispatchCalldata,
   buildOffVenueHedgeBatchOps,
   buildOffVenueHedgeDispatchCalldata,
-  hedgeTickBand,
 } from './dispatchCalldata'
 import type {
   CollateralSwapRequest,
@@ -186,43 +184,54 @@ export function createSamePoolLoanExecutor(deps: SamePoolLoanExecutorDeps): Hedg
   }
 
   function buildCollateralSwapCall(request: CollateralSwapRequest) {
-    if (request.amountIn <= 0n) throw new Error('collateral swap input must be positive')
-    const built = buildUniqueLoan(
-      request.poolId,
-      {
-        asset: BigInt(request.sellTokenType),
-        tokenType: BigInt(request.sellTokenType),
-        strike:
-          request.currentTick -
-          (request.currentTick % request.tickSpacing) -
-          (request.currentTick < 0n && request.currentTick % request.tickSpacing !== 0n
-            ? request.tickSpacing
-            : 0n),
-      },
-      request.existingPositionIds,
-      request.amountIn,
-    )
-    const swapBand = hedgeTickBand(true, request.currentTick, request.slippageBps)
-    const noSwapBand = hedgeTickBand(false, request.currentTick, request.slippageBps)
+    const built = buildCreditSwapCall({
+      ...request,
+      poolAddress,
+      tokenIndex: BigInt(request.tokenType),
+      builderCode,
+    })
     return {
       to: poolAddress,
       value: 0n,
-      data: encodeFunctionData({
-        abi: panopticPoolV2Abi,
-        functionName: 'dispatch',
-        args: [
-          [built.tokenId, built.tokenId],
-          request.existingPositionIds,
-          [built.adjustedSize, 0n],
-          [
-            [Number(noSwapBand.low), Number(noSwapBand.high), 0],
-            [Number(swapBand.high), Number(swapBand.low), 0],
-          ],
-          false,
-          builderCode,
-        ],
-      }),
+      data: built.data,
       operation: 0 as const,
+    }
+  }
+
+  const simulateCollateralSwap = async (
+    request: CollateralSwapRequest,
+  ): Promise<{ amountIn: bigint; amountOut: bigint }> => {
+    const call = buildCollateralSwapCall(request)
+    const simulation = await simulateWithTokenFlow({
+      client: asSdkClient<typeof simulateWithTokenFlow>(publicClient),
+      poolAddress,
+      user: safeAddress,
+      callData: call.data,
+    })
+    if (!simulation.success || !simulation.tokenFlow) {
+      throw simulation.rawError ?? new Error(simulation.error ?? 'credit swap simulation failed')
+    }
+    await rolesExecutor.simulate(call)
+    const { delta0, delta1 } = simulation.tokenFlow
+    const soldDelta =
+      request.kind === 'exactIn'
+        ? request.tokenType === 0
+          ? delta0
+          : delta1
+        : request.tokenType === 0
+          ? delta1
+          : delta0
+    const receivedDelta =
+      request.kind === 'exactIn'
+        ? request.tokenType === 0
+          ? delta1
+          : delta0
+        : request.tokenType === 0
+          ? delta0
+          : delta1
+    return {
+      amountIn: soldDelta < 0n ? -soldDelta : soldDelta,
+      amountOut: receivedDelta < 0n ? -receivedDelta : receivedDelta,
     }
   }
 
@@ -281,17 +290,19 @@ export function createSamePoolLoanExecutor(deps: SamePoolLoanExecutorDeps): Hedg
       return executeDispatch(intent, buildOffVenueDispatchData, ctx)
     },
     deriveSwapRequirement,
-    async simulateCollateralSwap(request: CollateralSwapRequest) {
-      await rolesExecutor.simulate(buildCollateralSwapCall(request))
-    },
+    simulateCollateralSwap,
     async executeCollateralSwap(request: CollateralSwapRequest, ctx?: HedgeContext) {
       const call = buildCollateralSwapCall(request)
+      const amountIn =
+        request.kind === 'exactIn'
+          ? request.amountIn
+          : (request.amountIn ?? (await simulateCollateralSwap(request)).amountIn)
       if (dryRun) {
         await rolesExecutor.simulate(call)
         return {
           transactionHash: null,
           receipt: null,
-          amountIn: request.amountIn,
+          amountIn,
           dryRun: true,
         }
       }
@@ -299,7 +310,7 @@ export function createSamePoolLoanExecutor(deps: SamePoolLoanExecutorDeps): Hedg
       return {
         transactionHash: receipt.transactionHash,
         receipt,
-        amountIn: request.amountIn,
+        amountIn,
         dryRun: false,
       }
     },

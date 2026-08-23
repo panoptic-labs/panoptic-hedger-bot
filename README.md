@@ -6,8 +6,9 @@ delta drifts past a threshold, mints/burns **hedge loans** to bring the portfoli
 back toward delta-neutral — all through a [Zodiac Roles v2](https://github.com/gnosisguild/zodiac-modifier-roles)
 modifier scoped so the bot can *only* touch loans, never the user's options.
 
-The bot is **stateless** — it re-derives all hedge state from on-chain positions
-on every startup — so it is safe to restart or kill at any time.
+The bot re-derives position state from on-chain data on every startup. The trusted
+`lastDeltaHedgeAt` cadence checkpoint used by timed hedging is persisted and
+restored across startup, so timed hedges do not fire early after a restart.
 
 ## What it does
 
@@ -15,9 +16,10 @@ Every cycle the bot:
 
 1. Reads a price signal (the pool tick, a CEX mid, or an external Uniswap pool).
 2. Computes the net delta of the Safe's Panoptic positions.
-3. If the delta has drifted past `DELTA_THRESHOLD_BPS`, plans a hedge: mint or
-   burn the loan legs needed to return toward delta-neutral, consolidating
-   fragmented hedge slots when they exceed `MAX_HEDGE_SLOTS`.
+3. Plans a hedge when drift exceeds `DELTA_THRESHOLD_BPS`, or—when explicitly
+   enabled—the timed interval is due and drift exceeds its smaller inner band.
+   It mints or burns the loan legs needed to return toward delta-neutral and
+   consolidates fragmented hedge slots above `MAX_HEDGE_SLOTS`.
 4. Submits that plan to `PanopticPool.dispatch` **through the Zodiac Roles
    modifier**, which permits loan-only actions and rejects anything else.
 
@@ -116,11 +118,12 @@ and disables the old modifier atomically. Interrupted onboarding is detected
 and offered for continuation automatically.
 
 To retune strategy parameters without touching permissions, run `pnpm tune`:
-it re-prompts the strategy/gas/cadence knobs (delta threshold/offset, slippage,
-margin reserve, fee caps, poll interval, SFPM savings threshold, deleverage
+it re-prompts the strategy/gas/cadence knobs (hard/timed delta thresholds,
+timed interval, delta offset, slippage, margin reserve, fee caps, poll interval, SFPM savings threshold, deleverage
 tunables) with the current values as defaults, validates the result, and
-patches `.env` in place. Nothing on-chain changes and DRY_RUN/activation are
-untouched — restart the bot to pick the new values up. Permission changes
+patches `.env` in place. Nothing on-chain changes, but the strategy fingerprint
+changes: inspect the new plan and run `pnpm activate` before the next live start.
+Never edit the activation marker directly. Permission changes
 (adding the SFPM venue or deleverager role) still go through `pnpm onboard`.
 
 > First run against an **anvil/Tenderly fork** to rehearse end-to-end with no
@@ -252,11 +255,14 @@ it writes (and for the manual path). The full annotated list lives in
 | `BOT_KEYSTORE_PASSPHRASE_FILE` | | Preferred owner-only passphrase secret file; mutually exclusive with the environment value |
 | `ASSET_INDEX` | | Which token is the sizing asset: `0` or `1` |
 | `DELTA_THRESHOLD_BPS` | | Rehedge trigger, default `200` (2%) |
+| `TIMED_HEDGE_INTERVAL_MS` | | Optional timed rehedge cadence; `0` disables (default), enabled range 5 minutes–7 days and must be at least the poll interval |
+| `TIMED_HEDGE_MIN_DRIFT_BPS` | | Timed trigger's inner drift band, default `100`; when enabled it must be positive and below `DELTA_THRESHOLD_BPS` |
 | `MAX_HEDGE_SLOTS` | | Consolidate hedge loans above this count, default `4` |
 | `SLIPPAGE_BPS` | | Hedge swap slippage tolerance, default `100` (±100 ticks for in-pool loans) |
 | `PRICE_SIGNAL_SOURCE` | | `pool-tick` \| `cex` (supported); `uniswap-pool` (experimental) |
 | `HEDGE_VENUE` | | `in-pool` (the only supported execution venue) |
 | `POLL_INTERVAL_MS` | | Loop interval, default `60000` |
+| `ORACLE_POKE_ENABLED` | | Opt-in SafeMode recovery. The keeper reads the attached RiskEngine's live thresholds and EMA periods, diagnoses its predicates from `getOracleTicks()`, and checks the result against authoritative `isSafeMode()`. Median divergence uses consecutive epochs, other causes follow their deployed EMA cadence, and guardian-locked pools are not poked. Live use is activation-bound; default `false`. |
 | `DRY_RUN` | | `true` simulates via `eth_call`; live also requires `pnpm activate` |
 | `UNISWAP_LP_OWNER` | | Extra address (besides the Safe) holding plain Uniswap v3/v4 LP positions on this pool's pair; scanned alongside the Safe — see [Hedging Uniswap LP positions](#hedging-uniswap-lp-positions). |
 | `HEDGE_INCLUDE_LP` | | `true` folds same-pair Uniswap LP delta into the hedge (only while the LP subgraph is fresh); default `false` = observe-only. |

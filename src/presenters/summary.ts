@@ -25,6 +25,7 @@ export function formatCycleSummary(
   const tag = result.dryRun ? '🟡 HEDGE (dry-run)' : '🟢 HEDGE EXECUTED'
   const trg = [
     plan.triggers.drift ? 'drift' : null,
+    plan.triggers.timedDrift ? 'timed-drift' : null,
     plan.triggers.overCap ? 'over-cap' : null,
     plan.triggers.signFlip ? 'sign-flip' : null,
   ].filter(Boolean)

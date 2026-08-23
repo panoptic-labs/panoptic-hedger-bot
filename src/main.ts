@@ -2,7 +2,17 @@ import 'dotenv/config'
 
 import { fileURLToPath } from 'node:url'
 
-import { createFileStorage, fetchSfpmV3PoolId, getPoolMetadata } from '@panoptic-eng/sdk/v2'
+import {
+  createFileStorage,
+  decodeOraclePack,
+  diagnoseOracleSafeMode,
+  fetchSfpmV3PoolId,
+  getOracleRiskParameters,
+  getPoolMetadata,
+  oracleEpochAt,
+  panopticPoolV2Abi,
+  pokeOracle,
+} from '@panoptic-eng/sdk/v2'
 import type { Address } from 'viem'
 import { createPublicClient, createWalletClient, fallback, http, parseAbi } from 'viem'
 
@@ -28,9 +38,9 @@ import { runtimeDataPath } from './runtime/paths'
 import { PendingSfpmSwapStore } from './runtime/pendingSfpmSwap'
 import {
   botVersion,
-  clearRuntimeState,
   patchRuntimeState,
   readRuntimeState,
+  trustedLastDeltaHedgeAt,
   writeRuntimeState,
 } from './runtime/stateFile'
 import { resolveBotAccount } from './safe/resolveBotAccount'
@@ -40,10 +50,11 @@ import { parseBuilderCode } from './utils/builderCode'
 import { defineBotChain } from './utils/chain'
 import { botError, botLog, botWarn } from './utils/log'
 import { sanitizeError } from './utils/sanitize'
-import { asSdkClient } from './utils/sdkClient'
+import { asSdkClient, asSdkWalletClient } from './utils/sdkClient'
 import { sleep } from './utils/sleep'
 
 const STARTUP_RETRY_DELAYS_MS = [15_000, 60_000, 120_000, 300_000] as const
+const ORACLE_POKE_INTERVAL_MS = 65_000
 
 async function initWithRetry(
   init: () => Promise<void>,
@@ -140,12 +151,15 @@ async function main(): Promise<void> {
     })
   })
   const gasPolicy = createGasPolicy({ publicClient, account, notifier, config })
-  const hedgeJournal = new HedgeJournal({
-    chainId: config.CHAIN_ID,
-    safe: config.SAFE_ADDRESS,
-    pool: config.POOL_ADDRESS,
-    signer: account.address,
-  })
+  const hedgeJournal = new HedgeJournal(
+    {
+      chainId: config.CHAIN_ID,
+      safe: config.SAFE_ADDRESS,
+      pool: config.POOL_ADDRESS,
+      signer: account.address,
+    },
+    { nonceStallBlocks: BigInt(config.HEDGER_NONCE_STALL_BLOCKS) },
+  )
 
   const rolesExecutor = createRolesExecutor({
     publicClient,
@@ -162,6 +176,7 @@ async function main(): Promise<void> {
       bumpIntervalMs: config.TX_BUMP_INTERVAL_MS,
     },
     observeTransaction: (update) => hedgeJournal.observeTransaction(update),
+    recordBroadcastAttempt: () => hedgeJournal.recordBroadcastAttempt(),
     assertSendAllowed: () => {
       assertTradingEnabled()
       instanceLease.assertOwned()
@@ -198,6 +213,7 @@ async function main(): Promise<void> {
             bumpIntervalMs: config.TX_BUMP_INTERVAL_MS,
           },
           observeTransaction: (update) => hedgeJournal.observeTransaction(update),
+          recordBroadcastAttempt: () => hedgeJournal.recordBroadcastAttempt(),
           assertSendAllowed: () => {
             assertTradingEnabled()
             instanceLease.assertOwned()
@@ -213,6 +229,12 @@ async function main(): Promise<void> {
     client: asSdkClient<typeof getPoolMetadata>(publicClient),
     poolAddress: config.POOL_ADDRESS,
   })
+  const oracleRiskParameters = config.ORACLE_POKE_ENABLED
+    ? await getOracleRiskParameters({
+        client: asSdkClient<typeof getOracleRiskParameters>(publicClient),
+        riskEngineAddress: metadata.riskEngineAddress,
+      })
+    : undefined
   const ethTokenIndex =
     config.PRICE_SIGNAL_SOURCE === 'cex'
       ? resolveCexAssetOrientation(config.CHAIN_ID, metadata.token0Asset, metadata.token1Asset)
@@ -229,6 +251,14 @@ async function main(): Promise<void> {
     config.ASSET_INDEX === 0n
       ? { decimals: Number(metadata.token0Decimals), symbol: metadata.token0Symbol }
       : { decimals: Number(metadata.token1Decimals), symbol: metadata.token1Symbol }
+
+  const previousRuntimeState = readRuntimeState()
+  const lastDeltaHedgeAt = trustedLastDeltaHedgeAt(previousRuntimeState, {
+    chainId: config.CHAIN_ID,
+    safe: config.SAFE_ADDRESS,
+    pool: config.POOL_ADDRESS,
+    signer: account.address,
+  })
 
   // Heartbeat file so `pnpm status` (a separate process) can see running-state
   // and last poll/hedge. Written before the loop; updated each cycle.
@@ -248,6 +278,7 @@ async function main(): Promise<void> {
     lifecycle: 'starting',
     ready: false,
     initAttempts: 0,
+    lastDeltaHedgeAt,
   })
 
   // Off-venue SFPM swap wiring. Resolves the swap pool + poolId, maps the v3
@@ -372,17 +403,20 @@ async function main(): Promise<void> {
     storage: createFileStorage(runtimeDataPath('.hedger-sync-cache')),
     poolMetadata: metadata,
     vaultAsset,
+    lastDeltaHedgeAt,
     recordPoll: (trigger) =>
       patchRuntimeState(instanceId, {
         lastPollAt: new Date().toISOString(),
         lastPollTrigger: trigger,
       }),
+    recordSafeMode: (level) => patchRuntimeState(instanceId, { safeModeLevel: level }),
     recordHedge: (action, tx) =>
       patchRuntimeState(instanceId, {
         lastHedgeAt: new Date().toISOString(),
         lastHedgeAction: action,
         lastHedgeTx: tx,
       }),
+    recordDeltaHedge: (at) => patchRuntimeState(instanceId, { lastDeltaHedgeAt: at }),
     recordDeleverage: (stage, bufferBps, tx, incidentActive) =>
       patchRuntimeState(instanceId, {
         lastDeleverageAt: new Date().toISOString(),
@@ -417,15 +451,156 @@ async function main(): Promise<void> {
     })
   }
   let activeCycle: Promise<CycleOutcome> | null = null
+  let activeOraclePoke: Promise<void> | null = null
+  let lastOracleDiagnosis = ''
+  let shuttingDown = false
+
+  const runOraclePoke = (trigger: string): Promise<void> => {
+    if (
+      shuttingDown ||
+      !config.ORACLE_POKE_ENABLED ||
+      !oracleRiskParameters ||
+      activeCycle ||
+      activeOraclePoke
+    ) {
+      return Promise.resolve()
+    }
+    const state = readRuntimeState()
+    if (!state || state.instanceId !== instanceId || (state.safeModeLevel ?? 0) === 0) {
+      return Promise.resolve()
+    }
+
+    const pending = (async () => {
+      try {
+        const block = await publicClient.getBlock({ blockTag: 'latest' })
+        if (block.number === null) throw new Error('latest block has no number')
+        const [oracleTicks, onchainSafeMode] = await Promise.all([
+          publicClient.readContract({
+            address: config.POOL_ADDRESS,
+            abi: panopticPoolV2Abi,
+            functionName: 'getOracleTicks',
+            blockNumber: block.number,
+          }),
+          publicClient.readContract({
+            address: config.POOL_ADDRESS,
+            abi: panopticPoolV2Abi,
+            functionName: 'isSafeMode',
+            blockNumber: block.number,
+          }),
+        ])
+        const [currentTick, spotTick, medianTick, , oraclePack] = oracleTicks
+        const oracle = decodeOraclePack(oraclePack, block.timestamp)
+        const diagnosis = diagnoseOracleSafeMode(
+          {
+            currentTick: BigInt(currentTick),
+            spotEMA: BigInt(spotTick),
+            fastEMA: oracle.fastEMA,
+            slowEMA: oracle.slowEMA,
+            medianTick: BigInt(medianTick),
+            lockMode: oracle.lockMode,
+          },
+          oracleRiskParameters,
+          BigInt(onchainSafeMode),
+        )
+        patchRuntimeState(instanceId, { safeModeLevel: Number(diagnosis.level) })
+
+        const diagnosisKey = `${diagnosis.level}:${diagnosis.causes.join(',')}`
+        const diagnosisChanged = diagnosisKey !== lastOracleDiagnosis
+        if (diagnosisChanged) {
+          lastOracleDiagnosis = diagnosisKey
+          const details =
+            `external=${diagnosis.externalShockDelta} internal=${diagnosis.internalDisagreementDelta} ` +
+            `median=${diagnosis.highDivergenceDelta}`
+          botLog(
+            `[hedger-bot] oracle SafeMode diagnosis: level=${diagnosis.level} ` +
+              `causes=${diagnosis.causes.join(',') || 'none'} ${details}`,
+          )
+          if (diagnosis.guardianLocked) {
+            botWarn('[hedger-bot] oracle poke suppressed: SafeMode is guardian-locked')
+          }
+          if (!diagnosis.matchesOnchain) {
+            botWarn(
+              `[hedger-bot] unknown RiskEngine SafeMode formula: onchain=${diagnosis.level} ` +
+                `reproduced=${diagnosis.reproducedLevel}; using on-chain level and one-epoch cadence`,
+            )
+          }
+        }
+        if (!diagnosis.shouldPoke) return
+
+        const currentEpoch = oracleEpochAt(block.timestamp)
+        const elapsedEpochs = (currentEpoch - oracle.epoch) & ((1n << 24n) - 1n)
+        if (elapsedEpochs < diagnosis.minimumPokeEpochs) return
+
+        if (config.DRY_RUN) {
+          await publicClient.simulateContract({
+            account: account.address,
+            address: config.POOL_ADDRESS,
+            abi: panopticPoolV2Abi,
+            functionName: 'pokeOracle',
+          })
+          patchRuntimeState(instanceId, {
+            lastOraclePokeAt: new Date().toISOString(),
+            lastOraclePokeResult: 'dry-run',
+          })
+          botLog(`[hedger-bot] oracle poke (${trigger}) simulated`)
+          return
+        }
+
+        const gas = await gasPolicy.assess(false)
+        if (!gas.proceed) {
+          patchRuntimeState(instanceId, { lastOraclePokeResult: 'deferred' })
+          if (gas.shouldNotifySkip) {
+            await notifier.notify(
+              `Oracle poke deferred: basefee ${gas.baseFeeGwei} gwei > ${gas.capGwei} gwei cap`,
+            )
+          }
+          return
+        }
+        assertTradingEnabled()
+        instanceLease.assertOwned()
+        const result = await pokeOracle({
+          client: asSdkClient<typeof pokeOracle>(publicClient),
+          walletClient: asSdkWalletClient<typeof pokeOracle>(walletClient),
+          account: account.address,
+          poolAddress: config.POOL_ADDRESS,
+          checkRateLimit: true,
+          txOverrides: await gasPolicy.fees(),
+        })
+        const receipt = await result.wait()
+        if (receipt.status !== 'success') throw new Error(`oracle poke reverted: ${receipt.hash}`)
+        patchRuntimeState(instanceId, {
+          lastOraclePokeAt: new Date().toISOString(),
+          lastOraclePokeTx: receipt.hash,
+          lastOraclePokeResult: 'confirmed',
+        })
+        botLog(`[hedger-bot] oracle poke (${trigger}) confirmed: ${receipt.hash}`)
+      } catch (error) {
+        patchRuntimeState(instanceId, { lastOraclePokeResult: 'failed' })
+        botError(`[hedger-bot] oracle poke (${trigger}) failed`, error)
+        await notifier.notify(`Oracle poke failed: ${sanitizeError(error)}`)
+      }
+    })()
+    activeOraclePoke = pending
+    const clear = () => {
+      if (activeOraclePoke === pending) activeOraclePoke = null
+    }
+    void pending.then(clear, clear)
+    return pending
+  }
+
   const runAndRecord = (trigger: string): Promise<CycleOutcome> => {
-    if (activeCycle) return Promise.resolve('in-flight')
+    if (activeCycle || activeOraclePoke) return Promise.resolve('in-flight')
     const pending = bot.runCycle(trigger).then((outcome) => {
       recordCycle(outcome)
       return outcome
     })
     activeCycle = pending
     const clear = () => {
-      if (activeCycle === pending) activeCycle = null
+      if (activeCycle !== pending) return
+      activeCycle = null
+      // A failed SafeMode hedge should not wait for the next 65-second timer
+      // edge. The epoch check makes this a no-op when a dispatch already poked.
+      void runOraclePoke('post-cycle')
     }
     void pending.then(clear, clear)
     return pending
@@ -445,21 +620,27 @@ async function main(): Promise<void> {
     })
 
   let pollTimer: ReturnType<typeof setInterval> | undefined
+  let oraclePokeTimer: ReturnType<typeof setInterval> | undefined
   let leaseHeartbeat: InstanceLeaseHeartbeat | undefined
   // Register before startup RPC work so termination still releases state,
   // signer resources, and the single-instance lease during initialization.
-  let shuttingDown = false
   const shutdown = async (signal: string, exitCode = 0) => {
     if (shuttingDown) return
     shuttingDown = true
     botLog(`[hedger-bot] received ${signal}, shutting down`)
     if (pollTimer) clearInterval(pollTimer)
+    if (oraclePokeTimer) clearInterval(oraclePokeTimer)
     leaseHeartbeat?.stop()
     priceSource.stop?.()
     if (activeCycle) {
       await Promise.race([activeCycle.catch(() => undefined), sleep(15_000)])
     }
-    clearRuntimeState(instanceId)
+    if (activeOraclePoke) {
+      await Promise.race([activeOraclePoke.catch(() => undefined), sleep(15_000)])
+    }
+    // Keep the final heartbeat as trusted cadence history. `pnpm status` uses
+    // the recorded PID to distinguish this stopped instance from a live one,
+    // and the next matching startup carries only lastDeltaHedgeAt forward.
     instanceLease.release()
     process.exit(exitCode)
   }
@@ -496,6 +677,11 @@ async function main(): Promise<void> {
       botError('[hedger-bot] poll cycle rejected', error)
     })
   }, config.POLL_INTERVAL_MS)
+  if (config.ORACLE_POKE_ENABLED) {
+    oraclePokeTimer = setInterval(() => {
+      void runOraclePoke('safe-mode-recovery')
+    }, ORACLE_POKE_INTERVAL_MS)
+  }
 }
 
 const entrypoint = process.argv[1]

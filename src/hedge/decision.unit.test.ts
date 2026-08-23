@@ -28,6 +28,7 @@ function planWithCollateral(args: {
     pool: {
       currentTick: args.currentTick,
       poolId: 1n,
+      tickSpacing: 10n,
       poolKey: { tickSpacing: 10 },
     } as never,
     collateral: {
@@ -76,7 +77,12 @@ describe('computeHedgePlan — collateral delta', () => {
 
   it('includes loose Safe balance on the vault-asset side', () => {
     const plan = computeHedgePlan({
-      pool: { currentTick: 0n, poolId: 1n, poolKey: { tickSpacing: 10 } } as never,
+      pool: {
+        currentTick: 0n,
+        poolId: 1n,
+        tickSpacing: 10n,
+        poolKey: { tickSpacing: 10 },
+      } as never,
       collateral: {
         token0: { assets: 10n },
         token1: { assets: 1_000n },
@@ -115,7 +121,12 @@ describe('computeHedgePlan — Uniswap LP delta', () => {
 
   const planWithLp = (includeLp: boolean) =>
     computeHedgePlan({
-      pool: { currentTick: 0n, poolId: 1n, poolKey: { tickSpacing: 10 } } as never,
+      pool: {
+        currentTick: 0n,
+        poolId: 1n,
+        tickSpacing: 10n,
+        poolKey: { tickSpacing: 10 },
+      } as never,
       collateral: { token0: { assets: 0n }, token1: { assets: 0n } } as never,
       signalTick: 0n,
       assetIndex: 0n,
@@ -146,7 +157,12 @@ describe('computeHedgePlan — Uniswap LP delta', () => {
 
   it('lpIncluded is false when there are no LP positions', () => {
     const plan = computeHedgePlan({
-      pool: { currentTick: 0n, poolId: 1n, poolKey: { tickSpacing: 10 } } as never,
+      pool: {
+        currentTick: 0n,
+        poolId: 1n,
+        tickSpacing: 10n,
+        poolKey: { tickSpacing: 10 },
+      } as never,
       collateral: { token0: { assets: 0n }, token1: { assets: 0n } } as never,
       signalTick: 0n,
       assetIndex: 0n,
@@ -170,7 +186,12 @@ describe('planHedge — gating', () => {
     // netDelta 100 / 10000 = 100bps < 200
     const r = planHedge(100n, 0n, 0n, [], PORT, CFG)
     expect(r.action).toBe('none')
-    expect(r.triggers).toEqual({ drift: false, overCap: false, signFlip: false })
+    expect(r.triggers).toEqual({
+      drift: false,
+      timedDrift: false,
+      overCap: false,
+      signFlip: false,
+    })
   })
 
   it('no action when portfolio size is zero and no hedges exist', () => {
@@ -200,6 +221,28 @@ describe('planHedge — gating', () => {
 })
 
 describe('planHedge — 5-case tree', () => {
+  it('fires the timed inner band only when due and below the hard band', () => {
+    const timed = { ...CFG, timedHedgeDue: true, timedHedgeMinDriftBps: 100n }
+    const due = planHedge(150n, 0n, 0n, [], PORT, timed)
+    expect(due.action).toBe('open')
+    expect(due.triggers.timedDrift).toBe(true)
+    expect(due.triggers.drift).toBe(false)
+    expect(planHedge(150n, 0n, 0n, [], PORT, { ...timed, timedHedgeDue: false }).action).toBe(
+      'none',
+    )
+    expect(planHedge(100n, 0n, 0n, [], PORT, timed).action).toBe('none')
+  })
+
+  it('gives hard drift precedence over timed drift', () => {
+    const r = planHedge(300n, 0n, 0n, [], PORT, {
+      ...CFG,
+      timedHedgeDue: true,
+      timedHedgeMinDriftBps: 100n,
+    })
+    expect(r.triggers.drift).toBe(true)
+    expect(r.triggers.timedDrift).toBe(false)
+  })
+
   it('Case A OPEN: no hedges, positive net delta → short hedge sized |H*|', () => {
     const r = planHedge(1000n, 0n, 0n, [], PORT, CFG)
     expect(r.action).toBe('open')
@@ -261,6 +304,17 @@ describe('planHedge — 5-case tree', () => {
     expect(r.triggers.signFlip).toBe(true)
     expect(r.action).toBe('flip')
   })
+
+  it('keeps sign-flip precedence when the timed inner band is also due', () => {
+    const r = planHedge(-120n, 100n, 0n, [short(1n, 100n)], PORT, {
+      ...CFG,
+      timedHedgeDue: true,
+      timedHedgeMinDriftBps: 10n,
+    })
+    expect(r.triggers.signFlip).toBe(true)
+    expect(r.triggers.timedDrift).toBe(false)
+    expect(r.action).toBe('flip')
+  })
 })
 
 describe('planHedge — delta offset (target bias)', () => {
@@ -320,7 +374,12 @@ describe('planHedge — mixed-side book (restart adoption)', () => {
     // no sign flip, count 5 > cap 4. The state-preserving consolidate assumes a
     // single-sided book, so the mixed book is rebuilt with swapAtMint=true.
     const r = planHedge(-100n, 400n, 50n, hedges, PORT, CFG)
-    expect(r.triggers).toEqual({ drift: false, overCap: true, signFlip: false })
+    expect(r.triggers).toEqual({
+      drift: false,
+      timedDrift: false,
+      overCap: true,
+      signFlip: false,
+    })
     expect(r.action).toBe('consolidate')
     expect(r.burns).toEqual([1n, 2n, 3n, 4n, 5n])
     expect(r.mints).toEqual([{ tokenType: SHORT, size: 250n }])
@@ -329,11 +388,29 @@ describe('planHedge — mixed-side book (restart adoption)', () => {
 })
 
 describe('planHedge — capacity overlay', () => {
+  it('keeps capacity precedence and leaves consolidation state-preserving when timed is due', () => {
+    const hedges = [1n, 2n, 3n, 4n, 5n].map((id) => short(id, 100n))
+    const r = planHedge(-150n, 500n, 0n, hedges, PORT, {
+      ...CFG,
+      timedHedgeDue: true,
+      timedHedgeMinDriftBps: 100n,
+    })
+    expect(r.triggers.overCap).toBe(true)
+    expect(r.triggers.timedDrift).toBe(false)
+    expect(r.action).toBe('consolidate')
+    expect(r.swapAtMint).toBe(false)
+  })
+
   it('pure capacity overlay (no drift/flip): consolidate to |H|, swapAtMint=false', () => {
     const hedges = [1n, 2n, 3n, 4n, 5n].map((id) => short(id, 100n))
     // 5 short hedges (H=-500), netDelta -150 (drift 150bps<200), H*=-350 (same side)
     const r = planHedge(-150n, 500n, 0n, hedges, PORT, CFG)
-    expect(r.triggers).toEqual({ drift: false, overCap: true, signFlip: false })
+    expect(r.triggers).toEqual({
+      drift: false,
+      timedDrift: false,
+      overCap: true,
+      signFlip: false,
+    })
     expect(r.action).toBe('consolidate')
     expect(r.burns).toEqual([1n, 2n, 3n, 4n, 5n])
     expect(r.mints).toEqual([{ tokenType: SHORT, size: 500n }]) // |H|

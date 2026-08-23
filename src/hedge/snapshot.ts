@@ -6,6 +6,7 @@ import {
   getBlockMeta,
   getCollateralAddresses,
   getPool,
+  getSafeMode,
   isLiquidatable,
 } from '@panoptic-eng/sdk/v2'
 import type { Address, PublicClient } from 'viem'
@@ -34,6 +35,7 @@ export interface HedgeSnapshot {
   positions: Awaited<ReturnType<typeof readSafePositions>>['positions']
   hedgePositions: Awaited<ReturnType<typeof readSafePositions>>['hedgePositions']
   pool: Awaited<ReturnType<typeof getPool>>
+  safeMode: Awaited<ReturnType<typeof getSafeMode>>
   buyingPower: Awaited<ReturnType<typeof getAccountBuyingPower>>
   collateral: Awaited<ReturnType<typeof getAccountCollateral>>
   liquidation: Awaited<ReturnType<typeof isLiquidatable>>
@@ -104,49 +106,56 @@ export async function readHedgeSnapshot(deps: ReadHedgeSnapshotDeps): Promise<He
   // The LP subgraph read only needs `pool` (resolved above), so run it alongside
   // the account reads rather than serially after them.
   const lpDeps = deps.lp
-  const [buyingPower, collateral, liquidation, walletBalances, lpResult] = await Promise.all([
-    getAccountBuyingPower({
-      client: asSdkClient<typeof getAccountBuyingPower>(deps.publicClient),
-      poolAddress: deps.poolAddress,
-      account: deps.safeAddress,
-      tokenIds,
-      blockNumber,
-      _meta: blockMeta,
-    }),
-    getAccountCollateral({
-      client: asSdkClient<typeof getAccountCollateral>(deps.publicClient),
-      poolAddress: deps.poolAddress,
-      account: deps.safeAddress,
-      collateralAddresses: getCollateralAddresses(pool),
-      blockNumber,
-      _meta: blockMeta,
-    }),
-    isLiquidatable({
-      client: asSdkClient<typeof isLiquidatable>(deps.publicClient),
-      poolAddress: deps.poolAddress,
-      account: deps.safeAddress,
-      tokenIds,
-      blockNumber,
-      _meta: blockMeta,
-    }),
-    readSafeWalletBalances({
-      publicClient: deps.publicClient,
-      safeAddress: deps.safeAddress,
-      asset0: pool.metadata.token0Asset,
-      asset1: pool.metadata.token1Asset,
-      weth9: deps.weth9,
-      blockNumber,
-    }),
-    lpDeps
-      ? readSafeLpPositions({
-          url: lpDeps.subgraphUrl,
-          owners: lpDeps.owners,
-          token0: pool.poolKey.currency0,
-          token1: pool.poolKey.currency1,
-          fetcher: lpDeps.fetcher,
-        })
-      : undefined,
-  ])
+  const [buyingPower, collateral, liquidation, walletBalances, safeMode, lpResult] =
+    await Promise.all([
+      getAccountBuyingPower({
+        client: asSdkClient<typeof getAccountBuyingPower>(deps.publicClient),
+        poolAddress: deps.poolAddress,
+        account: deps.safeAddress,
+        tokenIds,
+        blockNumber,
+        _meta: blockMeta,
+      }),
+      getAccountCollateral({
+        client: asSdkClient<typeof getAccountCollateral>(deps.publicClient),
+        poolAddress: deps.poolAddress,
+        account: deps.safeAddress,
+        collateralAddresses: getCollateralAddresses(pool),
+        blockNumber,
+        _meta: blockMeta,
+      }),
+      isLiquidatable({
+        client: asSdkClient<typeof isLiquidatable>(deps.publicClient),
+        poolAddress: deps.poolAddress,
+        account: deps.safeAddress,
+        tokenIds,
+        blockNumber,
+        _meta: blockMeta,
+      }),
+      readSafeWalletBalances({
+        publicClient: deps.publicClient,
+        safeAddress: deps.safeAddress,
+        asset0: pool.metadata.token0Asset,
+        asset1: pool.metadata.token1Asset,
+        weth9: deps.weth9,
+        blockNumber,
+      }),
+      getSafeMode({
+        client: asSdkClient<typeof getSafeMode>(deps.publicClient),
+        poolAddress: deps.poolAddress,
+        blockNumber,
+        _meta: blockMeta,
+      }),
+      lpDeps
+        ? readSafeLpPositions({
+            url: lpDeps.subgraphUrl,
+            owners: lpDeps.owners,
+            token0: pool.poolKey.currency0,
+            token1: pool.poolKey.currency1,
+            fetcher: lpDeps.fetcher,
+          })
+        : undefined,
+    ])
 
   let lp: HedgeSnapshotLp | undefined
   if (lpDeps && lpResult) {
@@ -159,6 +168,7 @@ export async function readHedgeSnapshot(deps: ReadHedgeSnapshotDeps): Promise<He
     blockNumber,
     ...positions,
     pool,
+    safeMode,
     buyingPower,
     collateral,
     liquidation,

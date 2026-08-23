@@ -65,4 +65,10 @@ describe('renderStatus — Uniswap LP row', () => {
     renderStatus(base)
     expect(output()).not.toContain('uniswap lp')
   })
+
+  it('renders timed hedge cadence state', () => {
+    renderStatus({ ...base, timedHedging: '14400000ms interval, min 100bps; DUE' })
+    expect(output()).toContain('timed hedge')
+    expect(output()).toContain('DUE')
+  })
 })

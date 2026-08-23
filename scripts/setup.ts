@@ -121,6 +121,8 @@ interface DeployState {
   saltNonce: string
   assetIndex: 0 | 1
   deltaThresholdBps?: number
+  timedHedgeIntervalMs?: number
+  timedHedgeMinDriftBps?: number
   deltaOffset?: number
   dryRun: boolean
   /** Extra LP-holding address scanned alongside the Safe. */
@@ -140,6 +142,16 @@ const addressSchema = z
   .string()
   .regex(/^0x[0-9a-fA-F]{40}$/)
   .transform((value) => getAddress(value))
+const enabledTimedHedgeSchema = z
+  .object({
+    intervalMs: z.number().int().min(300_000).max(604_800_000),
+    minDriftBps: z.number().int().positive(),
+    deltaThresholdBps: z.number().int().positive(),
+  })
+  .refine(({ minDriftBps, deltaThresholdBps }) => minDriftBps < deltaThresholdBps, {
+    path: ['minDriftBps'],
+    message: 'timed hedge minimum drift must be below the delta threshold',
+  })
 export const deployStateSchema: z.ZodType<DeployState, z.ZodTypeDef, unknown> = z
   .object({
     version: z.literal(1),
@@ -158,6 +170,8 @@ export const deployStateSchema: z.ZodType<DeployState, z.ZodTypeDef, unknown> = 
     saltNonce: z.string().regex(/^(0|[1-9]\d*)$/),
     assetIndex: z.union([z.literal(0), z.literal(1)]),
     deltaThresholdBps: z.number().int().positive().optional(),
+    timedHedgeIntervalMs: z.number().int().min(0).max(604_800_000).optional(),
+    timedHedgeMinDriftBps: z.number().int().positive().optional(),
     deltaOffset: z.number().int().optional(),
     dryRun: z.boolean(),
     uniswapLpOwner: addressSchema.optional(),
@@ -182,6 +196,19 @@ export const deployStateSchema: z.ZodType<DeployState, z.ZodTypeDef, unknown> = 
     rolesModifierAddress: addressSchema.optional(),
   })
   .strict()
+  .superRefine((state, ctx) => {
+    if (!state.timedHedgeIntervalMs) return
+    const result = enabledTimedHedgeSchema.safeParse({
+      intervalMs: state.timedHedgeIntervalMs,
+      minDriftBps: state.timedHedgeMinDriftBps,
+      deltaThresholdBps: state.deltaThresholdBps ?? 200,
+    })
+    if (!result.success) {
+      for (const issue of result.error.issues) {
+        ctx.addIssue({ ...issue, path: issue.path })
+      }
+    }
+  })
 
 async function writeState(state: DeployState): Promise<void> {
   writeSecureJson(STATE_PATH, deployStateSchema, state)
@@ -560,6 +587,31 @@ async function main(): Promise<void> {
     const deltaThresholdBps = Number(
       await p.text('DELTA_THRESHOLD_BPS (rehedge trigger)', { default: '200' }),
     )
+    const timedHedgingEnabled = await p.confirm(
+      'Enable timed hedging inside the hard delta band?',
+      false,
+    )
+    const timedHedgeIntervalMs = timedHedgingEnabled
+      ? Number(
+          await p.text('TIMED_HEDGE_INTERVAL_MS (5 minutes–7 days)', {
+            default: '14400000',
+          }),
+        )
+      : 0
+    const timedHedgeMinDriftBps = timedHedgingEnabled
+      ? Number(
+          await p.text('TIMED_HEDGE_MIN_DRIFT_BPS (inner timed band)', {
+            default: String(Math.max(1, Math.floor(deltaThresholdBps / 2))),
+          }),
+        )
+      : undefined
+    if (timedHedgingEnabled) {
+      enabledTimedHedgeSchema.parse({
+        intervalMs: timedHedgeIntervalMs,
+        minDriftBps: timedHedgeMinDriftBps,
+        deltaThresholdBps,
+      })
+    }
     const deltaOffset = Number(
       await p.text('DELTA_OFFSET_BPS (target delta bias, bps; 0 = neutral, +long / -short)', {
         default: '0',
@@ -888,6 +940,13 @@ async function main(): Promise<void> {
       saltNonce: saltNonce.toString(),
       assetIndex,
       deltaThresholdBps: Number.isFinite(deltaThresholdBps) ? deltaThresholdBps : undefined,
+      timedHedgeIntervalMs: Number.isFinite(timedHedgeIntervalMs)
+        ? timedHedgeIntervalMs
+        : undefined,
+      timedHedgeMinDriftBps:
+        timedHedgeMinDriftBps !== undefined && Number.isFinite(timedHedgeMinDriftBps)
+          ? timedHedgeMinDriftBps
+          : undefined,
       deltaOffset: Number.isFinite(deltaOffset) ? deltaOffset : undefined,
       dryRun,
       uniswapLpOwner,
@@ -1197,6 +1256,8 @@ async function finalizeDeployment(args: {
     BOT_KEYSTORE_PATH: state.storage === 'keystore' ? keystorePath : undefined,
     ASSET_INDEX: state.assetIndex,
     DELTA_THRESHOLD_BPS: state.deltaThresholdBps,
+    TIMED_HEDGE_INTERVAL_MS: state.timedHedgeIntervalMs,
+    TIMED_HEDGE_MIN_DRIFT_BPS: state.timedHedgeMinDriftBps,
     DELTA_OFFSET_BPS: state.deltaOffset,
     PRICE_SIGNAL_SOURCE: 'pool-tick',
     HEDGE_VENUE: 'in-pool',

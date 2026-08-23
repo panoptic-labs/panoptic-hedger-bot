@@ -70,6 +70,8 @@ describe('activation marker', () => {
       { ...config, ROLE_KEY: `0x${'33'.repeat(32)}` as Hex },
       { ...config, ASSET_INDEX: 1n },
       { ...config, DELTA_THRESHOLD_BPS: config.DELTA_THRESHOLD_BPS + 1n },
+      { ...config, TIMED_HEDGE_INTERVAL_MS: 300_000 },
+      { ...config, TIMED_HEDGE_MIN_DRIFT_BPS: config.TIMED_HEDGE_MIN_DRIFT_BPS + 1n },
       { ...config, MAX_HEDGE_SLOTS: config.MAX_HEDGE_SLOTS + 1 },
       { ...config, SLIPPAGE_BPS: config.SLIPPAGE_BPS + 1 },
       { ...config, MIN_MARGIN_RESERVE_BPS: config.MIN_MARGIN_RESERVE_BPS + 1n },

@@ -35,4 +35,35 @@ describe('deployStateSchema resume compatibility', () => {
       deployStateSchema.parse({ ...LEGACY_V1_STATE, hedgeIncludeLp: false }).hedgeIncludeLp,
     ).toBe(false)
   })
+
+  it('preserves timed hedge settings in resumable state', () => {
+    const state = deployStateSchema.parse({
+      ...LEGACY_V1_STATE,
+      timedHedgeIntervalMs: 14_400_000,
+      timedHedgeMinDriftBps: 100,
+    })
+    expect(state.timedHedgeIntervalMs).toBe(14_400_000)
+    expect(state.timedHedgeMinDriftBps).toBe(100)
+  })
+
+  it('rejects invalid enabled timed hedge settings before resume', () => {
+    expect(() =>
+      deployStateSchema.parse({
+        ...LEGACY_V1_STATE,
+        timedHedgeIntervalMs: 299_999,
+        timedHedgeMinDriftBps: 100,
+      }),
+    ).toThrow(/300000/)
+    expect(() =>
+      deployStateSchema.parse({ ...LEGACY_V1_STATE, timedHedgeIntervalMs: 300_000 }),
+    ).toThrow()
+    expect(() =>
+      deployStateSchema.parse({
+        ...LEGACY_V1_STATE,
+        deltaThresholdBps: 100,
+        timedHedgeIntervalMs: 300_000,
+        timedHedgeMinDriftBps: 100,
+      }),
+    ).toThrow(/below the delta threshold/)
+  })
 })

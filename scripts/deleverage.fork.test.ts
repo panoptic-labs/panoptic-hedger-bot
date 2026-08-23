@@ -447,6 +447,7 @@ describe('hedger-bot deleverager end-to-end (mainnet fork)', () => {
       txWait: { timeoutMs: 60_000, bumpIntervalMs: 30_000 },
       observeTransaction: () => {},
       assertSendAllowed: () => {},
+      recordBroadcastAttempt: () => {},
     }
     const loanRolesExecutor = createRolesExecutor({ ...rolesExecutorDeps, roleKey: loanRoleKey })
     const delevRolesExecutor = createRolesExecutor({

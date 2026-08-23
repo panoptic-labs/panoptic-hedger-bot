@@ -25,6 +25,8 @@ export interface HedgeItem {
 export interface PlanHedgeConfig {
   assetIndex: 0n | 1n
   deltaThresholdBps: bigint
+  timedHedgeMinDriftBps?: bigint
+  timedHedgeDue?: boolean
   // Signed target net delta the bot hedges toward, as bps of portfolio size
   // (0 = neutral). The book is driven to `netDelta === targetDelta`, not 0.
   deltaOffsetBps: bigint
@@ -44,7 +46,7 @@ export interface PlanHedgeResult {
   H: bigint
   Hstar: bigint
   driftBps: bigint
-  triggers: { drift: boolean; overCap: boolean; signFlip: boolean }
+  triggers: { drift: boolean; timedDrift: boolean; overCap: boolean; signFlip: boolean }
 }
 
 const abs = (x: bigint): bigint => (x < 0n ? -x : x)
@@ -90,7 +92,18 @@ export function planHedge(
   const drift = driftBps > cfg.deltaThresholdBps
   const overCap = hedges.length > cfg.absoluteMaxHedgeCount
   const signFlip = H !== 0n && Hstar !== 0n && !sameSign(H, Hstar)
-  const triggers = { drift, overCap, signFlip }
+  // Existing triggers own precedence. In particular, a capacity-only
+  // consolidation must remain state-preserving and leave a due cadence latched
+  // for the next poll.
+  const timedDrift =
+    !drift &&
+    !overCap &&
+    !signFlip &&
+    cfg.timedHedgeDue === true &&
+    cfg.timedHedgeMinDriftBps !== undefined &&
+    driftBps > cfg.timedHedgeMinDriftBps
+  const triggers = { drift, timedDrift, overCap, signFlip }
+  const deltaDrift = drift || timedDrift
 
   const none = (action: HedgeAction = 'none'): PlanHedgeResult => ({
     action,
@@ -104,7 +117,7 @@ export function planHedge(
   })
 
   if (sizeBasis === 0n) return none()
-  if (!(drift || overCap || signFlip)) return none()
+  if (!(deltaDrift || overCap || signFlip)) return none()
 
   const consolidate = (): PlanHedgeResult => {
     // Capacity overlay: collapse all same-side hedges into one WITHOUT changing
@@ -154,10 +167,10 @@ export function planHedge(
   // slippage cost that also clears the self-offsetting pair).
   const netSide = tokenTypeForDirection(H > 0n, cfg.assetIndex)
   const mixedBook = H !== 0n && hedges.some((h) => h.tokenType !== netSide)
-  if (mixedBook && overCap && !(drift || signFlip)) return growConsolidate()
+  if (mixedBook && overCap && !(deltaDrift || signFlip)) return growConsolidate()
 
   // Capacity overlay short-circuits the state-preserving-only case.
-  if (overCap && !(drift || signFlip)) return consolidate()
+  if (overCap && !(deltaDrift || signFlip)) return consolidate()
 
   // Classify.
   if (H === 0n && Hstar === 0n) return none()
@@ -234,6 +247,8 @@ export interface ComputeHedgePlanDeps {
   signalTick: bigint
   assetIndex: 0n | 1n
   deltaThresholdBps: bigint
+  timedHedgeMinDriftBps?: bigint
+  timedHedgeDue?: boolean
   deltaOffsetBps: bigint
   absoluteMaxHedgeCount: number
   slippageBps: bigint
@@ -298,7 +313,7 @@ export interface HedgePlan extends PlanHedgeResult {
  */
 export function computeHedgePlan(deps: ComputeHedgePlanDeps): HedgePlan {
   const { pool, collateral, signalTick, assetIndex } = deps
-  const tickSpacing = BigInt(pool.poolKey.tickSpacing)
+  const tickSpacing = BigInt(pool.tickSpacing)
   const poolId = pool.poolId
   const openIds = deps.positions.map((p) => p.tokenId)
   const markTick = pool.currentTick
@@ -386,6 +401,8 @@ export function computeHedgePlan(deps: ComputeHedgePlanDeps): HedgePlan {
   const plan = planHedge(netDelta, H_short, H_long, hedgeItems, portfolioSize, {
     assetIndex,
     deltaThresholdBps: deps.deltaThresholdBps,
+    timedHedgeMinDriftBps: deps.timedHedgeMinDriftBps,
+    timedHedgeDue: deps.timedHedgeDue,
     deltaOffsetBps: deps.deltaOffsetBps,
     absoluteMaxHedgeCount: deps.absoluteMaxHedgeCount,
   })

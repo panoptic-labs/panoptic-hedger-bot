@@ -1,4 +1,5 @@
-import { panopticPoolV2Abi } from '@panoptic-eng/sdk/v2'
+import type * as PanopticV2Module from '@panoptic-eng/sdk/v2'
+import { panopticPoolV2Abi, simulateWithTokenFlow } from '@panoptic-eng/sdk/v2'
 import type { Address, PublicClient } from 'viem'
 import { decodeFunctionData } from 'viem'
 import { describe, expect, it, vi } from 'vitest'
@@ -7,6 +8,11 @@ import type { RolesExecutor } from '../safe/rolesExecutor'
 import * as botLogModule from '../utils/log'
 import { createSamePoolLoanExecutor, slippageBpsToTickDistance } from './samePoolLoanExecutor'
 import type { HedgeContext, HedgeIntent } from './types'
+
+vi.mock('@panoptic-eng/sdk/v2', async (importOriginal) => {
+  const actual = await importOriginal<typeof PanopticV2Module>()
+  return { ...actual, simulateWithTokenFlow: vi.fn() }
+})
 
 const POOL: Address = '0x2222222222222222222222222222222222222222'
 const SAFE: Address = '0x3333333333333333333333333333333333333333'
@@ -165,8 +171,8 @@ describe('samePoolLoanExecutor.executeOffVenue — replacement hedge', () => {
   })
 })
 
-describe('samePoolLoanExecutor.executeCollateralSwap — balance-first exact input', () => {
-  it('mints a no-swap temporary loan then burns it with swapAtMint in one dispatch', async () => {
+describe('samePoolLoanExecutor.executeCollateralSwap — credit exact input', () => {
+  it('opens and closes a credit with the swap tick order in one dispatch', async () => {
     const roles = fakeRoles()
     const exec = createSamePoolLoanExecutor({
       poolAddress: POOL,
@@ -177,7 +183,8 @@ describe('samePoolLoanExecutor.executeCollateralSwap — balance-first exact inp
       dryRun: false,
     })
     const request = {
-      sellTokenType: 1 as const,
+      kind: 'exactIn' as const,
+      tokenType: 1 as const,
       amountIn: 200_000_000n,
       existingPositionIds: [11n, 22n],
       poolId: 1n,
@@ -186,10 +193,8 @@ describe('samePoolLoanExecutor.executeCollateralSwap — balance-first exact inp
       slippageBps: 30n,
     }
 
-    await exec.simulateCollateralSwap?.(request)
     const result = await exec.executeCollateralSwap?.(request)
 
-    expect(roles.simulate).toHaveBeenCalledTimes(1)
     expect(roles.send).toHaveBeenCalledTimes(1)
     const decoded = decodeDispatch(roles.send.mock.calls[0][0].data)
     expect(decoded.positionIdList).toHaveLength(2)
@@ -197,7 +202,7 @@ describe('samePoolLoanExecutor.executeCollateralSwap — balance-first exact inp
     expect(decoded.finalPositionIdList).toEqual([11n, 22n])
     expect(decoded.positionSizes).toEqual([200_000_000n, 0n])
     expect(decoded.tickLimits).toEqual([
-      [MIN_TICK, MAX_TICK, 0],
+      [70, 130, 0],
       [130, 70, 0],
     ])
     expect(result).toMatchObject({
@@ -205,6 +210,74 @@ describe('samePoolLoanExecutor.executeCollateralSwap — balance-first exact inp
       amountIn: 200_000_000n,
       dryRun: false,
     })
+  })
+
+  it('encodes exact-out with a descending swap mint and reports caller-provided input', async () => {
+    const roles = fakeRoles()
+    const exec = createSamePoolLoanExecutor({
+      poolAddress: POOL,
+      publicClient: PUBLIC_CLIENT,
+      safeAddress: SAFE,
+      rolesExecutor: roles,
+      dryRun: false,
+    })
+
+    const result = await exec.executeCollateralSwap?.({
+      kind: 'exactOut',
+      tokenType: 1,
+      amountOut: 100n,
+      amountIn: 55n,
+      existingPositionIds: [11n, 22n],
+      poolId: 1n,
+      tickSpacing: 10n,
+      currentTick: 100n,
+      slippageBps: 30n,
+    })
+
+    const decoded = decodeDispatch(roles.send.mock.calls[0][0].data)
+    expect(decoded.tickLimits).toEqual([
+      [130, 70, 0],
+      [70, 130, 0],
+    ])
+    expect(result?.amountIn).toBe(55n)
+  })
+
+  it.each([
+    {
+      request: { kind: 'exactIn' as const, tokenType: 1 as const, amountIn: 40n },
+      delta0: 25n,
+      delta1: -40n,
+      expected: { amountIn: 40n, amountOut: 25n },
+    },
+    {
+      request: { kind: 'exactOut' as const, tokenType: 1 as const, amountOut: 30n },
+      delta0: -50n,
+      delta1: 30n,
+      expected: { amountIn: 50n, amountOut: 30n },
+    },
+  ])('maps token-flow deltas for $request.kind', async ({ request, delta0, delta1, expected }) => {
+    vi.mocked(simulateWithTokenFlow).mockResolvedValueOnce({
+      success: true,
+      tokenFlow: { delta0, delta1 },
+    } as never)
+    const exec = createSamePoolLoanExecutor({
+      poolAddress: POOL,
+      publicClient: PUBLIC_CLIENT,
+      safeAddress: SAFE,
+      rolesExecutor: fakeRoles(),
+      dryRun: false,
+    })
+
+    await expect(
+      exec.simulateCollateralSwap?.({
+        ...request,
+        existingPositionIds: [],
+        poolId: 1n,
+        tickSpacing: 10n,
+        currentTick: 100n,
+        slippageBps: 30n,
+      }),
+    ).resolves.toEqual(expected)
   })
 })
 

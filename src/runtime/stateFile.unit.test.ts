@@ -10,6 +10,7 @@ import {
   computeRunning,
   patchRuntimeState,
   readRuntimeState,
+  trustedLastDeltaHedgeAt,
   writeRuntimeState,
 } from './stateFile'
 
@@ -42,8 +43,24 @@ describe('runtime state file', () => {
   })
 
   it('round-trips write → read', () => {
-    writeRuntimeState(base)
-    expect(readRuntimeState()).toEqual(base)
+    const withCadence = { ...base, lastDeltaHedgeAt: '2026-01-01T00:00:00Z' }
+    writeRuntimeState(withCadence)
+    expect(readRuntimeState()).toEqual(withCadence)
+  })
+
+  it('preserves cadence history only for the same chain, Safe, pool, and signer', () => {
+    const state = { ...base, lastDeltaHedgeAt: '2026-01-01T00:00:00Z' }
+    const identity = {
+      chainId: state.chainId,
+      safe: state.safe,
+      pool: state.pool,
+      signer: state.signer,
+    }
+    expect(trustedLastDeltaHedgeAt(state, identity)).toBe(state.lastDeltaHedgeAt)
+    expect(trustedLastDeltaHedgeAt(state, { ...identity, chainId: 2 })).toBeUndefined()
+    expect(trustedLastDeltaHedgeAt(state, { ...identity, safe: base.pool })).toBeUndefined()
+    expect(trustedLastDeltaHedgeAt(state, { ...identity, pool: base.safe })).toBeUndefined()
+    expect(trustedLastDeltaHedgeAt(state, { ...identity, signer: base.safe })).toBeUndefined()
   })
 
   it('merges into existing state and throws when no state exists', () => {

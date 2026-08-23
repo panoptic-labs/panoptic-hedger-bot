@@ -74,20 +74,34 @@ export interface HedgeSwapRequirement {
   inPoolAmountOut: bigint
 }
 
-/** Standalone exact-input collateral swap which leaves no loan position open. */
-export interface CollateralSwapRequest {
-  sellTokenType: 0 | 1
-  amountIn: bigint
+/** Standalone collateral swap which leaves no loan position open. */
+export type CollateralSwapRequest = {
   existingPositionIds: bigint[]
   poolId: bigint
   tickSpacing: bigint
   currentTick: bigint
   slippageBps: bigint
+} & (
+  | { kind: 'exactIn'; tokenType: 0 | 1; amountIn: bigint }
+  | {
+      kind: 'exactOut'
+      /** Token index received by the swap. */
+      tokenType: 0 | 1
+      amountOut: bigint
+      /** Simulated input required for this exact output, when already quoted by the caller. */
+      amountIn?: bigint
+    }
+)
+
+export interface CollateralSwapQuote {
+  amountIn: bigint
+  amountOut: bigint
 }
 
 export interface CollateralSwapResult {
   transactionHash: Hex | null
   receipt: TransactionReceipt | null
+  /** Exact input spent, including the simulated/caller-provided input for exact-out swaps. */
   amountIn: bigint
   dryRun: boolean
 }
@@ -123,9 +137,9 @@ export interface HedgeExecutor {
    * Optional for test/dummy executors which do not support standalone swaps.
    */
   deriveSwapRequirement?(intent: HedgeIntent): Promise<HedgeSwapRequirement | null>
-  /** Preflight a temporary-loan exact-input swap which leaves no position open. */
-  simulateCollateralSwap?(request: CollateralSwapRequest): Promise<void>
-  /** Execute a temporary-loan exact-input swap which leaves no position open. */
+  /** Quote an exact-input or exact-output temporary-credit swap with no open position. */
+  simulateCollateralSwap?(request: CollateralSwapRequest): Promise<CollateralSwapQuote>
+  /** Execute an exact-input or exact-output temporary-credit swap with no open position. */
   executeCollateralSwap?(
     request: CollateralSwapRequest,
     ctx?: HedgeContext,

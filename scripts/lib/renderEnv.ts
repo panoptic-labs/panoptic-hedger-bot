@@ -22,6 +22,8 @@ export interface EnvValues {
   // Hedging parameters
   ASSET_INDEX: 0 | 1
   DELTA_THRESHOLD_BPS?: number
+  TIMED_HEDGE_INTERVAL_MS?: number
+  TIMED_HEDGE_MIN_DRIFT_BPS?: number
   DELTA_OFFSET_BPS?: number
   MAX_HEDGE_SLOTS?: number
   SLIPPAGE_BPS?: number
@@ -44,6 +46,7 @@ export interface EnvValues {
   DELEVERAGER_ENABLED?: boolean
   // Loop
   POLL_INTERVAL_MS?: number
+  ORACLE_POKE_ENABLED?: boolean
   DRY_RUN?: boolean
   // Optional
   UNISWAP_LP_OWNER?: `0x${string}`
@@ -103,6 +106,8 @@ export function renderEnvFile(values: EnvValues): string {
       lines: [
         { key: 'ASSET_INDEX', value: values.ASSET_INDEX },
         { key: 'DELTA_THRESHOLD_BPS', value: values.DELTA_THRESHOLD_BPS },
+        { key: 'TIMED_HEDGE_INTERVAL_MS', value: values.TIMED_HEDGE_INTERVAL_MS },
+        { key: 'TIMED_HEDGE_MIN_DRIFT_BPS', value: values.TIMED_HEDGE_MIN_DRIFT_BPS },
         { key: 'DELTA_OFFSET_BPS', value: values.DELTA_OFFSET_BPS },
         { key: 'MAX_HEDGE_SLOTS', value: values.MAX_HEDGE_SLOTS },
         { key: 'SLIPPAGE_BPS', value: values.SLIPPAGE_BPS },
@@ -149,6 +154,7 @@ export function renderEnvFile(values: EnvValues): string {
         // Always emit the poll interval so it is visible + editable in .env
         // (falls back to the schema default when the wizard didn't set one).
         { key: 'POLL_INTERVAL_MS', value: values.POLL_INTERVAL_MS ?? 60_000 },
+        { key: 'ORACLE_POKE_ENABLED', value: values.ORACLE_POKE_ENABLED ?? false },
         { key: 'DRY_RUN', value: values.DRY_RUN },
       ],
     },

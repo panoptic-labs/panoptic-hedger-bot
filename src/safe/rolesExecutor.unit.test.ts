@@ -45,6 +45,7 @@ function makeDeps(overrides: Partial<RolesExecutorDeps> = {}): RolesExecutorDeps
     roleKey: ROLE_KEY,
     safeAddress: SAFE,
     observeTransaction: vi.fn(),
+    recordBroadcastAttempt: vi.fn(),
     assertSendAllowed: vi.fn(),
     ...overrides,
     publicClient,
@@ -87,9 +88,13 @@ describe('RolesExecutor.wrapCalldata', () => {
 describe('RolesExecutor.send', () => {
   it('sends the wrapped calldata to the modifier from the bot account', async () => {
     const sendTransaction = vi.fn().mockResolvedValue('0xhash')
+    const observeTransaction = vi.fn()
+    const recordBroadcastAttempt = vi.fn()
     const exec = createRolesExecutor(
       makeDeps({
         walletClient: { sendTransaction, chain: null } as never,
+        observeTransaction,
+        recordBroadcastAttempt,
       }),
     )
     const mined = await exec.send(CALL)
@@ -100,6 +105,14 @@ describe('RolesExecutor.send', () => {
     expect(arg.value).toBe(0n)
     expect(arg.account).toBe(account)
     expect(arg.data).toBe(exec.wrapCalldata(CALL))
+    expect(observeTransaction.mock.calls.map(([update]) => update.hashes)).toEqual([[], ['0xhash']])
+    expect(recordBroadcastAttempt).toHaveBeenCalledOnce()
+    expect(observeTransaction.mock.invocationCallOrder[0]).toBeLessThan(
+      recordBroadcastAttempt.mock.invocationCallOrder[0],
+    )
+    expect(recordBroadcastAttempt.mock.invocationCallOrder[0]).toBeLessThan(
+      sendTransaction.mock.invocationCallOrder[0],
+    )
   })
 
   it('fails before sending when ownership drift makes the bot a Safe owner', async () => {
@@ -119,10 +132,12 @@ describe('RolesExecutor.send', () => {
   it('fails at the immediate broadcast fence after a cycle was already planned', async () => {
     const sendTransaction = vi.fn()
     const observeTransaction = vi.fn()
+    const recordBroadcastAttempt = vi.fn()
     const exec = createRolesExecutor(
       makeDeps({
         walletClient: { sendTransaction, chain: null } as never,
         observeTransaction,
+        recordBroadcastAttempt,
         assertSendAllowed: vi.fn(() => {
           throw new Error('emergency deactivation is active')
         }),
@@ -132,6 +147,7 @@ describe('RolesExecutor.send', () => {
     await expect(exec.send(CALL)).rejects.toThrow(/deactivation is active/)
     expect(sendTransaction).not.toHaveBeenCalled()
     expect(observeTransaction).not.toHaveBeenCalled()
+    expect(recordBroadcastAttempt).not.toHaveBeenCalled()
   })
 })
 
@@ -265,7 +281,7 @@ describe('RolesExecutor.send — confirm-with-escalation', () => {
   })
 
   it('re-sends the SAME nonce with bumped fees when stuck, returns the mined replacement', async () => {
-    const { exec, sendTransaction, bumpFees } = makeHarness({
+    const { exec, sendTransaction, bumpFees, deps } = makeHarness({
       bumpQueue: [FEES_B],
       mineAt: { 1: 40 }, // replacement (sent at t=30) mines at t=40
     })
@@ -277,6 +293,10 @@ describe('RolesExecutor.send — confirm-with-escalation', () => {
     expect(second.maxFeePerGas).toBe(FEES_B.maxFeePerGas)
     expect(second.maxPriorityFeePerGas).toBe(FEES_B.maxPriorityFeePerGas)
     expect(bumpFees).toHaveBeenCalledWith(FEES_A, { urgent: true })
+    const markerCallOrder = vi.mocked(deps.recordBroadcastAttempt).mock.invocationCallOrder
+    expect(markerCallOrder).toHaveLength(2)
+    expect(markerCallOrder[0]).toBeLessThan(sendTransaction.mock.invocationCallOrder[0])
+    expect(markerCallOrder[1]).toBeLessThan(sendTransaction.mock.invocationCallOrder[1])
   })
 
   it('resolves to the original when the replacement is rejected with a nonce error (it mined)', async () => {

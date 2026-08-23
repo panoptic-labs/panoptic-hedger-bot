@@ -174,6 +174,11 @@ const rawEnvSchema = z
     // Hedging parameters
     ASSET_INDEX: z.enum(['0', '1']).transform((v) => BigInt(v)),
     DELTA_THRESHOLD_BPS: boundedBigint(1n, 5_000n, 200n),
+    // Optional hybrid cadence: the hard threshold always fires immediately;
+    // once this interval is due, the smaller inner drift band may also fire.
+    // Zero disables the timed trigger for backwards compatibility.
+    TIMED_HEDGE_INTERVAL_MS: boundedInteger(0, 604_800_000, 0),
+    TIMED_HEDGE_MIN_DRIFT_BPS: boundedBigint(0n, 5_000n, 100n),
     // Target net delta the bot hedges TOWARD, as signed bps of portfolio size
     // (0 = delta-neutral, positive = long bias, negative = short bias).
     DELTA_OFFSET_BPS: boundedSignedBigint(-5_000n, 5_000n, 0n),
@@ -267,10 +272,18 @@ const rawEnvSchema = z
     // While waiting, re-send the same nonce with >=12.5%-bumped fees every this
     // often, until MAX_FEE_GWEI caps the escalation or the receipt budget ends.
     TX_BUMP_INTERVAL_MS: boundedInteger(5_000, 300_000, 45_000),
+    // Blocks past a pending intent's submission before recovery declares its
+    // nonce slot a mempool-drop and auto-fails the entry. Below this, the
+    // slot is treated as still-in-flight and the entry is retained.
+    HEDGER_NONCE_STALL_BLOCKS: boundedInteger(4, 4_096, 64),
 
     // Loop
     POLL_INTERVAL_MS: boundedInteger(5_000, 300_000, 60_000),
+    // Permissionless direct-EOA recovery call. Opt-in because it spends keeper
+    // gas independently of hedge dispatches; live use is activation-bound.
+    ORACLE_POKE_ENABLED: booleanSchema.default('false'),
     DRY_RUN: booleanSchema.default('false'),
+    BALANCE_FIRST_ENABLED: booleanSchema.default('false'),
 
     // Optional
     // Block floor for the SDK position-event scan (syncPositions). Defaults to
@@ -442,6 +455,33 @@ const rawEnvSchema = z
         path: ['KEEPER_BALANCE_WARN_ETH'],
         message: 'KEEPER_BALANCE_WARN_ETH must be below MIN_KEEPER_BALANCE_ETH',
       })
+    }
+    if (cfg.TIMED_HEDGE_INTERVAL_MS > 0) {
+      if (cfg.TIMED_HEDGE_INTERVAL_MS < 300_000) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['TIMED_HEDGE_INTERVAL_MS'],
+          message: 'enabled interval must be at least 300000 (5 minutes)',
+        })
+      }
+      if (cfg.TIMED_HEDGE_INTERVAL_MS < cfg.POLL_INTERVAL_MS) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['TIMED_HEDGE_INTERVAL_MS'],
+          message: 'must be at least POLL_INTERVAL_MS when timed hedging is enabled',
+        })
+      }
+      if (
+        cfg.TIMED_HEDGE_MIN_DRIFT_BPS <= 0n ||
+        cfg.TIMED_HEDGE_MIN_DRIFT_BPS >= cfg.DELTA_THRESHOLD_BPS
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['TIMED_HEDGE_MIN_DRIFT_BPS'],
+          message:
+            'must be greater than 0 and below DELTA_THRESHOLD_BPS (timed minimum is the inner band; hard threshold is the outer band)',
+        })
+      }
     }
     if (cfg.PRICE_SIGNAL_SOURCE === 'cex' && cfg.CEX_MIN_FEEDS < 3) {
       ctx.addIssue({

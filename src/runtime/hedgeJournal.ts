@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto'
 
 import type { Address, Hex, PublicClient } from 'viem'
-import { getAddress, isHex, keccak256 } from 'viem'
+import { getAddress, isHex, TransactionReceiptNotFoundError } from 'viem'
 import { z } from 'zod'
 
 import type { HedgeAction } from '../executor/types'
+import { botLog, botWarn } from '../utils/log'
 import { runtimeDataPath } from './paths'
 import { readSecureJson, writeSecureJson } from './secureFile'
 
@@ -42,6 +43,7 @@ const journalIntentSchema = z
       .regex(/^0x[0-9a-f]{64}$/)
       .nullable(),
     submittedAtBlock: tokenIdSchema.nullable(),
+    broadcastAttempts: z.number().int().nonnegative(),
     hashes: hexSchema.array().max(32),
     status: z.enum(['pending', 'confirmed']),
     confirmedHash: z
@@ -58,7 +60,7 @@ const journalIntentSchema = z
 
 const journalSchema = z
   .object({
-    version: z.literal(2),
+    version: z.literal(3),
     chainId: z.number().int().positive(),
     safe: addressSchema,
     pool: addressSchema,
@@ -67,7 +69,18 @@ const journalSchema = z
   })
   .strict()
 
-const legacyIntentSchema = journalIntentSchema.extend({
+const v2IntentSchema = journalIntentSchema.omit({ broadcastAttempts: true })
+const v2JournalSchema = z
+  .object({
+    version: z.literal(2),
+    chainId: z.number().int().positive(),
+    safe: addressSchema,
+    pool: addressSchema,
+    signer: addressSchema,
+    intents: v2IntentSchema.array().max(256),
+  })
+  .strict()
+const legacyIntentSchema = v2IntentSchema.extend({
   expectedOpened: tokenIdSchema.nullable(),
   expectedClosed: tokenIdSchema.array().max(64),
   openPositionSize: tokenIdSchema.nullable(),
@@ -86,9 +99,18 @@ const legacyJournalSchema = z
     intents: legacyIntentSchema.array().max(256),
   })
   .strict()
-const journalFileSchema = z.union([journalSchema, legacyJournalSchema])
+const journalFileSchema = z.union([journalSchema, v2JournalSchema, legacyJournalSchema])
 
 type JournalData = z.infer<typeof journalSchema>
+
+function migrateV2Intent(entry: z.infer<typeof v2IntentSchema>) {
+  return {
+    ...entry,
+    // v2 only persisted transaction identity after sendTransaction returned,
+    // so any identified transaction must be treated as already attempted.
+    broadcastAttempts: entry.submittedAtBlock === null ? 0 : 1,
+  }
+}
 
 export interface JournalTransactionUpdate {
   sender: Address
@@ -117,52 +139,23 @@ export interface HedgeRecoveryClient {
     to: Address | null
     status: 'success' | 'reverted'
   }>
-  findMinedTransactions(identity: {
-    sender: Address
-    nonce: number
-    target: Address
-    calldataHash: Hex
-    fromBlock: bigint
-  }): Promise<Hex[]>
+  getTransactionCount(address: Address): Promise<number>
 }
-
-const MAX_AMBIGUOUS_RECOVERY_BLOCKS = 2_048n
 
 export function createHedgeRecoveryClient(publicClient: PublicClient): HedgeRecoveryClient {
   return {
     getBlockNumber: () => publicClient.getBlockNumber(),
     getBlock: (args) => publicClient.getBlock(args),
     getTransactionReceipt: (args) => publicClient.getTransactionReceipt(args),
-    async findMinedTransactions(identity) {
-      const latest = await publicClient.getBlockNumber()
-      if (latest < identity.fromBlock) return []
-      if (latest - identity.fromBlock > MAX_AMBIGUOUS_RECOVERY_BLOCKS) {
-        throw new Error('ambiguous hedge recovery exceeds the bounded block search window')
-      }
-      const matches: Hex[] = []
-      for (let blockNumber = identity.fromBlock; blockNumber <= latest; blockNumber += 1n) {
-        const block = await publicClient.getBlock({ blockNumber, includeTransactions: true })
-        for (const transaction of block.transactions) {
-          if (
-            typeof transaction !== 'string' &&
-            getAddress(transaction.from) === getAddress(identity.sender) &&
-            transaction.nonce === identity.nonce &&
-            transaction.to !== null &&
-            getAddress(transaction.to) === getAddress(identity.target) &&
-            keccak256(transaction.input) === identity.calldataHash
-          ) {
-            matches.push(transaction.hash)
-          }
-        }
-      }
-      return matches
-    },
+    getTransactionCount: (address) =>
+      publicClient.getTransactionCount({ address, blockTag: 'latest' }),
   }
 }
 
 export interface HedgeJournalPort {
   begin(action: HedgeJournalAction): string
   observeTransaction(update: JournalTransactionUpdate): void
+  recordBroadcastAttempt(): void
   confirm(receipt: { transactionHash: Hex; blockNumber: bigint; blockHash: Hex }): void
   fail(): void
   recover(publicClient: HedgeRecoveryClient): Promise<void>
@@ -186,19 +179,21 @@ export class HedgeJournal implements HedgeJournalPort {
   private data: JournalData
   private activeIntentId: string | null = null
   private readonly confirmedRecheckBlocks: bigint
+  private readonly nonceStallBlocks: bigint
 
   constructor(
     identity: { chainId: number; safe: Address; pool: Address; signer: Address },
-    options: { confirmedRecheckBlocks?: bigint } = {},
+    options: { confirmedRecheckBlocks?: bigint; nonceStallBlocks?: bigint } = {},
   ) {
     this.confirmedRecheckBlocks = options.confirmedRecheckBlocks ?? 64n
+    this.nonceStallBlocks = options.nonceStallBlocks ?? 64n
     const existing = readSecureJson(hedgeJournalPath(), journalFileSchema, {
       maxBytes: 256 * 1024,
       invalid: 'throw',
     })
     if (existing === null) {
       this.data = {
-        version: 2,
+        version: 3,
         chainId: identity.chainId,
         safe: lower(identity.safe),
         pool: lower(identity.pool),
@@ -207,28 +202,29 @@ export class HedgeJournal implements HedgeJournalPort {
       }
       return
     }
-    const parsed: JournalData =
-      existing.version === 2
-        ? existing
-        : {
-            version: 2,
-            chainId: existing.chainId,
-            safe: existing.safe,
-            pool: existing.pool,
-            signer: existing.signer,
-            intents: existing.intents
-              .filter((entry) => entry.status !== 'failed')
-              .map(
-                ({
-                  expectedOpened: _expectedOpened,
-                  expectedClosed: _expectedClosed,
-                  openPositionSize: _openPositionSize,
-                  currentTick: _currentTick,
-                  slippageBps: _slippageBps,
-                  ...entry
-                }) => ({ ...entry, status: entry.status as 'pending' | 'confirmed' }),
-              ),
-          }
+    const parsed: JournalData = {
+      version: 3,
+      chainId: existing.chainId,
+      safe: existing.safe,
+      pool: existing.pool,
+      signer: existing.signer,
+      intents: (() => {
+        if (existing.version === 3) return existing.intents
+        if (existing.version === 2) return existing.intents.map(migrateV2Intent)
+        return existing.intents
+          .filter((entry) => entry.status !== 'failed')
+          .map(
+            ({
+              expectedOpened: _expectedOpened,
+              expectedClosed: _expectedClosed,
+              openPositionSize: _openPositionSize,
+              currentTick: _currentTick,
+              slippageBps: _slippageBps,
+              ...entry
+            }) => migrateV2Intent({ ...entry, status: entry.status as 'pending' | 'confirmed' }),
+          )
+      })(),
+    }
     if (
       parsed.chainId !== identity.chainId ||
       parsed.safe !== lower(identity.safe) ||
@@ -253,6 +249,7 @@ export class HedgeJournal implements HedgeJournalPort {
       target: null,
       calldataHash: null,
       submittedAtBlock: null,
+      broadcastAttempts: 0,
       hashes: [],
       status: 'pending',
       confirmedHash: null,
@@ -288,6 +285,21 @@ export class HedgeJournal implements HedgeJournalPort {
       Object.assign(entry, immutable)
     }
     entry.hashes = [...new Set(update.hashes.map((hash) => hash.toLowerCase()))]
+    this.persist()
+  }
+
+  recordBroadcastAttempt(): void {
+    const entry = this.activeIntent()
+    if (
+      entry.sender === null ||
+      entry.nonce === null ||
+      entry.target === null ||
+      entry.calldataHash === null ||
+      entry.submittedAtBlock === null
+    ) {
+      throw new Error('transaction identity must be durable before broadcast')
+    }
+    entry.broadcastAttempts += 1
     this.persist()
   }
 
@@ -346,66 +358,99 @@ export class HedgeJournal implements HedgeJournalPort {
       }
       if (entry.status !== 'pending') continue
 
-      const getReceipts = () =>
-        Promise.all(
-          entry.hashes.map((hash) => {
-            if (!isHex(hash)) throw new Error('invalid transaction hash in hedge journal')
-            return publicClient.getTransactionReceipt({ hash }).catch(() => null)
-          }),
-        )
-      let receipts = await getReceipts()
-      let mined = receipts.filter((receipt) => receipt !== null)
-
-      // An observed replacement hash is durable before broadcast. If one of
-      // those hashes is mined, its receipt resolves recovery directly and there
-      // is no reason to scan historical blocks. The bounded identity scan only
-      // exists for the crash window after broadcast but before the hash list was
-      // persisted.
-      if (
-        mined.length === 0 &&
-        entry.sender !== null &&
-        entry.nonce !== null &&
-        entry.target !== null &&
-        entry.calldataHash !== null &&
-        entry.submittedAtBlock !== null
-      ) {
-        const discovered = await publicClient.findMinedTransactions({
-          sender: getAddress(entry.sender),
-          nonce: entry.nonce,
-          target: getAddress(entry.target),
-          calldataHash: checkedHex(entry.calldataHash),
-          fromBlock: BigInt(entry.submittedAtBlock),
-        })
-        entry.hashes = [
-          ...new Set([...entry.hashes, ...discovered.map((hash) => hash.toLowerCase())]),
-        ]
-        if (discovered.length > 0) {
-          this.persist()
-          receipts = await getReceipts()
-          mined = receipts.filter((receipt) => receipt !== null)
+      // Fast path: any recorded replacement hash whose receipt we can fetch
+      // resolves recovery directly. Prefer a success; a lone revert also settles
+      // the entry. Multiple mined replacements at once are treated as "spent" —
+      // exactly which one landed is not load-bearing because the next cycle
+      // re-derives the plan from live on-chain state.
+      const receipts = await Promise.all(
+        entry.hashes.map((hash) => {
+          if (!isHex(hash)) throw new Error('invalid transaction hash in hedge journal')
+          // Only "not found" (tx still unknown to this node) means "no receipt";
+          // transport/RPC failures must propagate so recovery does not silently
+          // treat an unreachable node as evidence the tx never landed.
+          return publicClient.getTransactionReceipt({ hash }).catch((error) => {
+            if (error instanceof TransactionReceiptNotFoundError) return null
+            throw error
+          })
+        }),
+      )
+      const mined = receipts.filter((receipt) => receipt !== null)
+      const success = mined.find((receipt) => receipt.status === 'success')
+      if (success) {
+        if (
+          entry.sender === null ||
+          entry.nonce === null ||
+          entry.target === null ||
+          getAddress(success.from) !== entry.sender ||
+          (success.to === null ? null : getAddress(success.to)) !== entry.target
+        ) {
+          throw new Error('mined replacement does not match the durable hedge transaction identity')
         }
-      }
-      if (mined.length > 1) throw new Error('ambiguous hedge recovery: multiple replacements mined')
-      const receipt = mined[0]
-      if (!receipt)
-        throw new Error('pending hedge has no confirmed replacement; operator review required')
-      if (
-        entry.sender === null ||
-        entry.nonce === null ||
-        entry.target === null ||
-        getAddress(receipt.from) !== entry.sender ||
-        (receipt.to === null ? null : getAddress(receipt.to)) !== entry.target
-      ) {
-        throw new Error('mined replacement does not match the durable hedge transaction identity')
-      }
-      this.activeIntentId = entry.id
-      if (receipt.status === 'success') {
+        entry.hashes = [...new Set([...entry.hashes, success.transactionHash.toLowerCase()])]
+        this.activeIntentId = entry.id
         this.confirm({
-          transactionHash: receipt.transactionHash,
-          blockNumber: receipt.blockNumber,
-          blockHash: receipt.blockHash,
+          transactionHash: success.transactionHash,
+          blockNumber: success.blockNumber,
+          blockHash: success.blockHash,
         })
-      } else this.fail()
+        continue
+      }
+      if (mined.length > 0) {
+        botWarn(
+          `[hedger-bot] pending intent ${entry.id} (action=${entry.action}) all recorded ` +
+            `replacements reverted; dropping so the next cycle can re-plan from chain state`,
+        )
+        this.activeIntentId = entry.id
+        this.fail()
+        continue
+      }
+
+      // No receipt for any recorded hash. Use the sender's on-chain nonce as the
+      // deterministic ground truth: if the nonce slot is spent, something landed
+      // (a fee-bumped replacement, or an out-of-band tx). We don't need to know
+      // exactly what — the next cycle re-derives the plan from chain state, so
+      // the effect (or lack of it) is already visible. Drop the entry.
+      if (entry.broadcastAttempts === 0 || entry.sender === null || entry.nonce === null) {
+        botLog(
+          `[hedger-bot] auto-expiring never-broadcast intent ${entry.id} (action=${entry.action})`,
+        )
+        this.activeIntentId = entry.id
+        this.fail()
+        continue
+      }
+      const chainNonce = await publicClient.getTransactionCount(getAddress(entry.sender))
+      if (chainNonce > entry.nonce) {
+        botWarn(
+          `[hedger-bot] pending intent ${entry.id} (action=${entry.action}, nonce=${entry.nonce}) ` +
+            `is spent on-chain (chainNonce=${chainNonce}); dropping — the next cycle re-derives ` +
+            `from chain state. Correlate on Etherscan if you need the exact hash.`,
+        )
+        this.activeIntentId = entry.id
+        this.fail()
+        continue
+      }
+      const submittedAt =
+        entry.submittedAtBlock === null ? latestBlock : BigInt(entry.submittedAtBlock)
+      const blocksSinceSubmit = latestBlock > submittedAt ? latestBlock - submittedAt : 0n
+      if (blocksSinceSubmit < this.nonceStallBlocks) {
+        // Nonce slot still open and it's too early to declare the send lost.
+        // Keep the entry pending; next cycle's begin() will bounce and recovery
+        // will retry when the wait exceeds the stall window.
+        botLog(
+          `[hedger-bot] pending intent ${entry.id} (action=${entry.action}, nonce=${entry.nonce}) ` +
+            `still legitimately in flight (chainNonce=${chainNonce}, blocksSinceSubmit=` +
+            `${blocksSinceSubmit}); keeping pending`,
+        )
+        continue
+      }
+      botWarn(
+        `[hedger-bot] pending intent ${entry.id} (action=${entry.action}, nonce=${entry.nonce}) ` +
+          `and all fee-bumped replacements dropped from mempool ` +
+          `(chainNonce=${chainNonce}, blocksSinceSubmit=${blocksSinceSubmit}); auto-failing`,
+      )
+      this.activeIntentId = entry.id
+      this.fail()
     }
     this.pruneTerminalIntents(latestBlock)
     this.persist()

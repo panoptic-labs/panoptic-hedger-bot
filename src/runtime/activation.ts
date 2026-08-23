@@ -16,10 +16,10 @@ import { readSecureJson, writeSecureJson } from './secureFile'
 import { botVersion } from './stateFile'
 
 const ACTIVATION_SCHEMA_VERSION = 2 as const
-// v5: binds the optional explicitly provisioned SFPM venue to activation.
+// v7: additionally binds the opt-in direct-EOA oracle-poke behavior.
 // Bumping this invalidates existing activation markers on purpose —
 // operators re-review and re-run `pnpm activate` after upgrading.
-export const ACTIVATION_POLICY_VERSION = 'hedger-bot-policy-v6' as const
+export const ACTIVATION_POLICY_VERSION = 'hedger-bot-policy-v7' as const
 const MAX_ACTIVATION_BYTES = 16 * 1024
 // keccak256(toHex(JSON.stringify(build<Role>DispatchConditions()))) of the
 // reviewed SDK condition trees — recompute and re-review on any builder change.
@@ -183,6 +183,8 @@ export function buildActivationPolicy(
     hedgeVenue: config.HEDGE_VENUE,
     assetIndex: config.ASSET_INDEX.toString(),
     deltaThresholdBps: config.DELTA_THRESHOLD_BPS.toString(),
+    timedHedgeIntervalMs: config.TIMED_HEDGE_INTERVAL_MS,
+    timedHedgeMinDriftBps: config.TIMED_HEDGE_MIN_DRIFT_BPS.toString(),
     maxHedgeSlots: config.MAX_HEDGE_SLOTS,
     slippageBps: config.SLIPPAGE_BPS,
     minMarginReserveBps: config.MIN_MARGIN_RESERVE_BPS.toString(),
@@ -216,6 +218,7 @@ export function buildActivationPolicy(
       bumpIntervalMs: config.TX_BUMP_INTERVAL_MS,
     },
     pollIntervalMs: config.POLL_INTERVAL_MS,
+    oraclePokeEnabled: config.ORACLE_POKE_ENABLED,
     codeIdentityFingerprint: evidence.codeIdentityFingerprint,
     permissionManifestFingerprint: evidence.permissionManifestFingerprint,
   }

@@ -21,10 +21,13 @@ describe('parseHedgerBotConfig', () => {
     expect(cfg.CHAIN_ID).toBe(1)
     expect(cfg.ASSET_INDEX).toBe(1n)
     expect(cfg.DELTA_THRESHOLD_BPS).toBe(200n)
+    expect(cfg.TIMED_HEDGE_INTERVAL_MS).toBe(0)
+    expect(cfg.TIMED_HEDGE_MIN_DRIFT_BPS).toBe(100n)
     expect(cfg.MAX_HEDGE_SLOTS).toBe(4)
     expect(cfg.SLIPPAGE_BPS).toBe(100)
     expect(cfg.PRICE_SIGNAL_SOURCE).toBe('pool-tick')
     expect(cfg.POLL_INTERVAL_MS).toBe(60_000)
+    expect(cfg.ORACLE_POKE_ENABLED).toBe(false)
     expect(cfg.DRY_RUN).toBe(false)
     expect(cfg.SFPM_SWAP_PROVISIONED).toBe(false)
   })
@@ -51,6 +54,59 @@ describe('parseHedgerBotConfig', () => {
     expect(cfg.DRY_RUN).toBe(true)
     expect(cfg.DELTA_THRESHOLD_BPS).toBe(150n)
     expect(cfg.POLL_INTERVAL_MS).toBe(30_000)
+  })
+
+  it('accepts a valid timed inner band and cadence', () => {
+    const cfg = parseHedgerBotConfig({
+      ...BASE_ENV,
+      DELTA_THRESHOLD_BPS: '200',
+      TIMED_HEDGE_INTERVAL_MS: '14400000',
+      TIMED_HEDGE_MIN_DRIFT_BPS: '100',
+    })
+    expect(cfg.TIMED_HEDGE_INTERVAL_MS).toBe(14_400_000)
+  })
+
+  it('validates timed cadence and strict inner/outer bands only when enabled', () => {
+    expect(() => parseHedgerBotConfig({ ...BASE_ENV, TIMED_HEDGE_INTERVAL_MS: '299999' })).toThrow(
+      /at least 300000/,
+    )
+    expect(() =>
+      parseHedgerBotConfig({
+        ...BASE_ENV,
+        POLL_INTERVAL_MS: '600000',
+        TIMED_HEDGE_INTERVAL_MS: '300000',
+      }),
+    ).toThrow(/TIMED_HEDGE_INTERVAL_MS/)
+    expect(() =>
+      parseHedgerBotConfig({
+        ...BASE_ENV,
+        DELTA_THRESHOLD_BPS: '100',
+        TIMED_HEDGE_INTERVAL_MS: '300000',
+        TIMED_HEDGE_MIN_DRIFT_BPS: '100',
+      }),
+    ).toThrow(/inner band/)
+    expect(() =>
+      parseHedgerBotConfig({
+        ...BASE_ENV,
+        TIMED_HEDGE_INTERVAL_MS: '300000',
+        TIMED_HEDGE_MIN_DRIFT_BPS: '0',
+      }),
+    ).toThrow(/greater than 0/)
+    expect(() =>
+      parseHedgerBotConfig({
+        ...BASE_ENV,
+        DELTA_THRESHOLD_BPS: '50',
+        TIMED_HEDGE_INTERVAL_MS: '0',
+        TIMED_HEDGE_MIN_DRIFT_BPS: '100',
+      }),
+    ).not.toThrow()
+    expect(() =>
+      parseHedgerBotConfig({
+        ...BASE_ENV,
+        TIMED_HEDGE_INTERVAL_MS: '0',
+        TIMED_HEDGE_MIN_DRIFT_BPS: '0',
+      }),
+    ).not.toThrow()
   })
 
   it('defaults the deleverager off with sane tunables', () => {
@@ -282,6 +338,7 @@ describe('parseHedgerBotConfig', () => {
   it.each([
     ['SLIPPAGE_BPS', '0', '500', '-1', '501'],
     ['POLL_INTERVAL_MS', '5000', '300000', '4999', '300001'],
+    ['TIMED_HEDGE_INTERVAL_MS', '0', '604800000', '-1', '604800001'],
     ['CEX_STALE_MS', '1000', '60000', '999', '60001'],
     ['SIGNAL_TICK_SANITY_MAX', '100', '10000', '99', '10001'],
     ['MAX_HEDGE_SLOTS', '1', '16', '0', '17'],

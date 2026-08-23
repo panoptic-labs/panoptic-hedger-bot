@@ -17,3 +17,16 @@ export function asSdkClient<T extends (...args: never[]) => unknown>(
 ): SdkClientParam<T> {
   return client as SdkClientParam<T>
 }
+
+type SdkWalletClientParam<T extends (...args: never[]) => unknown> = Parameters<T>[0] extends {
+  walletClient: infer WalletClient
+}
+  ? WalletClient
+  : never
+
+/** Cast a wallet client across the same SDK/app viem type-identity boundary. */
+export function asSdkWalletClient<T extends (...args: never[]) => unknown>(
+  client: unknown,
+): SdkWalletClientParam<T> {
+  return client as SdkWalletClientParam<T>
+}

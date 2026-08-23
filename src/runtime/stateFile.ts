@@ -29,6 +29,13 @@ const runtimeStateSchema = z
     lastPollCompletedAt: iso.optional(),
     lastPollTrigger: z.string().min(1).max(64).optional(),
     lastCycleOutcome: z.enum(['complete', 'signal-unavailable', 'error']).optional(),
+    safeModeLevel: z.number().int().min(0).max(255).optional(),
+    lastOraclePokeAt: iso.optional(),
+    lastOraclePokeTx: z
+      .string()
+      .regex(/^0x[0-9a-fA-F]+$/)
+      .optional(),
+    lastOraclePokeResult: z.enum(['confirmed', 'dry-run', 'deferred', 'failed']).optional(),
     consecutiveSignalFailures: z.number().int().nonnegative().optional(),
     lastHedgeAt: iso.optional(),
     lastHedgeAction: z.string().min(1).max(64).optional(),
@@ -36,6 +43,8 @@ const runtimeStateSchema = z
       .string()
       .regex(/^0x[0-9a-fA-F]+$/)
       .optional(),
+    /** Last confirmed live action that changed portfolio delta. */
+    lastDeltaHedgeAt: iso.optional(),
     lastDeleverageAt: iso.optional(),
     lastDeleverageStage: z.enum(['loans', 'options']).optional(),
     lastDeleverageTx: z
@@ -88,6 +97,29 @@ export function readRuntimeState(): RuntimeState | null {
 
 export function writeRuntimeState(state: RuntimeState): void {
   writeSecureJson(runtimeStatePath(), runtimeStateSchema, state)
+}
+
+export interface RuntimeIdentity {
+  chainId: number
+  safe: string
+  pool: string
+  signer: string
+}
+
+/** Return cadence history only when every portfolio/signer identity matches. */
+export function trustedLastDeltaHedgeAt(
+  state: RuntimeState | null,
+  identity: RuntimeIdentity,
+): string | undefined {
+  if (
+    state?.chainId !== identity.chainId ||
+    state.safe.toLowerCase() !== identity.safe.toLowerCase() ||
+    state.pool.toLowerCase() !== identity.pool.toLowerCase() ||
+    state.signer.toLowerCase() !== identity.signer.toLowerCase()
+  ) {
+    return undefined
+  }
+  return state.lastDeltaHedgeAt
 }
 
 export function patchRuntimeState(

@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 import type { Address, Hex } from 'viem'
+import { TransactionReceiptNotFoundError } from 'viem'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { type HedgeRecoveryClient, HedgeJournal } from './hedgeJournal'
@@ -20,7 +21,7 @@ function journal() {
   return new HedgeJournal({ chainId: 1, safe: SAFE, pool: POOL, signer: SIGNER })
 }
 
-function observe(target: HedgeJournal, hashes: readonly Hex[]) {
+function persistIdentity(target: HedgeJournal, hashes: readonly Hex[] = []) {
   target.observeTransaction({
     sender: SIGNER,
     nonce: 4,
@@ -31,18 +32,31 @@ function observe(target: HedgeJournal, hashes: readonly Hex[]) {
   })
 }
 
+function broadcast(target: HedgeJournal, hashes: readonly Hex[]) {
+  persistIdentity(target)
+  target.recordBroadcastAttempt()
+  persistIdentity(target, hashes)
+}
+
+interface ClientCaptured {
+  nonceQueries: Address[]
+}
+
 function client(
   receipts: ReadonlyMap<Hex, 'success' | 'reverted'>,
   blockHash = BLOCK_HASH,
-  discovered: Hex[] = [],
+  chainNonce = 4,
   latestBlock = 101n,
-) {
+): HedgeRecoveryClient & { captured: ClientCaptured } {
+  const captured: ClientCaptured = { nonceQueries: [] }
   const recoveryClient: HedgeRecoveryClient = {
     getBlockNumber: async () => latestBlock,
     getBlock: async () => ({ hash: blockHash }),
     getTransactionReceipt: async ({ hash }) => {
       const status = receipts.get(hash)
-      if (!status) throw new Error('receipt not found')
+      // Match production semantics: unknown-hash paths must throw the same viem
+      // error class production catches; anything else propagates as transport.
+      if (!status) throw new TransactionReceiptNotFoundError({ hash })
       return {
         transactionHash: hash,
         blockNumber: 101n,
@@ -52,9 +66,12 @@ function client(
         status,
       }
     },
-    findMinedTransactions: async () => discovered,
+    getTransactionCount: async (address) => {
+      captured.nonceQueries.push(address)
+      return chainNonce
+    },
   }
-  return recoveryClient
+  return Object.assign(recoveryClient, { captured })
 }
 
 describe('HedgeJournal', () => {
@@ -72,7 +89,7 @@ describe('HedgeJournal', () => {
   it('persists intent before send and recovers a late successful replacement', async () => {
     const first = journal()
     first.begin('open')
-    observe(first, [HASH_A, HASH_B])
+    broadcast(first, [HASH_A, HASH_B])
 
     const restarted = journal()
     await restarted.recover(client(new Map([[HASH_B, 'success']])))
@@ -80,34 +97,109 @@ describe('HedgeJournal', () => {
     expect(restarted.checkpoint()).toMatchObject({ transactionHash: HASH_B, fromBlock: 100n })
   })
 
-  it('fails closed when no observed replacement has a receipt', async () => {
-    const target = journal()
-    target.begin('open')
-    observe(target, [HASH_A])
+  it('keeps a fresh pending intent while the nonce slot is still open', async () => {
+    const first = journal()
+    first.begin('open')
+    broadcast(first, [HASH_A])
 
-    await expect(target.recover(client(new Map()))).rejects.toThrow(/operator review/)
+    const restarted = journal()
+    // chainNonce still at 4 (== entry.nonce), 10 blocks since submit — inside the stall window.
+    await restarted.recover(client(new Map(), BLOCK_HASH, 4, 110n))
+    expect(() => restarted.begin('grow')).toThrow(/ambiguous pending hedge intent/)
   })
 
-  it('recovers a post-broadcast crash by immutable sender/nonce/calldata identity', async () => {
-    const target = journal()
-    target.begin('open')
-    observe(target, [])
+  it('auto-fails a stalled pending intent whose nonce slot never advanced', async () => {
+    const first = journal()
+    first.begin('open')
+    broadcast(first, [HASH_A])
 
-    await target.recover(client(new Map([[HASH_A, 'success']]), BLOCK_HASH, [HASH_A]))
+    const restarted = journal()
+    // chainNonce == entry.nonce (nothing landed) and 500 blocks past submit.
+    const recoveryClient = client(new Map(), BLOCK_HASH, 4, 600n)
+    await restarted.recover(recoveryClient)
+    expect(restarted.checkpoint()).toEqual({})
+    expect(recoveryClient.captured.nonceQueries).toEqual([SIGNER])
+    restarted.begin('grow')
   })
 
-  it('uses a known mined hash without an obsolete bounded block scan', async () => {
+  it('holds a pending intent at the nonceStallBlocks-1 boundary and auto-fails at the threshold', async () => {
+    // submittedAtBlock=100n, default nonceStallBlocks=64n. At block 163 (delta 63)
+    // the entry is still fresh; at block 164 (delta 64) it hits the threshold.
+    const freshFirst = journal()
+    freshFirst.begin('open')
+    broadcast(freshFirst, [HASH_A])
+    const fresh = journal()
+    await fresh.recover(client(new Map(), BLOCK_HASH, 4, 163n))
+    expect(() => fresh.begin('grow')).toThrow(/ambiguous pending hedge intent/)
+
+    // Reset with a fresh journal file (new tempdir per test) via a second
+    // in-process instance sharing the same env path is not equivalent — build a
+    // fresh path so this case is independent of the prior one.
+    process.env.HEDGER_JOURNAL_PATH = path.join(
+      mkdtempSync(path.join(tmpdir(), 'hedger-journal-')),
+      'journal.json',
+    )
+    const stalledFirst = journal()
+    stalledFirst.begin('open')
+    broadcast(stalledFirst, [HASH_A])
+    const stalled = journal()
+    await stalled.recover(client(new Map(), BLOCK_HASH, 4, 164n))
+    expect(stalled.checkpoint()).toEqual({})
+    stalled.begin('grow')
+  })
+
+  it('drops a pending intent whose nonce slot is spent on-chain', async () => {
+    const first = journal()
+    first.begin('open')
+    broadcast(first, [HASH_A])
+
+    const restarted = journal()
+    // chainNonce > entry.nonce ⇒ something for that nonce landed; drop.
+    const recoveryClient = client(new Map(), BLOCK_HASH, 5, 10_000n)
+    await restarted.recover(recoveryClient)
+    expect(restarted.checkpoint()).toEqual({})
+    expect(recoveryClient.captured.nonceQueries).toEqual([SIGNER])
+    restarted.begin('grow')
+  })
+
+  it('propagates transport failures from getTransactionReceipt instead of treating them as no-receipt', async () => {
+    const first = journal()
+    first.begin('open')
+    broadcast(first, [HASH_A])
+
+    const restarted = journal()
+    const recoveryClient = client(new Map([[HASH_A, 'success']]))
+    recoveryClient.getTransactionReceipt = async () => {
+      throw new Error('RPC transport failure')
+    }
+    await expect(restarted.recover(recoveryClient)).rejects.toThrow(/RPC transport failure/)
+  })
+
+  it('recovers a crash after broadcast but before the transaction hash is observed', async () => {
+    const first = journal()
+    first.begin('open')
+    persistIdentity(first)
+    first.recordBroadcastAttempt()
+
+    const restarted = journal()
+    // No hashes in receipts map; chainNonce advanced past entry.nonce means the
+    // tx landed under a hash we never captured — drop and re-derive next cycle.
+    await restarted.recover(client(new Map(), BLOCK_HASH, 5, 200n))
+    expect(restarted.checkpoint()).toEqual({})
+    restarted.begin('grow')
+  })
+
+  it('uses a known mined hash without any block scan even far past submit', async () => {
     const target = journal()
     target.begin('grow')
-    observe(target, [HASH_A])
-    const recoveryClient = client(new Map([[HASH_A, 'success']]), BLOCK_HASH, [], 10_000n)
-    recoveryClient.findMinedTransactions = vi.fn(async () => {
-      throw new Error('ambiguous hedge recovery exceeds the bounded block search window')
-    })
+    broadcast(target, [HASH_A])
+    const recoveryClient = client(new Map([[HASH_A, 'success']]), BLOCK_HASH, 5, 10_000n)
+    recoveryClient.getTransactionCount = vi.fn(recoveryClient.getTransactionCount)
 
     await target.recover(recoveryClient)
 
-    expect(recoveryClient.findMinedTransactions).not.toHaveBeenCalled()
+    // Fast path resolves via receipt without consulting the nonce.
+    expect(recoveryClient.getTransactionCount).not.toHaveBeenCalled()
     expect(target.checkpoint()).toMatchObject({ transactionHash: HASH_A, fromBlock: 100n })
   })
 
@@ -120,7 +212,7 @@ describe('HedgeJournal', () => {
     ] as const) {
       const target = journal()
       target.begin(action)
-      observe(target, [HASH_A])
+      broadcast(target, [HASH_A])
       const restarted = journal()
       await restarted.recover(client(new Map([[HASH_A, 'success']])))
       expect(restarted.checkpoint()).toMatchObject({ transactionHash: HASH_A, fromBlock: 100n })
@@ -130,7 +222,7 @@ describe('HedgeJournal', () => {
   it('rejects replacement identity drift before it is persisted', () => {
     const target = journal()
     target.begin('open')
-    observe(target, [HASH_A])
+    broadcast(target, [HASH_A])
 
     expect(() =>
       target.observeTransaction({
@@ -144,27 +236,43 @@ describe('HedgeJournal', () => {
     ).toThrow(/replacement changed/)
   })
 
-  it('rejects multiple mined replacements as ambiguous', async () => {
+  it('resolves via the first successful replacement when multiple hashes mined', async () => {
     const target = journal()
     target.begin('open')
-    observe(target, [HASH_A, HASH_B])
+    broadcast(target, [HASH_A, HASH_B])
 
-    await expect(
-      target.recover(
-        client(
-          new Map([
-            [HASH_A, 'success'],
-            [HASH_B, 'success'],
-          ]),
-        ),
+    await target.recover(
+      client(
+        new Map([
+          [HASH_A, 'success'],
+          [HASH_B, 'success'],
+        ]),
       ),
-    ).rejects.toThrow(/multiple replacements mined/)
+    )
+    expect(target.checkpoint()).toMatchObject({ transactionHash: HASH_A, fromBlock: 100n })
+  })
+
+  it('drops a pending intent whose recorded replacements all reverted', async () => {
+    const target = journal()
+    target.begin('open')
+    broadcast(target, [HASH_A, HASH_B])
+
+    await target.recover(
+      client(
+        new Map([
+          [HASH_A, 'reverted'],
+          [HASH_B, 'reverted'],
+        ]),
+      ),
+    )
+    expect(target.checkpoint()).toEqual({})
+    target.begin('grow')
   })
 
   it('detects a reorg of a previously confirmed hedge on restart', async () => {
     const target = journal()
     target.begin('open')
-    observe(target, [HASH_A])
+    broadcast(target, [HASH_A])
     target.confirm({ transactionHash: HASH_A, blockNumber: 101n, blockHash: BLOCK_HASH })
 
     const restarted = journal()
@@ -176,10 +284,10 @@ describe('HedgeJournal', () => {
   it('bounds restart RPC checks to recent confirmed intents', async () => {
     const target = journal()
     target.begin('open')
-    observe(target, [HASH_A])
+    broadcast(target, [HASH_A])
     target.confirm({ transactionHash: HASH_A, blockNumber: 101n, blockHash: BLOCK_HASH })
 
-    const recoveryClient = client(new Map([[HASH_A, 'success']]), BLOCK_HASH, [], 1_000n)
+    const recoveryClient = client(new Map([[HASH_A, 'success']]), BLOCK_HASH, 4, 1_000n)
     recoveryClient.getBlock = vi.fn(recoveryClient.getBlock)
     recoveryClient.getTransactionReceipt = vi.fn(recoveryClient.getTransactionReceipt)
     await journal().recover(recoveryClient)
@@ -210,5 +318,36 @@ describe('HedgeJournal', () => {
           signer: '0x5555555555555555555555555555555555555555',
         }),
     ).toThrow(/identity/)
+  })
+
+  it('auto-expires an intent when restart happens before transaction identity is persisted', async () => {
+    const first = journal()
+    first.begin('open')
+
+    const restarted = journal()
+    await restarted.recover(client(new Map(), BLOCK_HASH, 4, 200n))
+    restarted.begin('grow')
+  })
+
+  it('auto-expires a prepared intent when no broadcast was attempted', async () => {
+    const first = journal()
+    first.begin('open')
+    persistIdentity(first)
+
+    const restarted = journal()
+    const recoveryClient = client(new Map(), BLOCK_HASH, 4, 200n)
+    recoveryClient.getTransactionCount = vi.fn(recoveryClient.getTransactionCount)
+    await restarted.recover(recoveryClient)
+
+    // Never broadcast ⇒ no need to consult the on-chain nonce.
+    expect(recoveryClient.getTransactionCount).not.toHaveBeenCalled()
+    restarted.begin('grow')
+  })
+
+  it('requires durable transaction identity before recording a broadcast attempt', () => {
+    const target = journal()
+    target.begin('open')
+
+    expect(() => target.recordBroadcastAttempt()).toThrow(/identity must be durable/)
   })
 })
