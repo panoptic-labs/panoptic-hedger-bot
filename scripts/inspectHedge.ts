@@ -11,8 +11,9 @@ import { computeHedgePlan } from '../src/hedge/decision'
 import { assessSafety } from '../src/hedge/safety'
 import { readHedgeSnapshot } from '../src/hedge/snapshot'
 import { timedHedgeCadence } from '../src/hedge/timedCadence'
-import { createPriceSignalSource } from '../src/priceSignal'
+import { createPriceSignalSource, waitForPriceSignal } from '../src/priceSignal'
 import { resolveCexAssetOrientation } from '../src/priceSignal/cexSource'
+import { formatHedgeTriggerStatus, HedgeTriggerMonitor } from '../src/runtime/hedgeTriggerMonitor'
 import { readRuntimeState, trustedLastDeltaHedgeAt } from '../src/runtime/stateFile'
 import { resolveBotAddress } from '../src/safe/resolveBotAccount'
 import { defineBotChain } from '../src/utils/chain'
@@ -64,7 +65,7 @@ export async function runHedgeInspection(config: HedgerBotConfig): Promise<Hedge
   })
   const signal = await (async () => {
     try {
-      return await priceSource.getSignal()
+      return await waitForPriceSignal(priceSource)
     } finally {
       priceSource.stop?.()
     }
@@ -116,6 +117,12 @@ export async function runHedgeInspection(config: HedgerBotConfig): Promise<Hedge
     lpPositions: snapshot.lp?.positions,
     includeLp: config.HEDGE_INCLUDE_LP && (snapshot.lp?.fresh ?? false),
   })
+  const triggerStatus = new HedgeTriggerMonitor({
+    assetIndex: config.ASSET_INDEX === 0n ? 0n : 1n,
+    deltaThresholdBps: config.DELTA_THRESHOLD_BPS,
+    deltaOffsetBps: config.DELTA_OFFSET_BPS,
+    includeLp: config.HEDGE_INCLUDE_LP,
+  }).refresh(snapshot)
 
   // ---- Step-by-step delta breakdown (vault-asset frame) --------------------
   const b = plan.breakdown
@@ -172,6 +179,14 @@ export async function runHedgeInspection(config: HedgerBotConfig): Promise<Hedge
   console.log(`Hstar = H - netDelta = ${h(plan.Hstar)}   portfolioSize = ${h(b.portfolioSize)}`)
   console.log(
     `driftBps = |netDelta| / sizeBasis = ${plan.driftBps}  (threshold ${config.DELTA_THRESHOLD_BPS})`,
+  )
+  console.log(
+    formatHedgeTriggerStatus(triggerStatus, {
+      token0Decimals: BigInt(metadata.token0Decimals),
+      token1Decimals: BigInt(metadata.token1Decimals),
+      token0Symbol: metadata.token0Symbol,
+      token1Symbol: metadata.token1Symbol,
+    }),
   )
   console.log('timed hedge:', {
     intervalMs: config.TIMED_HEDGE_INTERVAL_MS,

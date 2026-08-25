@@ -148,6 +148,10 @@ export abstract class ExchangeFeed extends EventEmitter {
       this.scheduleReconnect()
     })
     ws.on('error', (err) => {
+      // Closing a CONNECTING socket during an intentional one-shot shutdown
+      // makes `ws` emit "closed before the connection was established". It is
+      // cleanup, not a feed outage, so consume it without logging/reconnecting.
+      if (this.stopped) return
       if (!this.errorLogged) {
         this.errorLogged = true
         botWarn(`[cex] ${this.name} feed error: ${err.message}`)

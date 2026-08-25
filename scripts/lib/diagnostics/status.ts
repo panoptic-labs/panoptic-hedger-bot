@@ -42,6 +42,7 @@ export interface StatusSnapshot {
   /** Uniswap LP summary (owner scope, count, subgraph lag/freshness, delta); undefined when LP tracking is off. */
   lp?: string
   priceSignal?: string
+  eventMonitor?: string
   lastPoll?: string
   lastHedge?: string
   oracleRecovery?: string
@@ -105,6 +106,13 @@ export async function gatherStatus(ctx: StatusDiagnosticsContext): Promise<Statu
     pool: config.POOL_ADDRESS,
     safe: config.SAFE_ADDRESS,
     botAddress,
+    eventMonitor: state?.lastPriceObservedAt
+      ? `${state.monitorHealthy ? 'healthy' : 'DEGRADED'}; ` +
+        `${state.hedgeMonitorMode ?? 'unknown'}; tick=${state.lastPriceTick ?? '?'} ` +
+        `block=${state.lastPriceBlock ?? '?'} (${fmtAgo(state.lastPriceObservedAt)}); ` +
+        `trigger=[${state.hedgeTriggerDownTick ?? 'none'}, ${state.hedgeTriggerUpTick ?? 'none'}] ` +
+        `eventBlock=${state.lastEventScanBlock ?? '?'}`
+      : 'not started',
     lastPoll: state?.lastPollAt
       ? `${fmtAgo(state.lastPollAt)} (${state.lastPollTrigger ?? '?'})`
       : 'never',

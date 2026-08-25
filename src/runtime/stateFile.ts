@@ -29,6 +29,33 @@ const runtimeStateSchema = z
     lastPollCompletedAt: iso.optional(),
     lastPollTrigger: z.string().min(1).max(64).optional(),
     lastCycleOutcome: z.enum(['complete', 'signal-unavailable', 'error']).optional(),
+    lastReconcileAt: iso.optional(),
+    lastPriceObservedAt: iso.optional(),
+    lastPriceBlock: z.string().regex(/^\d+$/).optional(),
+    lastPriceTick: z
+      .string()
+      .regex(/^-?\d+$/)
+      .optional(),
+    lastEventScanBlock: z.string().regex(/^\d+$/).optional(),
+    monitorHealthy: z.boolean().optional(),
+    hedgeMonitorMode: z.enum(['boundaries', 'local-eval']).optional(),
+    hedgeMonitorSnapshotBlock: z.string().regex(/^\d+$/).optional(),
+    hedgeApproachDownTick: z
+      .string()
+      .regex(/^-?\d+$/)
+      .optional(),
+    hedgeApproachUpTick: z
+      .string()
+      .regex(/^-?\d+$/)
+      .optional(),
+    hedgeTriggerDownTick: z
+      .string()
+      .regex(/^-?\d+$/)
+      .optional(),
+    hedgeTriggerUpTick: z
+      .string()
+      .regex(/^-?\d+$/)
+      .optional(),
     safeModeLevel: z.number().int().min(0).max(255).optional(),
     lastOraclePokeAt: iso.optional(),
     lastOraclePokeTx: z
@@ -170,7 +197,8 @@ export function computeRunning(
   if (!isProcessAlive(state.pid)) {
     return { running: false, stalled: false, reason: `pid ${state.pid} not alive` }
   }
-  const freshWindow = Math.max(pollIntervalMs * 2, 30_000)
+  const fastHeartbeat = state.monitorHealthy === true ? state.lastPriceObservedAt : undefined
+  const freshWindow = fastHeartbeat ? 30_000 : Math.max(pollIntervalMs * 2, 30_000)
   if (!state.lastPollAt) {
     const startupAge = nowMs - Date.parse(state.startedAt)
     if (startupAge > freshWindow) {
@@ -178,13 +206,18 @@ export function computeRunning(
     }
     return { running: true, stalled: false, reason: 'starting; first poll pending' }
   }
-  const ageMs = nowMs - Date.parse(state.lastPollAt)
+  const heartbeatAt = fastHeartbeat ?? state.lastPollAt
+  const ageMs = nowMs - Date.parse(heartbeatAt)
   if (ageMs > freshWindow) {
     return {
       running: false,
       stalled: true,
-      reason: `pid ${state.pid} alive but last poll ${Math.round(ageMs / 1000)}s ago`,
+      reason: `pid ${state.pid} alive but last monitor heartbeat ${Math.round(ageMs / 1000)}s ago`,
     }
   }
-  return { running: true, stalled: false, reason: `last poll ${Math.round(ageMs / 1000)}s ago` }
+  return {
+    running: true,
+    stalled: false,
+    reason: `last monitor heartbeat ${Math.round(ageMs / 1000)}s ago`,
+  }
 }

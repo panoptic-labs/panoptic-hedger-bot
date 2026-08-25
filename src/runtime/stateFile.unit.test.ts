@@ -111,6 +111,34 @@ describe('computeRunning', () => {
     expect(r.stalled).toBe(true)
   })
 
+  it('uses the fast monitor heartbeat while it is healthy', () => {
+    const r = computeRunning(
+      {
+        ...base,
+        lastPollAt: '2026-01-01T00:00:00Z',
+        lastPriceObservedAt: '2026-01-01T00:09:40Z',
+        monitorHealthy: true,
+      },
+      300_000,
+      nowMs,
+    )
+    expect(r.running).toBe(true)
+  })
+
+  it('falls back to reconciliation freshness while the fast monitor is degraded', () => {
+    const r = computeRunning(
+      {
+        ...base,
+        lastPollAt: '2026-01-01T00:09:10Z',
+        lastPriceObservedAt: '2026-01-01T00:00:00Z',
+        monitorHealthy: false,
+      },
+      300_000,
+      nowMs,
+    )
+    expect(r.running).toBe(true)
+  })
+
   it('stalled when first poll never completes within the startup window', () => {
     const r = computeRunning({ ...base }, 60_000, nowMs)
     expect(r.stalled).toBe(true)

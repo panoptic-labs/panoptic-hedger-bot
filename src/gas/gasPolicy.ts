@@ -55,6 +55,7 @@ export interface GasPolicy {
 export interface GasPolicyConfig {
   MAX_FEE_GWEI: bigint
   MAX_PRIORITY_FEE_GWEI: bigint
+  MIN_PRIORITY_FEE_GWEI: bigint
   URGENT_PRIORITY_FEE_GWEI: bigint
   HEDGE_MAX_BASE_FEE_GWEI: bigint
   URGENT_MAX_BASE_FEE_GWEI: bigint
@@ -80,6 +81,7 @@ export function createGasPolicy(deps: GasPolicyDeps): GasPolicy {
 
   const maxFeeCap = config.MAX_FEE_GWEI
   const priorityCap = config.MAX_PRIORITY_FEE_GWEI
+  const priorityFloor = config.MIN_PRIORITY_FEE_GWEI
   const urgentPriorityFloor = config.URGENT_PRIORITY_FEE_GWEI
   // Only warn once the balance falls below this (defaults below the target
   // MIN_KEEPER_BALANCE_ETH, so routine balances above the warn line don't spam
@@ -112,10 +114,10 @@ export function createGasPolicy(deps: GasPolicyDeps): GasPolicy {
   async function fees(opts?: { urgent?: boolean }): Promise<GasFees | undefined> {
     const base = await baseFee()
     if (base === null) return undefined
-    // Tip = the network-estimated priority fee, clamped to MAX_PRIORITY_FEE_GWEI
-    // (a true ceiling, not the paid value) so quiet networks pay the small tip
-    // they actually need instead of a flat cap. If the RPC can't estimate,
-    // fall back to the cap (previous behavior). The tip also never exceeds the
+    // Tip = the network estimate, bounded by the configured routine floor and
+    // ceiling. The nonzero floor prevents a zero RPC estimate from creating a
+    // transaction whose replacements also remain at zero priority forever. If
+    // the RPC can't estimate, fall back to the cap. The tip never exceeds the
     // fee cap itself.
     const ceil = priorityCap > maxFeeCap ? maxFeeCap : priorityCap
     let estimated: bigint
@@ -125,6 +127,8 @@ export function createGasPolicy(deps: GasPolicyDeps): GasPolicy {
       estimated = ceil
     }
     let maxPriorityFeePerGas = estimated > ceil ? ceil : estimated
+    const floor = priorityFloor > maxFeeCap ? maxFeeCap : priorityFloor
+    if (maxPriorityFeePerGas < floor) maxPriorityFeePerGas = floor
     // Urgent hedges must land NOW: lift the tip to the urgent floor even past
     // the routine ceiling (an RPC estimating ~0 during a spike would otherwise
     // leave the tx unprioritised exactly when it matters). Only the fee cap

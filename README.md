@@ -261,7 +261,7 @@ it writes (and for the manual path). The full annotated list lives in
 | `SLIPPAGE_BPS` | | Hedge swap slippage tolerance, default `100` (±100 ticks for in-pool loans) |
 | `PRICE_SIGNAL_SOURCE` | | `pool-tick` \| `cex` (supported); `uniswap-pool` (experimental) |
 | `HEDGE_VENUE` | | `in-pool` (the only supported execution venue) |
-| `POLL_INTERVAL_MS` | | Loop interval, default `60000` |
+| `POLL_INTERVAL_MS` | | Full account reconciliation interval, default `300000`; pool price and relevant account events are monitored between reconciliations |
 | `ORACLE_POKE_ENABLED` | | Opt-in SafeMode recovery. The keeper reads the attached RiskEngine's live thresholds and EMA periods, diagnoses its predicates from `getOracleTicks()`, and checks the result against authoritative `isSafeMode()`. Median divergence uses consecutive epochs, other causes follow their deployed EMA cadence, and guardian-locked pools are not poked. Live use is activation-bound; default `false`. |
 | `DRY_RUN` | | `true` simulates via `eth_call`; live also requires `pnpm activate` |
 | `UNISWAP_LP_OWNER` | | Extra address (besides the Safe) holding plain Uniswap v3/v4 LP positions on this pool's pair; scanned alongside the Safe — see [Hedging Uniswap LP positions](#hedging-uniswap-lp-positions). |

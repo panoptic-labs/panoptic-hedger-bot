@@ -249,6 +249,9 @@ const rawEnvSchema = z
     // Hard EIP-1559 caps applied to every send:
     MAX_FEE_GWEI: boundedGwei('1', '1000', '400'),
     MAX_PRIORITY_FEE_GWEI: boundedGwei('0.01', '100', '2'),
+    // Every send pays at least this priority tip, even when the RPC estimator
+    // returns zero. Without a floor, fee bumps cannot raise a zero tip.
+    MIN_PRIORITY_FEE_GWEI: boundedGwei('0.01', '100', '0.1'),
     // Urgent tip FLOOR: when a hedge is urgent (see URGENT_DRIFT_MULTIPLIER) the
     // priority tip is lifted to at least this, so an RPC estimating a near-zero
     // tip can't leave an urgent hedge unprioritised in a volatility spike. May
@@ -278,7 +281,9 @@ const rawEnvSchema = z
     HEDGER_NONCE_STALL_BLOCKS: boundedInteger(4, 4_096, 64),
 
     // Loop
-    POLL_INTERVAL_MS: boundedInteger(5_000, 300_000, 60_000),
+    // Authoritative account reconciliation cadence. Price and account events
+    // are monitored separately between these full snapshots.
+    POLL_INTERVAL_MS: boundedInteger(5_000, 300_000, 300_000),
     // Permissionless direct-EOA recovery call. Opt-in because it spends keeper
     // gas independently of hedge dispatches; live use is activation-bound.
     ORACLE_POKE_ENABLED: booleanSchema.default('false'),
@@ -432,6 +437,20 @@ const rawEnvSchema = z
           'MAX_FEE_GWEI must be >= URGENT_MAX_BASE_FEE_GWEI (urgent sends must be able to price in)',
       })
     }
+    if (cfg.MIN_PRIORITY_FEE_GWEI > cfg.MAX_PRIORITY_FEE_GWEI) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['MIN_PRIORITY_FEE_GWEI'],
+        message: 'MIN_PRIORITY_FEE_GWEI must be <= MAX_PRIORITY_FEE_GWEI',
+      })
+    }
+    if (cfg.MIN_PRIORITY_FEE_GWEI > cfg.MAX_FEE_GWEI) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['MIN_PRIORITY_FEE_GWEI'],
+        message: 'MIN_PRIORITY_FEE_GWEI must be <= MAX_FEE_GWEI (the tip must fit the fee cap)',
+      })
+    }
     // No check against MAX_PRIORITY_FEE_GWEI on purpose: the urgent floor is
     // allowed to exceed the routine tip ceiling — that is its entire point.
     if (cfg.URGENT_PRIORITY_FEE_GWEI > cfg.MAX_FEE_GWEI) {
@@ -462,13 +481,6 @@ const rawEnvSchema = z
           code: z.ZodIssueCode.custom,
           path: ['TIMED_HEDGE_INTERVAL_MS'],
           message: 'enabled interval must be at least 300000 (5 minutes)',
-        })
-      }
-      if (cfg.TIMED_HEDGE_INTERVAL_MS < cfg.POLL_INTERVAL_MS) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['TIMED_HEDGE_INTERVAL_MS'],
-          message: 'must be at least POLL_INTERVAL_MS when timed hedging is enabled',
         })
       }
       if (

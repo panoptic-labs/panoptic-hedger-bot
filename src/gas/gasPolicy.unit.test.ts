@@ -9,6 +9,7 @@ const KEEPER = '0x00000000000000000000000000000000000000ea' as `0x${string}`
 const CONFIG = {
   MAX_FEE_GWEI: parseGwei('400'),
   MAX_PRIORITY_FEE_GWEI: parseGwei('2'),
+  MIN_PRIORITY_FEE_GWEI: parseGwei('0.1'),
   URGENT_PRIORITY_FEE_GWEI: parseGwei('1'),
   HEDGE_MAX_BASE_FEE_GWEI: parseGwei('50'),
   URGENT_MAX_BASE_FEE_GWEI: parseGwei('300'),
@@ -156,6 +157,15 @@ describe('fees — EIP-1559 caps', () => {
     expect(fees?.maxPriorityFeePerGas).toBe(parseGwei('2'))
   })
 
+  it('lifts a zero RPC estimate to the priority-fee floor', async () => {
+    const { policy } = makePolicy({ baseFee: parseGwei('0.2'), priorityFee: 0n })
+    const fees = await policy.fees()
+    expect(fees).toEqual({
+      maxFeePerGas: parseGwei('0.5'),
+      maxPriorityFeePerGas: parseGwei('0.1'),
+    })
+  })
+
   it('hard-clamps maxFeePerGas to MAX_FEE_GWEI', async () => {
     const { policy } = makePolicy({ baseFee: parseGwei('250') })
     const fees = await policy.fees()
@@ -167,10 +177,10 @@ describe('fees — EIP-1559 caps', () => {
     expect(await policy.fees()).toBeUndefined()
   })
 
-  it('urgent: false leaves the routine tip untouched', async () => {
+  it('urgent: false applies the routine floor to a smaller estimate', async () => {
     const { policy } = makePolicy({ baseFee: parseGwei('30'), priorityFee: parseGwei('0.001') })
     const fees = await policy.fees({ urgent: false })
-    expect(fees?.maxPriorityFeePerGas).toBe(parseGwei('0.001'))
+    expect(fees?.maxPriorityFeePerGas).toBe(parseGwei('0.1'))
   })
 
   it('urgent: lifts a near-zero estimate to the urgent floor (the 0.001-gwei incident)', async () => {
@@ -232,6 +242,15 @@ describe('bumped — stuck-tx replacement fees', () => {
     // fresh maxFee = 2x100 + 0.1 = 200.1 > 10 x 1.125
     expect(next?.maxFeePerGas).toBe(parseGwei('200.1'))
     expect(next?.maxPriorityFeePerGas).toBe(parseGwei('0.1'))
+  })
+
+  it('lifts a zero-tip replacement to the priority-fee floor', async () => {
+    const { policy } = makePolicy({ baseFee: parseGwei('0.2'), priorityFee: 0n })
+    const next = await policy.bumped({ maxFeePerGas: parseGwei('0.4'), maxPriorityFeePerGas: 0n })
+    expect(next).toEqual({
+      maxFeePerGas: parseGwei('0.5'),
+      maxPriorityFeePerGas: parseGwei('0.1'),
+    })
   })
 
   it('applies the urgent floor on the fresh recompute', async () => {

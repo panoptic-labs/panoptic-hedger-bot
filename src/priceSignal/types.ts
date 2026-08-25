@@ -47,3 +47,49 @@ export interface PriceSignalSource {
   /** Release any background resources (e.g. CEX WebSocket feeds). Optional. */
   stop?(): void
 }
+
+export interface WaitForPriceSignalOptions {
+  /** Maximum time one-shot commands wait for a transient source to become ready. */
+  timeoutMs?: number
+  retryIntervalMs?: number
+  /** Test seams; production callers should use the defaults. */
+  nowMs?: () => number
+  sleep?: (ms: number) => Promise<void>
+}
+
+export const PRICE_SIGNAL_WARMUP_TIMEOUT_MS = 15_000
+
+/**
+ * Wait for a transiently unavailable source to produce its first fresh signal.
+ *
+ * The live hedger remains non-blocking and skips unavailable cycles. One-shot
+ * commands such as activation and inspection need different semantics: their
+ * freshly-created CEX WebSockets must be allowed to connect and reach quorum
+ * before the command decides that inspection failed.
+ */
+export async function waitForPriceSignal(
+  source: PriceSignalSource,
+  options: WaitForPriceSignalOptions = {},
+): Promise<PriceSignal> {
+  const timeoutMs = options.timeoutMs ?? PRICE_SIGNAL_WARMUP_TIMEOUT_MS
+  const retryIntervalMs = options.retryIntervalMs ?? 250
+  const nowMs = options.nowMs ?? Date.now
+  const sleep =
+    options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const deadline = nowMs() + timeoutMs
+
+  for (;;) {
+    try {
+      return await source.getSignal()
+    } catch (error) {
+      if (!(error instanceof PriceSignalUnavailableError)) throw error
+      const remainingMs = deadline - nowMs()
+      if (remainingMs <= 0) {
+        throw new PriceSignalUnavailableError(
+          `${error.message}; timed out after ${timeoutMs}ms waiting for a fresh price signal`,
+        )
+      }
+      await sleep(Math.min(retryIntervalMs, remainingMs))
+    }
+  }
+}

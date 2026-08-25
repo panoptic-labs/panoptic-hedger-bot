@@ -208,6 +208,7 @@ export function buildActivationPolicy(
     gasPolicy: {
       maxFeeGwei: config.MAX_FEE_GWEI.toString(),
       maxPriorityFeeGwei: config.MAX_PRIORITY_FEE_GWEI.toString(),
+      minPriorityFeeGwei: config.MIN_PRIORITY_FEE_GWEI.toString(),
       urgentPriorityFeeGwei: config.URGENT_PRIORITY_FEE_GWEI.toString(),
       hedgeMaxBaseFeeGwei: config.HEDGE_MAX_BASE_FEE_GWEI.toString(),
       urgentMaxBaseFeeGwei: config.URGENT_MAX_BASE_FEE_GWEI.toString(),

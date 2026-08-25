@@ -26,7 +26,7 @@ describe('parseHedgerBotConfig', () => {
     expect(cfg.MAX_HEDGE_SLOTS).toBe(4)
     expect(cfg.SLIPPAGE_BPS).toBe(100)
     expect(cfg.PRICE_SIGNAL_SOURCE).toBe('pool-tick')
-    expect(cfg.POLL_INTERVAL_MS).toBe(60_000)
+    expect(cfg.POLL_INTERVAL_MS).toBe(300_000)
     expect(cfg.ORACLE_POKE_ENABLED).toBe(false)
     expect(cfg.DRY_RUN).toBe(false)
     expect(cfg.SFPM_SWAP_PROVISIONED).toBe(false)
@@ -73,10 +73,10 @@ describe('parseHedgerBotConfig', () => {
     expect(() =>
       parseHedgerBotConfig({
         ...BASE_ENV,
-        POLL_INTERVAL_MS: '600000',
+        POLL_INTERVAL_MS: '300000',
         TIMED_HEDGE_INTERVAL_MS: '300000',
       }),
-    ).toThrow(/TIMED_HEDGE_INTERVAL_MS/)
+    ).not.toThrow()
     expect(() =>
       parseHedgerBotConfig({
         ...BASE_ENV,
@@ -288,10 +288,36 @@ describe('parseHedgerBotConfig', () => {
     expect(cfg.CEX_SYMBOL).toBe('ETH-USD')
   })
 
-  it('defaults the urgent tip floor and bump interval', () => {
+  it('defaults the routine and urgent tip floors and bump interval', () => {
     const cfg = parseHedgerBotConfig({ ...BASE_ENV })
+    expect(cfg.MIN_PRIORITY_FEE_GWEI).toBe(parseGwei('0.1'))
     expect(cfg.URGENT_PRIORITY_FEE_GWEI).toBe(parseGwei('1'))
     expect(cfg.TX_BUMP_INTERVAL_MS).toBe(45_000)
+  })
+
+  it('rejects a routine tip floor above its ceiling', () => {
+    expect(() =>
+      parseHedgerBotConfig({
+        ...BASE_ENV,
+        MIN_PRIORITY_FEE_GWEI: '3',
+        MAX_PRIORITY_FEE_GWEI: '2',
+      }),
+    ).toThrow(/MIN_PRIORITY_FEE_GWEI/)
+  })
+
+  it('allows a routine tip floor at MAX_FEE_GWEI and rejects one above it', () => {
+    const feeEnv = {
+      ...BASE_ENV,
+      MAX_FEE_GWEI: '50',
+      MAX_PRIORITY_FEE_GWEI: '100',
+      HEDGE_MAX_BASE_FEE_GWEI: '50',
+      URGENT_MAX_BASE_FEE_GWEI: '50',
+    }
+
+    expect(() => parseHedgerBotConfig({ ...feeEnv, MIN_PRIORITY_FEE_GWEI: '50' })).not.toThrow()
+    expect(() => parseHedgerBotConfig({ ...feeEnv, MIN_PRIORITY_FEE_GWEI: '50.01' })).toThrow(
+      /MIN_PRIORITY_FEE_GWEI/,
+    )
   })
 
   it('allows the urgent tip floor to exceed the routine tip ceiling', () => {

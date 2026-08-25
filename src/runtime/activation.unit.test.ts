@@ -89,6 +89,7 @@ describe('activation marker', () => {
       { ...config, POLL_INTERVAL_MS: config.POLL_INTERVAL_MS + 1 },
       { ...config, MAX_FEE_GWEI: config.MAX_FEE_GWEI + 1n },
       { ...config, MAX_PRIORITY_FEE_GWEI: config.MAX_PRIORITY_FEE_GWEI + 1n },
+      { ...config, MIN_PRIORITY_FEE_GWEI: config.MIN_PRIORITY_FEE_GWEI + 1n },
       { ...config, URGENT_PRIORITY_FEE_GWEI: config.URGENT_PRIORITY_FEE_GWEI + 1n },
       { ...config, HEDGE_MAX_BASE_FEE_GWEI: config.HEDGE_MAX_BASE_FEE_GWEI + 1n },
       { ...config, URGENT_MAX_BASE_FEE_GWEI: config.URGENT_MAX_BASE_FEE_GWEI + 1n },

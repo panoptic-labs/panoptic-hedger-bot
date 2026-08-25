@@ -76,6 +76,7 @@ export function renderStatus(s: StatusSnapshot): void {
   row('net delta', s.netDelta)
   if (s.lp !== undefined) row('uniswap lp', s.lp)
   row('price signal', s.priceSignal)
+  row('event monitor', s.eventMonitor)
   row('last poll', s.lastPoll)
   row('last hedge', s.lastHedge)
   row('oracle recovery', s.oracleRecovery)

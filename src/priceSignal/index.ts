@@ -7,7 +7,13 @@ import type { PriceSignalSource } from './types'
 import { createUniswapPoolSource } from './uniswapPoolSource'
 
 export { createPoolTickSource } from './poolTickSource'
-export { type PriceSignal, type PriceSignalSource, PriceSignalUnavailableError } from './types'
+export {
+  type PriceSignal,
+  type PriceSignalSource,
+  PRICE_SIGNAL_WARMUP_TIMEOUT_MS,
+  PriceSignalUnavailableError,
+  waitForPriceSignal,
+} from './types'
 
 export interface CreatePriceSignalSourceDeps {
   publicClient: PublicClient

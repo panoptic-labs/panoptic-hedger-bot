@@ -93,6 +93,11 @@ export const TUNE_KNOBS: readonly TuneKnob[] = [
     current: (cfg) => gwei(cfg.MAX_PRIORITY_FEE_GWEI),
   },
   {
+    key: 'MIN_PRIORITY_FEE_GWEI',
+    hint: 'priority-tip floor for every transaction',
+    current: (cfg) => gwei(cfg.MIN_PRIORITY_FEE_GWEI),
+  },
+  {
     key: 'URGENT_PRIORITY_FEE_GWEI',
     hint: 'urgent priority-tip floor',
     current: (cfg) => gwei(cfg.URGENT_PRIORITY_FEE_GWEI),

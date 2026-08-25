@@ -6,7 +6,11 @@ import { formatEther, zeroAddress } from 'viem'
 import { deleveragerRoleKey, walletWethAddress } from '../../../src/config'
 import { readSafeLpPositions } from '../../../src/hedge/lpPositions'
 import { validateBotToken } from '../../../src/notify/telegramOnboard'
-import { createPriceSignalSource, PriceSignalUnavailableError } from '../../../src/priceSignal'
+import {
+  createPriceSignalSource,
+  PriceSignalUnavailableError,
+  waitForPriceSignal,
+} from '../../../src/priceSignal'
 import { assertSafeCanReceiveErc1155 } from '../../../src/safe/erc1155Receiver'
 import { rolesModifierV2Abi } from '../../../src/safe/rolesAbi'
 import {
@@ -591,7 +595,7 @@ export async function runDoctorChecks(
         token1Decimals,
         ethTokenIndex: eth,
       })
-      const signal = await source.getSignal()
+      const signal = await waitForPriceSignal(source)
       const pool = await getPool({
         client: asSdkClient<typeof getPool>(publicClient),
         poolAddress: config.POOL_ADDRESS,

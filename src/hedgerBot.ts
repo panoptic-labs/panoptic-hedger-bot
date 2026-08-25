@@ -106,6 +106,8 @@ export interface HedgerBotDeps {
   vaultAsset: { decimals: number; symbol: string }
   /** Heartbeat hooks so a status command can see last poll / last hedge. */
   recordPoll?: (trigger: string) => void
+  /** Cache input for the cheap between-cycle price trigger monitor. */
+  recordSnapshot?: (snapshot: HedgeSnapshot) => void
   recordSafeMode?: (level: number) => void
   recordHedge?: (action: string, tx?: Hex) => void
   /** Trusted persisted cadence history, already identity-checked by startup. */
@@ -310,6 +312,7 @@ export class HedgerBot {
           }
         : undefined,
     })
+    this.deps.recordSnapshot?.(snapshot)
     // Unit/custom snapshot adapters predating the raw level are treated as
     // normal; the production reader always supplies the field.
     const safeModeLevel = snapshot.safeMode?.level ?? 0n

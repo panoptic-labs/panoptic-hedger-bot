@@ -39,8 +39,8 @@ const BASE_ENV_BODY = [
   '',
 ].join('\n')
 
-// 14 knobs apply with this env (no SFPM, no deleverager).
-const KNOB_COUNT = 14
+// 15 knobs apply with this env (no SFPM, no deleverager).
+const KNOB_COUNT = 15
 
 let dir: string
 afterEach(() => rmSync(dir, { recursive: true, force: true }))

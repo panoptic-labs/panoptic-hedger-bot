@@ -14,7 +14,7 @@ import {
   pokeOracle,
 } from '@panoptic-eng/sdk/v2'
 import type { Address } from 'viem'
-import { createPublicClient, createWalletClient, fallback, http, parseAbi } from 'viem'
+import { createPublicClient, createWalletClient, fallback, http, parseAbi, zeroAddress } from 'viem'
 
 import { deleveragerRoleKey, parseHedgerBotConfig, walletWethAddress } from './config'
 import { createHedgeExecutor, createSamePoolLoanExecutor } from './executor'
@@ -22,13 +22,16 @@ import { createSfpmSwapExecutor } from './executor/sfpmSwapExecutor'
 import { createGasPolicy } from './gas/gasPolicy'
 import { createSfpmVenueCoordinator } from './hedge/sfpmVenueCoordinator'
 import { buildSwapPoolMapping } from './hedge/sfpmVenueRouter'
+import { timedHedgeCadence } from './hedge/timedCadence'
 import { type CycleOutcome, type HedgerBotDeps, HedgerBot } from './hedgerBot'
 import { createTelegramNotifier } from './notify/telegram'
 import { createPriceSignalSource } from './priceSignal'
 import { resolveCexAssetOrientation } from './priceSignal/cexSource'
+import { AccountEventMonitor } from './runtime/accountEventMonitor'
 import { buildActivationEvidence, isActivated } from './runtime/activation'
 import { assertTradingEnabled, isDeactivated } from './runtime/deactivation'
 import { HedgeJournal } from './runtime/hedgeJournal'
+import { formatHedgeTriggerStatus, HedgeTriggerMonitor } from './runtime/hedgeTriggerMonitor'
 import {
   type InstanceLeaseHeartbeat,
   acquireInstanceLease,
@@ -48,13 +51,15 @@ import { createRolesExecutor } from './safe/rolesExecutor'
 import { assertProductionEligibleConfig } from './security/productionProfile'
 import { parseBuilderCode } from './utils/builderCode'
 import { defineBotChain } from './utils/chain'
-import { botError, botLog, botWarn } from './utils/log'
+import { botError, botLog, botStatus, botWarn } from './utils/log'
 import { sanitizeError } from './utils/sanitize'
 import { asSdkClient, asSdkWalletClient } from './utils/sdkClient'
 import { sleep } from './utils/sleep'
 
 const STARTUP_RETRY_DELAYS_MS = [15_000, 60_000, 120_000, 300_000] as const
 const ORACLE_POKE_INTERVAL_MS = 65_000
+const FAST_MONITOR_INTERVAL_MS = 12_000
+const DEGRADED_RECONCILE_INTERVAL_MS = 60_000
 
 async function initWithRetry(
   init: () => Promise<void>,
@@ -253,7 +258,7 @@ async function main(): Promise<void> {
       : { decimals: Number(metadata.token1Decimals), symbol: metadata.token1Symbol }
 
   const previousRuntimeState = readRuntimeState()
-  const lastDeltaHedgeAt = trustedLastDeltaHedgeAt(previousRuntimeState, {
+  let lastDeltaHedgeAt = trustedLastDeltaHedgeAt(previousRuntimeState, {
     chainId: config.CHAIN_ID,
     safe: config.SAFE_ADDRESS,
     pool: config.POOL_ADDRESS,
@@ -384,6 +389,25 @@ async function main(): Promise<void> {
     swapPool: config.SFPM_SWAP_POOL_ADDRESS,
   })
 
+  const hedgeTriggerMonitor = new HedgeTriggerMonitor({
+    assetIndex: config.ASSET_INDEX === 0n ? 0n : 1n,
+    deltaThresholdBps: config.DELTA_THRESHOLD_BPS,
+    deltaOffsetBps: config.DELTA_OFFSET_BPS,
+    includeLp: config.HEDGE_INCLUDE_LP,
+  })
+  const accountEventMonitor = new AccountEventMonitor(
+    publicClient,
+    config.POOL_ADDRESS,
+    [
+      metadata.collateralToken0Address,
+      metadata.collateralToken1Address,
+      metadata.token0Asset,
+      metadata.token1Asset,
+    ].filter((address) => address !== zeroAddress),
+    config.SAFE_ADDRESS,
+  )
+  let queuedTrigger: string | undefined
+
   const bot = new HedgerBot({
     config,
     publicClient,
@@ -404,27 +428,63 @@ async function main(): Promise<void> {
     poolMetadata: metadata,
     vaultAsset,
     lastDeltaHedgeAt,
-    recordPoll: (trigger) =>
-      patchRuntimeState(instanceId, {
+    recordPoll: (trigger) => {
+      const patch = {
         lastPollAt: new Date().toISOString(),
         lastPollTrigger: trigger,
-      }),
+      }
+      patchRuntimeState(
+        instanceId,
+        trigger === 'reconcile' ? { ...patch, lastReconcileAt: new Date().toISOString() } : patch,
+      )
+    },
+    recordSnapshot: (snapshot) => {
+      accountEventMonitor.reset(snapshot.blockNumber)
+      const status = hedgeTriggerMonitor.refresh(snapshot)
+      botLog(
+        `[hedger-bot] ${formatHedgeTriggerStatus(status, {
+          token0Decimals: BigInt(metadata.token0Decimals),
+          token1Decimals: BigInt(metadata.token1Decimals),
+          token0Symbol: metadata.token0Symbol,
+          token1Symbol: metadata.token1Symbol,
+        })}`,
+      )
+      patchRuntimeState(instanceId, {
+        hedgeMonitorMode: status.mode,
+        hedgeMonitorSnapshotBlock: status.snapshotBlock.toString(),
+        hedgeApproachDownTick: status.approachDown?.toString(),
+        hedgeApproachUpTick: status.approachUp?.toString(),
+        hedgeTriggerDownTick: status.triggerDown?.toString(),
+        hedgeTriggerUpTick: status.triggerUp?.toString(),
+      })
+    },
     recordSafeMode: (level) => patchRuntimeState(instanceId, { safeModeLevel: level }),
-    recordHedge: (action, tx) =>
+    recordHedge: (action, tx) => {
+      hedgeTriggerMonitor.invalidate()
+      queuedTrigger = 'post-action'
       patchRuntimeState(instanceId, {
         lastHedgeAt: new Date().toISOString(),
         lastHedgeAction: action,
         lastHedgeTx: tx,
-      }),
-    recordDeltaHedge: (at) => patchRuntimeState(instanceId, { lastDeltaHedgeAt: at }),
-    recordDeleverage: (stage, bufferBps, tx, incidentActive) =>
+      })
+    },
+    recordDeltaHedge: (at) => {
+      lastDeltaHedgeAt = at
+      patchRuntimeState(instanceId, { lastDeltaHedgeAt: at })
+    },
+    recordDeleverage: (stage, bufferBps, tx, incidentActive) => {
+      if (tx !== undefined) {
+        hedgeTriggerMonitor.invalidate()
+        queuedTrigger = 'post-action'
+      }
       patchRuntimeState(instanceId, {
         lastDeleverageAt: new Date().toISOString(),
         lastDeleverageStage: stage,
         lastDeleverageTx: tx,
         lastBufferBps: bufferBps.toString(),
         deleverageIncidentActive: incidentActive,
-      }),
+      })
+    },
   })
 
   const recordCycle = (outcome: CycleOutcome) => {
@@ -454,6 +514,11 @@ async function main(): Promise<void> {
   let activeOraclePoke: Promise<void> | null = null
   let lastOracleDiagnosis = ''
   let shuttingDown = false
+  let fastMonitorInFlight = false
+  let monitorHealthy = false
+  let lastFastMonitorSuccessAt = Date.now()
+  let lastCrossedWakeAt = 0
+  let timedWakeFor: string | undefined
 
   const runOraclePoke = (trigger: string): Promise<void> => {
     if (
@@ -582,14 +647,23 @@ async function main(): Promise<void> {
     })()
     activeOraclePoke = pending
     const clear = () => {
-      if (activeOraclePoke === pending) activeOraclePoke = null
+      if (activeOraclePoke !== pending) return
+      activeOraclePoke = null
+      if (queuedTrigger) {
+        const queued = queuedTrigger
+        queuedTrigger = undefined
+        void runAndRecord(queued)
+      }
     }
     void pending.then(clear, clear)
     return pending
   }
 
   const runAndRecord = (trigger: string): Promise<CycleOutcome> => {
-    if (activeCycle || activeOraclePoke) return Promise.resolve('in-flight')
+    if (activeCycle || activeOraclePoke) {
+      queuedTrigger ??= trigger
+      return Promise.resolve('in-flight')
+    }
     const pending = bot.runCycle(trigger).then((outcome) => {
       recordCycle(outcome)
       return outcome
@@ -598,6 +672,12 @@ async function main(): Promise<void> {
     const clear = () => {
       if (activeCycle !== pending) return
       activeCycle = null
+      if (queuedTrigger) {
+        const queued = queuedTrigger
+        queuedTrigger = undefined
+        void runAndRecord(queued)
+        return
+      }
       // A failed SafeMode hedge should not wait for the next 65-second timer
       // edge. The epoch check makes this a no-op when a dispatch already poked.
       void runOraclePoke('post-cycle')
@@ -605,10 +685,83 @@ async function main(): Promise<void> {
     void pending.then(clear, clear)
     return pending
   }
+
+  const runFastMonitor = async (): Promise<void> => {
+    if (shuttingDown || fastMonitorInFlight || activeCycle || activeOraclePoke) return
+    fastMonitorInFlight = true
+    try {
+      const blockNumber = await publicClient.getBlockNumber()
+      const oracleTicks = await publicClient.readContract({
+        address: config.POOL_ADDRESS,
+        abi: panopticPoolV2Abi,
+        functionName: 'getOracleTicks',
+        blockNumber,
+      })
+      const currentTick = BigInt(oracleTicks[0])
+      const accountChanged = await accountEventMonitor.scan(blockNumber)
+      const observation = hedgeTriggerMonitor.observe(currentTick)
+      const now = new Date().toISOString()
+      lastFastMonitorSuccessAt = Date.now()
+      if (!monitorHealthy) botLog('[hedger-bot] fast price/event monitor healthy')
+      monitorHealthy = true
+      patchRuntimeState(instanceId, {
+        lastPriceObservedAt: now,
+        lastPriceBlock: blockNumber.toString(),
+        lastPriceTick: currentTick.toString(),
+        lastEventScanBlock: accountEventMonitor.lastScannedBlock?.toString(),
+        monitorHealthy: true,
+        hedgeMonitorMode: observation?.status.mode,
+      })
+      if (observation) {
+        botStatus(
+          `[hedger-bot] ${formatHedgeTriggerStatus(observation.status, {
+            token0Decimals: BigInt(metadata.token0Decimals),
+            token1Decimals: BigInt(metadata.token1Decimals),
+            token0Symbol: metadata.token0Symbol,
+            token1Symbol: metadata.token1Symbol,
+          })} block=${blockNumber} drift=${observation.status.driftBps}bps`,
+        )
+      }
+
+      if (accountChanged) {
+        hedgeTriggerMonitor.invalidate()
+        await runAndRecord('account-event')
+        return
+      }
+      if (observation?.reason) {
+        if (observation.reason === 'hedge-crossed') lastCrossedWakeAt = Date.now()
+        await runAndRecord(observation.reason)
+        return
+      }
+      if (
+        observation &&
+        observation.status.driftBps > config.DELTA_THRESHOLD_BPS &&
+        Date.now() - lastCrossedWakeAt >= DEGRADED_RECONCILE_INTERVAL_MS
+      ) {
+        lastCrossedWakeAt = Date.now()
+        await runAndRecord('hedge-crossed-retry')
+        return
+      }
+      const cadence = timedHedgeCadence(config.TIMED_HEDGE_INTERVAL_MS, lastDeltaHedgeAt)
+      const cadenceKey = cadence.lastDeltaHedgeAt ?? 'no-confirmed-delta-hedge'
+      if (cadence.due && timedWakeFor !== cadenceKey) {
+        timedWakeFor = cadenceKey
+        await runAndRecord('timed-deadline')
+      }
+    } catch (error) {
+      if (monitorHealthy) {
+        botWarn(`[hedger-bot] fast price/event monitor degraded: ${sanitizeError(error)}`)
+      }
+      monitorHealthy = false
+      patchRuntimeState(instanceId, { monitorHealthy: false })
+    } finally {
+      fastMonitorInFlight = false
+    }
+  }
   botLog(
     `[hedger-bot] starting: chain=${config.CHAIN_ID} pool=${config.POOL_ADDRESS} safe=${config.SAFE_ADDRESS} ` +
       `signal=${config.PRICE_SIGNAL_SOURCE} dryRun=${config.DRY_RUN}${activated ? '' : ' (forced: not activated)'} ` +
-      `interval=${config.POLL_INTERVAL_MS}ms`,
+      `reconcileInterval=${config.POLL_INTERVAL_MS}ms fastMonitorInterval=${FAST_MONITOR_INTERVAL_MS}ms`,
   )
 
   const recordInitFailure = (attempt: number, error: unknown) =>
@@ -619,7 +772,9 @@ async function main(): Promise<void> {
       ready: false,
     })
 
-  let pollTimer: ReturnType<typeof setInterval> | undefined
+  let reconcileTimer: ReturnType<typeof setInterval> | undefined
+  let fastMonitorTimer: ReturnType<typeof setInterval> | undefined
+  let degradedTimer: ReturnType<typeof setInterval> | undefined
   let oraclePokeTimer: ReturnType<typeof setInterval> | undefined
   let leaseHeartbeat: InstanceLeaseHeartbeat | undefined
   // Register before startup RPC work so termination still releases state,
@@ -628,7 +783,9 @@ async function main(): Promise<void> {
     if (shuttingDown) return
     shuttingDown = true
     botLog(`[hedger-bot] received ${signal}, shutting down`)
-    if (pollTimer) clearInterval(pollTimer)
+    if (reconcileTimer) clearInterval(reconcileTimer)
+    if (fastMonitorTimer) clearInterval(fastMonitorTimer)
+    if (degradedTimer) clearInterval(degradedTimer)
     if (oraclePokeTimer) clearInterval(oraclePokeTimer)
     leaseHeartbeat?.stop()
     priceSource.stop?.()
@@ -672,11 +829,26 @@ async function main(): Promise<void> {
       throw new Error('startup cycle did not reach readiness')
     }
   }, recordInitFailure)
-  pollTimer = setInterval(() => {
-    void runAndRecord('poll').catch((error) => {
-      botError('[hedger-bot] poll cycle rejected', error)
+  const startupCadence = timedHedgeCadence(config.TIMED_HEDGE_INTERVAL_MS, lastDeltaHedgeAt)
+  if (startupCadence.due) {
+    timedWakeFor = startupCadence.lastDeltaHedgeAt ?? 'no-confirmed-delta-hedge'
+  }
+  await runFastMonitor()
+  reconcileTimer = setInterval(() => {
+    void runAndRecord('reconcile').catch((error) => {
+      botError('[hedger-bot] reconciliation cycle rejected', error)
     })
   }, config.POLL_INTERVAL_MS)
+  fastMonitorTimer = setInterval(() => {
+    void runFastMonitor()
+  }, FAST_MONITOR_INTERVAL_MS)
+  degradedTimer = setInterval(() => {
+    if (!monitorHealthy || Date.now() - lastFastMonitorSuccessAt > FAST_MONITOR_INTERVAL_MS * 2) {
+      void runAndRecord('monitor-fallback').catch((error) => {
+        botError('[hedger-bot] degraded fallback cycle rejected', error)
+      })
+    }
+  }, DEGRADED_RECONCILE_INTERVAL_MS)
   if (config.ORACLE_POKE_ENABLED) {
     oraclePokeTimer = setInterval(() => {
       void runOraclePoke('safe-mode-recovery')

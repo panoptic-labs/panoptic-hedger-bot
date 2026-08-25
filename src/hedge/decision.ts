@@ -49,8 +49,34 @@ export interface PlanHedgeResult {
   triggers: { drift: boolean; timedDrift: boolean; overCap: boolean; signFlip: boolean }
 }
 
+export interface HedgeDrift {
+  H: bigint
+  Hstar: bigint
+  driftBps: bigint
+}
+
 const abs = (x: bigint): bigint => (x < 0n ? -x : x)
 const sameSign = (a: bigint, b: bigint): boolean => (a > 0n && b > 0n) || (a < 0n && b < 0n)
+
+/** The common drift calculation used by both full planning and cached price monitoring. */
+export function computeHedgeDrift(
+  netDelta: bigint,
+  H_short: bigint,
+  H_long: bigint,
+  portfolioSize: bigint,
+  deltaOffsetBps: bigint,
+): HedgeDrift {
+  const H = H_long - H_short
+  const hedgeGross = H_short + H_long
+  const sizeBasis = portfolioSize > 0n ? portfolioSize : hedgeGross
+  const targetDelta = (sizeBasis * deltaOffsetBps) / 10_000n
+  const effectiveDelta = netDelta - targetDelta
+  return {
+    H,
+    Hstar: H - effectiveDelta,
+    driftBps: sizeBasis > 0n ? (abs(effectiveDelta) * 10_000n) / sizeBasis : 0n,
+  }
+}
 
 /** tokenType for a hedge of the given direction. Positive delta ⇒ long ⇒ borrow numeraire. */
 function tokenTypeForDirection(positiveDelta: boolean, assetIndex: 0n | 1n): bigint {
@@ -74,7 +100,13 @@ export function planHedge(
   portfolioSize: bigint,
   cfg: PlanHedgeConfig,
 ): PlanHedgeResult {
-  const H = H_long - H_short
+  const { H, Hstar, driftBps } = computeHedgeDrift(
+    netDelta,
+    H_short,
+    H_long,
+    portfolioSize,
+    cfg.deltaOffsetBps,
+  )
   // Drift is measured against the option book normally; when all options are
   // closed but a hedge loan remains, fall back to the gross hedge book so a
   // standalone hedge still gets unwound toward H* instead of being stranded
@@ -84,11 +116,6 @@ export function planHedge(
   // The bias shifts the target delta the book is driven to. `effectiveDelta` is
   // the delta we actually neutralize; with deltaOffsetBps=0 it equals netDelta,
   // so H* and drift reduce to the delta-neutral case unchanged.
-  const targetDelta = (sizeBasis * cfg.deltaOffsetBps) / 10_000n
-  const effectiveDelta = netDelta - targetDelta
-  const Hstar = H - effectiveDelta
-  const driftBps = sizeBasis > 0n ? (abs(effectiveDelta) * 10_000n) / sizeBasis : 0n
-
   const drift = driftBps > cfg.deltaThresholdBps
   const overCap = hedges.length > cfg.absoluteMaxHedgeCount
   const signFlip = H !== 0n && Hstar !== 0n && !sameSign(H, Hstar)
@@ -306,25 +333,42 @@ export interface HedgePlan extends PlanHedgeResult {
   breakdown: HedgeDeltaBreakdown
 }
 
-/**
- * Compute a full, execution-ready hedge plan for the current cycle.
- * The caller supplies the already-read positions (so position discovery and
- * hedge classification live in positionReader).
- */
-export function computeHedgePlan(deps: ComputeHedgePlanDeps): HedgePlan {
-  const { pool, collateral, signalTick, assetIndex } = deps
-  const tickSpacing = BigInt(pool.tickSpacing)
-  const poolId = pool.poolId
-  const openIds = deps.positions.map((p) => p.tokenId)
+export type ComputeHedgeExposureDeps = Pick<
+  ComputeHedgePlanDeps,
+  | 'pool'
+  | 'collateral'
+  | 'walletBalances'
+  | 'assetIndex'
+  | 'positions'
+  | 'hedgePositions'
+  | 'lpPositions'
+  | 'includeLp'
+>
+
+export interface HedgeExposure {
+  netDelta: bigint
+  portfolioSize: bigint
+  H_short: bigint
+  H_long: bigint
+  hedgeItems: HedgeItem[]
+  portfolioDelta: PortfolioDeltaBreakdown
+  positionsDelta: bigint
+  collateralDelta: bigint
+  lpDelta: bigint
+  lpIncluded: boolean
+  walletBalances: SafeWalletBalances
+}
+
+/** Pure exposure calculation shared by authoritative planning and the fast price monitor. */
+export function computeHedgeExposure(deps: ComputeHedgeExposureDeps): HedgeExposure {
+  const { pool, collateral, assetIndex } = deps
   const markTick = pool.currentTick
+  const tickSpacing = BigInt(pool.tickSpacing)
   const collateralAssetSide =
     assetIndex === 0n ? collateral.token0.assets : collateral.token1.assets
   const walletBalances = deps.walletBalances ?? EMPTY_SAFE_WALLET_BALANCES
   const walletAssetSide =
     assetIndex === 0n ? walletBalances.token0.total : walletBalances.token1.total
-  // Delta is taken with respect to the vault asset, so the opposite collateral
-  // balance is numeraire. The selected balance is already in the vault asset
-  // frame; this identity conversion is therefore independent of markTick.
   const collateralDelta = toVaultFrameAtTick(
     collateralAssetSide + walletAssetSide,
     assetIndex,
@@ -340,14 +384,8 @@ export function computeHedgePlan(deps: ComputeHedgePlanDeps): HedgePlan {
   )
   const positionsDelta = portfolioDelta.total
 
-  // Same-pair Uniswap LP delta, priced at the pool's mark tick. Because the LP
-  // pair == the Panoptic pair (canonical ordering), assetIndex is the vault
-  // asset frame directly — no further conversion, same sign as collateralDelta.
   let lpDelta = 0n
   for (const lp of deps.lpPositions ?? []) {
-    // Fail closed per position: a malformed LP entry (e.g. an out-of-range tick)
-    // must not throw out of the hedge cycle and take the options/loans hedge down
-    // with it. Skip that position's contribution and keep going.
     try {
       lpDelta += getLpGreeks({
         liquidity: lp.liquidity,
@@ -357,14 +395,13 @@ export function computeHedgePlan(deps: ComputeHedgePlanDeps): HedgePlan {
         assetIndex: assetIndex === 0n ? 0 : 1,
       }).delta
     } catch {
-      // skip — contributes 0 to lpDelta
+      // A malformed LP position contributes no delta, matching authoritative planning.
     }
   }
   const lpIncluded = Boolean(deps.includeLp) && (deps.lpPositions?.length ?? 0) > 0
   const netDelta = positionsDelta + collateralDelta + (lpIncluded ? lpDelta : 0n)
   const portfolioSize = computePortfolioSizeInVaultAsset(deps.positions, assetIndex)
 
-  // Decompose the hedge book into short/long magnitudes (vault-asset frame).
   let H_short = 0n
   let H_long = 0n
   const hedgeItems: HedgeItem[] = []
@@ -373,10 +410,6 @@ export function computeHedgePlan(deps: ComputeHedgePlanDeps): HedgePlan {
     let side: bigint | null = null
     for (const leg of h.legs) {
       if (leg.width !== 0n) continue
-      // The shrink/consolidate classifier assigns ONE tokenType per HedgeItem, so
-      // a mixed-side (multi-leg) zero-width loan would be silently miscategorized
-      // (last leg wins). The bot only mints single-leg loans; assert that here so
-      // an unexpected multi-leg loan fails loudly instead of corrupting the book.
       if (side !== null && side !== leg.tokenType) {
         throw new Error(
           `hedge loan ${h.tokenId} has mixed-side zero-width legs; expected a single-side loan`,
@@ -397,6 +430,46 @@ export function computeHedgePlan(deps: ComputeHedgePlanDeps): HedgePlan {
     }
     hedgeItems.push({ tokenId: h.tokenId, tokenType: side ?? assetIndex, size: sizeMag })
   }
+
+  return {
+    netDelta,
+    portfolioSize,
+    H_short,
+    H_long,
+    hedgeItems,
+    portfolioDelta,
+    positionsDelta,
+    collateralDelta,
+    lpDelta,
+    lpIncluded,
+    walletBalances,
+  }
+}
+
+/**
+ * Compute a full, execution-ready hedge plan for the current cycle.
+ * The caller supplies the already-read positions (so position discovery and
+ * hedge classification live in positionReader).
+ */
+export function computeHedgePlan(deps: ComputeHedgePlanDeps): HedgePlan {
+  const { pool, collateral, signalTick, assetIndex } = deps
+  const tickSpacing = BigInt(pool.tickSpacing)
+  const poolId = pool.poolId
+  const openIds = deps.positions.map((p) => p.tokenId)
+  const exposure = computeHedgeExposure(deps)
+  const {
+    netDelta,
+    portfolioSize,
+    H_short,
+    H_long,
+    hedgeItems,
+    portfolioDelta,
+    positionsDelta,
+    collateralDelta,
+    lpDelta,
+    lpIncluded,
+    walletBalances,
+  } = exposure
 
   const plan = planHedge(netDelta, H_short, H_long, hedgeItems, portfolioSize, {
     assetIndex,
