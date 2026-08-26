@@ -27,7 +27,6 @@ export function formatCycleSummary(
     plan.triggers.drift ? 'drift' : null,
     plan.triggers.timedDrift ? 'timed-drift' : null,
     plan.triggers.overCap ? 'over-cap' : null,
-    plan.triggers.signFlip ? 'sign-flip' : null,
   ].filter(Boolean)
   const lines = [
     `━━━━━━ ${tag} ━━━━━━`,

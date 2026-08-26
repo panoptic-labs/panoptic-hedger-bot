@@ -74,6 +74,16 @@ function boundedInteger(min: number, max: number, defaultValue?: number) {
   return defaultValue === undefined ? schema : schema.default(String(defaultValue))
 }
 
+function integerAtLeast(min: number, defaultValue?: number) {
+  const schema = z
+    .string()
+    .regex(/^(0|[1-9]\d*)$/, 'must be a plain non-negative integer')
+    .transform(Number)
+    .refine(Number.isSafeInteger, 'must be a safe integer')
+    .refine((value) => value >= min, `must be at least ${min}`)
+  return defaultValue === undefined ? schema : schema.default(String(defaultValue))
+}
+
 function boundedBigint(min: bigint, max: bigint, defaultValue?: bigint) {
   const schema = z
     .string()
@@ -283,7 +293,7 @@ const rawEnvSchema = z
     // Loop
     // Authoritative account reconciliation cadence. Price and account events
     // are monitored separately between these full snapshots.
-    POLL_INTERVAL_MS: boundedInteger(5_000, 300_000, 300_000),
+    POLL_INTERVAL_MS: integerAtLeast(5_000, 300_000),
     // Permissionless direct-EOA recovery call. Opt-in because it spends keeper
     // gas independently of hedge dispatches; live use is activation-bound.
     ORACLE_POKE_ENABLED: booleanSchema.default('false'),

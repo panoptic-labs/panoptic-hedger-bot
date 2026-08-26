@@ -20,7 +20,7 @@ const runtimeStateSchema = z
     chainId: z.number().int().positive(),
     safe: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
     pool: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
-    pollIntervalMs: z.number().int().min(5_000).max(300_000),
+    pollIntervalMs: z.number().int().min(5_000).max(Number.MAX_SAFE_INTEGER),
     lifecycle: z.enum(['starting', 'ready', 'degraded', 'failed']),
     ready: z.boolean(),
     initAttempts: z.number().int().nonnegative(),

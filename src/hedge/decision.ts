@@ -46,7 +46,7 @@ export interface PlanHedgeResult {
   H: bigint
   Hstar: bigint
   driftBps: bigint
-  triggers: { drift: boolean; timedDrift: boolean; overCap: boolean; signFlip: boolean }
+  triggers: { drift: boolean; timedDrift: boolean; overCap: boolean }
 }
 
 export interface HedgeDrift {
@@ -118,18 +118,20 @@ export function planHedge(
   // so H* and drift reduce to the delta-neutral case unchanged.
   const drift = driftBps > cfg.deltaThresholdBps
   const overCap = hedges.length > cfg.absoluteMaxHedgeCount
-  const signFlip = H !== 0n && Hstar !== 0n && !sameSign(H, Hstar)
+  // A sign change through delta zero is NOT an independent trigger: it must not
+  // by itself provoke a delta-changing flip while drift stays below the
+  // applicable threshold. The flip *action* still fires once an ordinary
+  // trigger (hard drift, timed drift, or capacity) permits planning.
   // Existing triggers own precedence. In particular, a capacity-only
   // consolidation must remain state-preserving and leave a due cadence latched
   // for the next poll.
   const timedDrift =
     !drift &&
     !overCap &&
-    !signFlip &&
     cfg.timedHedgeDue === true &&
     cfg.timedHedgeMinDriftBps !== undefined &&
     driftBps > cfg.timedHedgeMinDriftBps
-  const triggers = { drift, timedDrift, overCap, signFlip }
+  const triggers = { drift, timedDrift, overCap }
   const deltaDrift = drift || timedDrift
 
   const none = (action: HedgeAction = 'none'): PlanHedgeResult => ({
@@ -144,7 +146,7 @@ export function planHedge(
   })
 
   if (sizeBasis === 0n) return none()
-  if (!(deltaDrift || overCap || signFlip)) return none()
+  if (!(deltaDrift || overCap)) return none()
 
   const consolidate = (): PlanHedgeResult => {
     // Capacity overlay: collapse all same-side hedges into one WITHOUT changing
@@ -194,10 +196,12 @@ export function planHedge(
   // slippage cost that also clears the self-offsetting pair).
   const netSide = tokenTypeForDirection(H > 0n, cfg.assetIndex)
   const mixedBook = H !== 0n && hedges.some((h) => h.tokenType !== netSide)
-  if (mixedBook && overCap && !(deltaDrift || signFlip)) return growConsolidate()
+  if (mixedBook && overCap && !deltaDrift) return growConsolidate()
 
-  // Capacity overlay short-circuits the state-preserving-only case.
-  if (overCap && !(deltaDrift || signFlip)) return consolidate()
+  // Capacity overlay short-circuits the state-preserving-only case. A
+  // below-threshold sign change alone must not turn consolidation into a
+  // delta-changing flip.
+  if (overCap && !deltaDrift) return consolidate()
 
   // Classify.
   if (H === 0n && Hstar === 0n) return none()

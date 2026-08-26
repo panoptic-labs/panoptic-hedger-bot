@@ -51,7 +51,8 @@ import { createRolesExecutor } from './safe/rolesExecutor'
 import { assertProductionEligibleConfig } from './security/productionProfile'
 import { parseBuilderCode } from './utils/builderCode'
 import { defineBotChain } from './utils/chain'
-import { botError, botLog, botStatus, botWarn } from './utils/log'
+import { botError, botLog, botStatus, botWarn, botWarnBlock, formatAsciiBox } from './utils/log'
+import { type LongInterval, startLongInterval } from './utils/longInterval'
 import { sanitizeError } from './utils/sanitize'
 import { asSdkClient, asSdkWalletClient } from './utils/sdkClient'
 import { sleep } from './utils/sleep'
@@ -122,8 +123,13 @@ async function main(): Promise<void> {
   const effectiveDryRun = parsed.DRY_RUN || !activated
   const config = { ...parsed, DRY_RUN: effectiveDryRun }
   if (!activated && !parsed.DRY_RUN) {
-    botWarn(
-      '[hedger-bot] NOT ACTIVATED — forcing DRY_RUN. Run `pnpm activate` to go live (it runs preflight first).',
+    botWarnBlock(
+      formatAsciiBox('[hedger-bot]', [
+        '!!! DRY RUN: HEDGER-BOT IS NOT ACTIVATED !!!',
+        '',
+        'Transactions will only be simulated; nothing will be sent.',
+        'Run `pnpm activate` to complete preflight and enable live execution.',
+      ]),
     )
   }
   if (config.PRICE_SIGNAL_SOURCE === 'uniswap-pool') {
@@ -772,7 +778,7 @@ async function main(): Promise<void> {
       ready: false,
     })
 
-  let reconcileTimer: ReturnType<typeof setInterval> | undefined
+  let reconcileTimer: LongInterval | undefined
   let fastMonitorTimer: ReturnType<typeof setInterval> | undefined
   let degradedTimer: ReturnType<typeof setInterval> | undefined
   let oraclePokeTimer: ReturnType<typeof setInterval> | undefined
@@ -783,7 +789,7 @@ async function main(): Promise<void> {
     if (shuttingDown) return
     shuttingDown = true
     botLog(`[hedger-bot] received ${signal}, shutting down`)
-    if (reconcileTimer) clearInterval(reconcileTimer)
+    reconcileTimer?.stop()
     if (fastMonitorTimer) clearInterval(fastMonitorTimer)
     if (degradedTimer) clearInterval(degradedTimer)
     if (oraclePokeTimer) clearInterval(oraclePokeTimer)
@@ -834,7 +840,7 @@ async function main(): Promise<void> {
     timedWakeFor = startupCadence.lastDeltaHedgeAt ?? 'no-confirmed-delta-hedge'
   }
   await runFastMonitor()
-  reconcileTimer = setInterval(() => {
+  reconcileTimer = startLongInterval(() => {
     void runAndRecord('reconcile').catch((error) => {
       botError('[hedger-bot] reconciliation cycle rejected', error)
     })

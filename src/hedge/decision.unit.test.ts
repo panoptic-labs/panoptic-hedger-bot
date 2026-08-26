@@ -190,7 +190,6 @@ describe('planHedge — gating', () => {
       drift: false,
       timedDrift: false,
       overCap: false,
-      signFlip: false,
     })
   })
 
@@ -298,22 +297,58 @@ describe('planHedge — 5-case tree', () => {
     expect(r.swapAtMint).toBe(true)
   })
 
-  it('sign-flip trigger fires even when drift is tiny', () => {
-    // H = -100 (short), netDelta -120 → H* = +20; drift 12bps < 200 but signFlip
+  it('sub-threshold sign change alone does NOT flip (churn-around-zero regression)', () => {
+    // Incident repro: H = -100 (short), netDelta -120 → H* = +20 (opposite sign);
+    // drift 12bps < 200 and no other trigger. Crossing zero must not churn.
     const r = planHedge(-120n, 100n, 0n, [short(1n, 100n)], PORT, CFG)
-    expect(r.triggers.signFlip).toBe(true)
-    expect(r.action).toBe('flip')
+    expect(r.action).toBe('none')
+    expect(r.mints).toEqual([])
+    expect(r.burns).toEqual([])
+    expect(r.triggers).toEqual({ drift: false, timedDrift: false, overCap: false })
   })
 
-  it('keeps sign-flip precedence when the timed inner band is also due', () => {
-    const r = planHedge(-120n, 100n, 0n, [short(1n, 100n)], PORT, {
-      ...CFG,
-      timedHedgeDue: true,
-      timedHedgeMinDriftBps: 10n,
-    })
-    expect(r.triggers.signFlip).toBe(true)
-    expect(r.triggers.timedDrift).toBe(false)
+  it('does not churn across consecutive observations straddling zero', () => {
+    // The current hedge is unchanged between polls because the first flip is
+    // suppressed, so the second target must be computed against the SAME H —
+    // not a hypothetical post-flip book. Both sub-threshold crossings hold.
+    const hedge = [short(1n, 12n)]
+    // Obs 1: H=-12, netDelta -16 → H*=+4 (crosses short→long), drift 16bps < 200.
+    const obs1 = planHedge(-16n, 12n, 0n, hedge, PORT, CFG)
+    expect(obs1.action).toBe('none')
+    expect(obs1.H).toBe(-12n)
+    // Obs 2: hedge still -12 (nothing executed), netDelta -8 → H*=-4 (reverses
+    // long→short), drift 8bps < 200. Still no execution.
+    const obs2 = planHedge(-8n, 12n, 0n, hedge, PORT, CFG)
+    expect(obs2.action).toBe('none')
+    expect(obs2.H).toBe(-12n)
+    expect(obs2.burns).toEqual([])
+    expect(obs2.mints).toEqual([])
+  })
+
+  it('opposite-signed target above the hard threshold still FLIPs', () => {
+    // H = -1000 (short), netDelta -1500 → H* = +500; drift 500bps > 200 → flip.
+    const r = planHedge(-1500n, 1000n, 0n, [short(1n, 1000n)], PORT, CFG)
     expect(r.action).toBe('flip')
+    expect(r.triggers.drift).toBe(true)
+    expect(r.burns).toEqual([1n])
+    expect(r.mints).toEqual([{ tokenType: LONG, size: 500n }])
+  })
+
+  it('sign change in the timed band flips only when cadence is due', () => {
+    // H = -100 (short), netDelta -120 → H* = +20; drift 12bps < 200 hard band but
+    // > 10 timed min. Fires a flip only when the timed cadence is due.
+    const timed = { ...CFG, timedHedgeDue: true, timedHedgeMinDriftBps: 10n }
+    const due = planHedge(-120n, 100n, 0n, [short(1n, 100n)], PORT, timed)
+    expect(due.action).toBe('flip')
+    expect(due.triggers.timedDrift).toBe(true)
+    expect(due.burns).toEqual([1n])
+    expect(due.mints).toEqual([{ tokenType: LONG, size: 20n }])
+
+    const notDue = planHedge(-120n, 100n, 0n, [short(1n, 100n)], PORT, {
+      ...timed,
+      timedHedgeDue: false,
+    })
+    expect(notDue.action).toBe('none')
   })
 })
 
@@ -378,7 +413,6 @@ describe('planHedge — mixed-side book (restart adoption)', () => {
       drift: false,
       timedDrift: false,
       overCap: true,
-      signFlip: false,
     })
     expect(r.action).toBe('consolidate')
     expect(r.burns).toEqual([1n, 2n, 3n, 4n, 5n])
@@ -409,11 +443,23 @@ describe('planHedge — capacity overlay', () => {
       drift: false,
       timedDrift: false,
       overCap: true,
-      signFlip: false,
     })
     expect(r.action).toBe('consolidate')
     expect(r.burns).toEqual([1n, 2n, 3n, 4n, 5n])
     expect(r.mints).toEqual([{ tokenType: SHORT, size: 500n }]) // |H|
+    expect(r.swapAtMint).toBe(false)
+  })
+
+  it('capacity-only consolidation stays state-preserving when H* sign differs', () => {
+    // 5 tiny short hedges (H=-5), netDelta -7 → H*=+2 (opposite sign), drift
+    // 7bps < 200. A below-threshold sign change must NOT turn the capacity
+    // consolidation into a delta-changing flip: consolidate to |H|, no swap.
+    const hedges = [1n, 2n, 3n, 4n, 5n].map((id) => short(id, 1n))
+    const r = planHedge(-7n, 5n, 0n, hedges, PORT, CFG)
+    expect(r.action).toBe('consolidate')
+    expect(r.triggers).toEqual({ drift: false, timedDrift: false, overCap: true })
+    expect(r.burns).toEqual([1n, 2n, 3n, 4n, 5n])
+    expect(r.mints).toEqual([{ tokenType: SHORT, size: 5n }]) // |H|, target-preserving
     expect(r.swapAtMint).toBe(false)
   })
 

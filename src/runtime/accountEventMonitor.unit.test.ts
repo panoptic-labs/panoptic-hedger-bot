@@ -26,6 +26,19 @@ describe('isRelevantAccountLog', () => {
     ).toBe(false)
   })
 
+  it.each([
+    ['OptionMinted(address,uint256,uint256)', 1],
+    ['OptionBurnt(address,uint128,uint256,int256[4])', 1],
+    ['ForcedExercised(address,address,uint256,int256)', 2],
+    ['AccountLiquidated(address,address,int256)', 2],
+    ['PremiumSettled(address,uint256,uint256,int256)', 1],
+  ])('matches %s for the configured account', (signature, accountIndex) => {
+    const topics = [keccak256(stringToHex(signature)), topic(other), topic(other)]
+    topics[accountIndex] = topic(account)
+
+    expect(isRelevantAccountLog(log(pool, topics), pool, [collateral], account)).toBe(true)
+  })
+
   it('treats a collateral log mentioning the account as an invalidation hint', () => {
     expect(
       isRelevantAccountLog(

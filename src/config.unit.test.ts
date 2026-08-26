@@ -363,7 +363,6 @@ describe('parseHedgerBotConfig', () => {
 
   it.each([
     ['SLIPPAGE_BPS', '0', '500', '-1', '501'],
-    ['POLL_INTERVAL_MS', '5000', '300000', '4999', '300001'],
     ['TIMED_HEDGE_INTERVAL_MS', '0', '604800000', '-1', '604800001'],
     ['CEX_STALE_MS', '1000', '60000', '999', '60001'],
     ['SIGNAL_TICK_SANITY_MAX', '100', '10000', '99', '10001'],
@@ -377,6 +376,18 @@ describe('parseHedgerBotConfig', () => {
     expect(() => parseHedgerBotConfig({ ...BASE_ENV, [field]: max })).not.toThrow()
     expect(() => parseHedgerBotConfig({ ...BASE_ENV, [field]: below })).toThrow(field)
     expect(() => parseHedgerBotConfig({ ...BASE_ENV, [field]: above })).toThrow(field)
+  })
+
+  it('accepts any safe POLL_INTERVAL_MS at or above five seconds', () => {
+    expect(
+      parseHedgerBotConfig({ ...BASE_ENV, POLL_INTERVAL_MS: '9007199254740991' }).POLL_INTERVAL_MS,
+    ).toBe(Number.MAX_SAFE_INTEGER)
+    expect(() =>
+      parseHedgerBotConfig({ ...BASE_ENV, POLL_INTERVAL_MS: '2147483648' }),
+    ).not.toThrow()
+    expect(() => parseHedgerBotConfig({ ...BASE_ENV, POLL_INTERVAL_MS: '4999' })).toThrow(
+      /POLL_INTERVAL_MS/,
+    )
   })
 
   it('bounds receipt timeout with a compatible bump interval', () => {

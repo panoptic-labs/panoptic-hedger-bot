@@ -29,6 +29,29 @@ export function botWarn(message: string): void {
   console.warn(`${stamp()} ${sanitizeText(message, 4_000)}`)
 }
 
+/** Write a multi-line warning with an identical timestamp prefix on every line. */
+export function botWarnBlock(lines: readonly string[]): void {
+  clearTransientStatus()
+  const timestamp = stamp()
+  console.warn(lines.map((line) => `${timestamp} ${sanitizeText(line, 4_000)}`).join('\n'))
+}
+
+/** Separate dense log fields into terminal-friendly, tab-aligned columns. */
+export function formatLogColumns(heading: string, columns: readonly string[]): string {
+  return [heading, ...columns].join('\t| ')
+}
+
+/** Frame a short operator message without relying on terminal color support. */
+export function formatAsciiBox(tag: string, lines: readonly string[]): string[] {
+  const contentWidth = Math.max(...lines.map((line) => line.length), 1)
+  const border = `+${'-'.repeat(contentWidth + 2)}+`
+  return [
+    `${tag} ${border}`,
+    ...lines.map((line) => `${tag} | ${line.padEnd(contentWidth)} |`),
+    `${tag} ${border}`,
+  ]
+}
+
 export function botError(message: string, ...rest: unknown[]): void {
   clearTransientStatus()
   const details = rest.map(sanitizeError).filter(Boolean)

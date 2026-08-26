@@ -54,7 +54,7 @@ import {
 } from './runtime/hedgeJournal'
 import type { PendingSfpmSwapPort } from './runtime/pendingSfpmSwap'
 import { type RolesExecutor, TxNotMinedError } from './safe/rolesExecutor'
-import { botError, botLog, botWarn } from './utils/log'
+import { botError, botLog, botWarn, formatLogColumns } from './utils/log'
 import { sanitizeError } from './utils/sanitize'
 
 export interface HedgerBotDeps {
@@ -338,22 +338,25 @@ export class HedgerBot {
           leg.width > 0n && (pool.currentTick < leg.tickLower || pool.currentTick > leg.tickUpper),
       ),
     )
-    const oorNote =
+    const oorColumn =
       outOfRange.length > 0
-        ? ` ⚠️ outOfRange=${outOfRange.length}/${snapshot.positions.length} [${outOfRange
+        ? `⚠️ outOfRange=${outOfRange.length}/${snapshot.positions.length} [${outOfRange
             .map((p) => p.tokenId)
             .join(', ')}]`
-        : ''
+        : undefined
     botLog(
-      `[hedger-bot] portfolio positions=${snapshot.positions.length} legs=${legCount} ` +
-        `collateral=[${f0(bp.collateralBalance0)}, ${f1(bp.collateralBalance1)}] ` +
-        `safeWallet=[${f0(walletBalances.token0.total)}, ` +
-        `${f1(walletBalances.token1.total)}] ` +
+      formatLogColumns('[hedger-bot] portfolio', [
+        `positions=${snapshot.positions.length}`,
+        `legs=${legCount}`,
+        `collateral=[${f0(bp.collateralBalance0)}, ${f1(bp.collateralBalance1)}]`,
+        `safeWallet=[${f0(walletBalances.token0.total)}, ${f1(walletBalances.token1.total)}]`,
         `portfolioCollateral=[${f0(
           snapshot.collateral.token0.assets + walletBalances.token0.total,
-        )}, ${f1(snapshot.collateral.token1.assets + walletBalances.token1.total)}] ` +
-        `buyingPower=[${f0(free0)}, ${f1(free1)}] ` +
-        `marginUsed=[${f0(bp.requiredCollateral0)}, ${f1(bp.requiredCollateral1)}]${oorNote}`,
+        )}, ${f1(snapshot.collateral.token1.assets + walletBalances.token1.total)}]`,
+        `buyingPower=[${f0(free0)}, ${f1(free1)}]`,
+        `marginUsed=[${f0(bp.requiredCollateral0)}, ${f1(bp.requiredCollateral1)}]`,
+        ...(oorColumn ? [oorColumn] : []),
+      ]),
     )
 
     const bufferBps = computeLiquidationBufferBps(snapshot.liquidation)
@@ -503,8 +506,13 @@ export class HedgerBot {
     const { decimals, symbol } = this.deps.vaultAsset
     const asset = (v: bigint) => `${formatUnits(v, decimals)} ${symbol}`
     botLog(
-      `[hedger-bot] ${trigger} action=${plan.action} netDelta=${asset(plan.netDelta)} ` +
-        `H=${asset(plan.H)} H*=${asset(plan.Hstar)} drift=${plan.driftBps}bps`,
+      formatLogColumns(`[hedger-bot] ${trigger}`, [
+        `action=${plan.action}`,
+        `netDelta=${asset(plan.netDelta)}`,
+        `H=${asset(plan.H)}`,
+        `H*=${asset(plan.Hstar)}`,
+        `drift=${plan.driftBps}bps`,
+      ]),
     )
 
     if (plan.action === 'none') {

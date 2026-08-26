@@ -150,7 +150,7 @@ const closeSevenPlan = {
   H: -20n,
   Hstar: 0n,
   driftBps: 0n,
-  triggers: { drift: false, timedDrift: false, overCap: false, signFlip: true },
+  triggers: { drift: true, timedDrift: false, overCap: false },
   netDelta: -20n,
   portfolioSize: 100n,
   intent: {
@@ -175,7 +175,7 @@ const consolidatePlan = {
   H: -20n,
   Hstar: -20n,
   driftBps: 0n,
-  triggers: { drift: false, timedDrift: false, overCap: true, signFlip: false },
+  triggers: { drift: false, timedDrift: false, overCap: true },
   netDelta: 0n,
   portfolioSize: 100n,
   intent: {
@@ -199,7 +199,7 @@ const openBalanceFirstPlan = {
   H: 0n,
   Hstar: 100n,
   driftBps: 1_000n,
-  triggers: { drift: true, timedDrift: false, overCap: false, signFlip: false },
+  triggers: { drift: true, timedDrift: false, overCap: false },
   netDelta: -100n,
   portfolioSize: 1_000n,
   intent: {
@@ -385,7 +385,7 @@ describe('HedgerBot gas deferral gate', () => {
     vi.mocked(computeHedgePlan).mockReturnValue({
       ...(closeSevenPlan as object),
       driftBps: 150n,
-      triggers: { drift: false, timedDrift: true, overCap: false, signFlip: false },
+      triggers: { drift: false, timedDrift: true, overCap: false },
     } as never)
     const { bot } = await makeBot(deferResult, 'success', {
       gasPolicy: { ...openGasPolicy, assess },
