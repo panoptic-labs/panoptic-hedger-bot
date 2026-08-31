@@ -211,6 +211,218 @@ runtime. Their earlier prototypes were removed so the shipped configuration,
 recovery journal, and Roles proposal describe one execution model: in-pool,
 loan-only dispatch.
 
+## Multi-instance host operations
+
+The supported template at
+[`examples/multi-instance`](./examples/multi-instance/) runs three independent
+hedgers from one reviewed image. The default `docker-compose.yml` remains the
+single-instance path. The reusable files contain no credentials and do not
+create a private operations directory for you.
+
+### Prepare and validate the operations checkout
+
+From the standalone hedger source directory, copy the template outside the
+checkout and create the generic instance directories:
+
+```bash
+cp -R examples/multi-instance ../hedger-ops
+cd ../hedger-ops
+cp .env.example .env
+for instance in instance-a instance-b instance-c; do
+  mkdir "$instance"
+  cp instance.env.example "$instance/hedger.env"
+done
+```
+
+For each instance, fill `hedger.env`, place `bot-keystore.json` and
+`bot-keystore-passphrase` beside it, then set both secret files to mode `0600`.
+Every instance needs its own signer, Safe/pool assignment, state volume, and
+staged-secret volume. Config files must not contain `BOT_PRIVATE_KEY`,
+`BOT_KEYSTORE_PASSPHRASE`, or overrides for the Compose-owned runtime/key paths.
+
+Build the reviewed source exactly once, tag it with the complete commit, record
+the same SHA for Compose, and run the offline validation before startup:
+
+```bash
+SOURCE_REPO=../panoptic-hedger-bot
+SOURCE_SHA=$(git -C "$SOURCE_REPO" rev-parse HEAD)
+git -C "$SOURCE_REPO" archive "$SOURCE_SHA" | \
+  docker build \
+    --build-arg SOURCE_SHA="$SOURCE_SHA" \
+    --tag "panoptic-hedger-bot:$SOURCE_SHA" \
+    -
+printf 'SOURCE_SHA=%s\n' "$SOURCE_SHA" > .env
+pnpm --dir ../panoptic-hedger-bot multi:check -- "$PWD"
+docker compose up -d
+```
+
+The checker makes no network calls and never decrypts a keystore. It discovers
+directories containing `hedger.env`, applies the full runtime configuration
+schema, verifies secret presence/ownership/mode, reads only the encrypted
+keystore's public address, and rejects duplicate signers or duplicate
+chain+Safe+pool identities. Successful output is limited to instance names,
+public identities, the image SHA, and dry/live mode.
+
+In a monorepo checkout, build from the repository root instead:
+
+```bash
+SOURCE_REPO=../panoptic-monorepo-ui
+SOURCE_SHA=$(git -C "$SOURCE_REPO" rev-parse HEAD)
+git -C "$SOURCE_REPO" archive "$SOURCE_SHA" | \
+  docker build \
+    --build-arg SOURCE_SHA="$SOURCE_SHA" \
+    --tag "panoptic-hedger-bot:$SOURCE_SHA" \
+    --file ./Dockerfile \
+    -
+```
+
+### Bring one instance live
+
+`DRY_RUN=false` is intentional in each `hedger.env`: the absent activation
+marker in a fresh state volume remains the authoritative gate and forces the
+main process to simulate. Do not activate all services together. For each
+instance, observe dry-run, validate, activate, restart, and health-check in this
+order:
+
+```bash
+SERVICE=instance-a
+docker compose logs -f "$SERVICE" # observe a complete dry-run cycle; then Ctrl-C
+docker compose exec "$SERVICE" node dist/scripts/status.js
+docker compose exec "$SERVICE" node dist/scripts/doctor.js
+docker compose exec "$SERVICE" node dist/scripts/inspectHedge.js
+docker compose exec "$SERVICE" node dist/scripts/activate.js --read-only-config
+docker compose restart "$SERVICE"
+docker compose exec "$SERVICE" node dist/scripts/health.js
+docker compose exec "$SERVICE" node dist/scripts/status.js
+```
+
+Container activation uses the configured `SFPM_SWAP_ENABLED` value, refuses
+`DRY_RUN=true`, writes only the activation marker in `/var/lib/hedger`, and never
+edits `hedger.env`. The service restart is required because the long-running
+main process evaluates activation at startup. Host-side `pnpm activate` remains
+interactive and retains its existing `.env` update behavior.
+
+The normal per-instance commands are:
+
+```bash
+SERVICE=instance-a
+docker compose logs -f "$SERVICE"
+docker compose exec "$SERVICE" node dist/scripts/status.js
+docker compose exec "$SERVICE" node dist/scripts/doctor.js
+docker compose exec "$SERVICE" node dist/scripts/inspectHedge.js
+docker compose exec "$SERVICE" node dist/scripts/activate.js --read-only-config
+docker compose exec "$SERVICE" node dist/scripts/deactivate.js
+docker compose exec "$SERVICE" node dist/scripts/health.js
+docker compose start "$SERVICE"
+docker compose stop "$SERVICE"
+docker compose restart "$SERVICE"
+```
+
+Deactivation installs the immediate send kill switch and removes activation.
+Restart after any later successful activation so the main process re-evaluates
+the marker. Use `-T` on non-interactive `exec` calls; activation itself needs an
+interactive terminal for review and confirmation.
+
+### Isolation and upstream capacity
+
+There must be at most one active strategy for a given chain+Safe+pool, and no
+two active instances may share a signer. The lease lives in one state volume;
+separate volumes cannot fence duplicate deployments and duplicate signers can
+race the same nonce.
+
+Capacity-plan the combined load. Three hedgers multiply RPC reads and event
+subscriptions, CEX WebSockets, LP-subgraph queries, and Telegram messages.
+Confirm provider quotas and rate limits, use resilient RPC gateways (including
+configured fallbacks), and give each Telegram destination enough alert capacity
+to avoid masking an unhealthy instance.
+
+### Rolling upgrades
+
+Build and tag the new reviewed SHA before changing `.env`. Then change the
+single `SOURCE_SHA`, replace only one hedger, and repeat the full validation and
+activation sequence before continuing:
+
+```bash
+SOURCE_REPO=../panoptic-hedger-bot
+NEW_SHA=$(git -C "$SOURCE_REPO" rev-parse HEAD)
+git -C "$SOURCE_REPO" archive "$NEW_SHA" | \
+  docker build --build-arg SOURCE_SHA="$NEW_SHA" \
+    --tag "panoptic-hedger-bot:$NEW_SHA" -
+printf 'SOURCE_SHA=%s\n' "$NEW_SHA" > .env
+pnpm --dir ../panoptic-hedger-bot multi:check -- "$PWD"
+
+docker compose up -d --no-deps instance-a
+# doctor → inspect → activate --read-only-config → restart → health
+# Continue with instance-b, then instance-c, only after the prior service is healthy.
+```
+
+A changed `HEDGER_BUILD_ID` invalidates the old activation marker by design.
+The template intentionally has one shared `${SOURCE_SHA}`. A brief rolling
+transition may leave old containers running their prior image, but permanently
+divergent versions require distinct image variables or separate deployments.
+
+### State backup and restore
+
+State includes activation, the transaction journal, cadence checkpoints, and
+runtime safety markers. Stop the affected instance before backup so the archive
+is transactionally quiet:
+
+```bash
+SERVICE=instance-a
+VOLUME=panoptic-hedgers_instance-a-state
+IMAGE="panoptic-hedger-bot:$(sed -n 's/^SOURCE_SHA=//p' .env)"
+mkdir -p backups
+docker compose stop "$SERVICE"
+docker run --rm --user 0:0 --entrypoint /bin/sh \
+  --volume "$VOLUME:/state:ro" --volume "$PWD/backups:/backup" \
+  "$IMAGE" -c 'tar czf /backup/instance-a-state.tgz -C /state .'
+docker compose start "$SERVICE"
+```
+
+Before restore, verify no container on any host is running a copy of the same
+chain+Safe+pool or signer. A restore into a live or duplicated instance can
+replay stale operational assumptions. Replace the stopped service's volume,
+restore the archive, then start and verify it:
+
+```bash
+docker compose stop instance-a
+docker compose rm -f instance-a
+docker volume rm panoptic-hedgers_instance-a-state
+docker volume create panoptic-hedgers_instance-a-state
+docker run --rm --user 0:0 --entrypoint /bin/sh \
+  --volume panoptic-hedgers_instance-a-state:/state \
+  --volume "$PWD/backups:/backup:ro" "$IMAGE" \
+  -c 'tar xzf /backup/instance-a-state.tgz -C /state && chown -R 1000:1000 /state'
+docker compose up -d --no-deps instance-a
+docker compose exec instance-a node dist/scripts/status.js
+docker compose exec instance-a node dist/scripts/health.js
+```
+
+Never restore while another copy is active. Preserve backups with the same care
+as other operational records; although private keys are staged in a separate
+volume, state reveals public strategy identities and transaction history.
+
+### Secret rotation and teardown
+
+Deactivate and stop one service, update its Safe role if the signer changes,
+replace the two host secret files with owner-only files, validate, restage, and
+reactivate:
+
+```bash
+docker compose exec instance-a node dist/scripts/deactivate.js
+docker compose stop instance-a
+# Replace instance-a/bot-keystore.json and bot-keystore-passphrase; chmod 0600 both.
+pnpm --dir ../panoptic-hedger-bot multi:check -- "$PWD"
+docker compose run --rm instance-a-secret-init
+docker compose up -d --no-deps instance-a
+# doctor → inspect → activate --read-only-config → restart → health
+```
+
+Ordinary `docker compose down` preserves all named volumes. **Never use
+`docker compose down --volumes` as a routine stop command:** it destroys
+activation markers, journals, checkpoints, and staged secrets for every
+instance.
+
 ## Emergency deleverager (optional)
 
 When `DELEVERAGER_ENABLED=true`, the bot force-closes positions instead of only

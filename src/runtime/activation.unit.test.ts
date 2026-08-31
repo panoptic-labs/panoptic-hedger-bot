@@ -1,4 +1,11 @@
-import { chmodSync, mkdtempSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  mkdtempSync,
+  readdirSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -149,6 +156,8 @@ describe('activation marker', () => {
     symlinkSync(target, markerPath)
     expect(readActivation()).toBeNull()
     expect(() => writeActivation(marker())).toThrow(/regular file/)
+    expect(() => clearActivation()).toThrow(/regular file/)
+    unlinkSync(markerPath)
   })
 
   it('atomically replaces a valid marker without leaving temporary files', () => {

@@ -1,0 +1,124 @@
+# Three independent hedgers using one reviewed, commit-tagged image.
+# Copy this directory outside the source checkout before adding private files.
+
+name: panoptic-hedgers
+
+x-hedger-common: &hedger-common
+  image: panoptic-hedger-bot:${SOURCE_SHA:?set SOURCE_SHA to the reviewed 40-character commit}
+  restart: unless-stopped
+  mem_limit: 512m
+  pids_limit: 128
+  environment:
+    NODE_OPTIONS: --max-old-space-size=256
+    HEDGER_STATE_DIR: /var/lib/hedger
+    BOT_KEYSTORE_PATH: /var/lib/hedger-secrets/bot-keystore
+    BOT_KEYSTORE_PASSPHRASE_FILE: /var/lib/hedger-secrets/bot-keystore-passphrase
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=16m
+  logging:
+    driver: json-file
+    options:
+      max-size: '10m'
+      max-file: '3'
+
+x-secret-init-common: &secret-init-common
+  image: panoptic-hedger-bot:${SOURCE_SHA:?set SOURCE_SHA to the reviewed 40-character commit}
+  user: '0:0'
+  entrypoint:
+    - /bin/sh
+    - -c
+    - |
+      set -eu
+      mkdir -p /var/lib/hedger-secrets
+      cp /run/secrets/bot-keystore /var/lib/hedger-secrets/bot-keystore
+      cp /run/secrets/bot-keystore-passphrase /var/lib/hedger-secrets/bot-keystore-passphrase
+      chown -R 1000:1000 /var/lib/hedger-secrets
+      chmod 700 /var/lib/hedger-secrets
+      chmod 600 /var/lib/hedger-secrets/*
+  restart: 'no'
+
+services:
+  instance-a:
+    <<: *hedger-common
+    env_file: [./instance-a/hedger.env]
+    depends_on:
+      instance-a-secret-init:
+        condition: service_completed_successfully
+    volumes:
+      - instance-a-state:/var/lib/hedger
+      - instance-a-secrets:/var/lib/hedger-secrets:ro
+
+  instance-a-secret-init:
+    <<: *secret-init-common
+    volumes:
+      - instance-a-secrets:/var/lib/hedger-secrets
+    secrets:
+      - source: instance-a-keystore
+        target: bot-keystore
+      - source: instance-a-passphrase
+        target: bot-keystore-passphrase
+
+  instance-b:
+    <<: *hedger-common
+    env_file: [./instance-b/hedger.env]
+    depends_on:
+      instance-b-secret-init:
+        condition: service_completed_successfully
+    volumes:
+      - instance-b-state:/var/lib/hedger
+      - instance-b-secrets:/var/lib/hedger-secrets:ro
+
+  instance-b-secret-init:
+    <<: *secret-init-common
+    volumes:
+      - instance-b-secrets:/var/lib/hedger-secrets
+    secrets:
+      - source: instance-b-keystore
+        target: bot-keystore
+      - source: instance-b-passphrase
+        target: bot-keystore-passphrase
+
+  instance-c:
+    <<: *hedger-common
+    env_file: [./instance-c/hedger.env]
+    depends_on:
+      instance-c-secret-init:
+        condition: service_completed_successfully
+    volumes:
+      - instance-c-state:/var/lib/hedger
+      - instance-c-secrets:/var/lib/hedger-secrets:ro
+
+  instance-c-secret-init:
+    <<: *secret-init-common
+    volumes:
+      - instance-c-secrets:/var/lib/hedger-secrets
+    secrets:
+      - source: instance-c-keystore
+        target: bot-keystore
+      - source: instance-c-passphrase
+        target: bot-keystore-passphrase
+
+secrets:
+  instance-a-keystore:
+    file: ./instance-a/bot-keystore.json
+  instance-a-passphrase:
+    file: ./instance-a/bot-keystore-passphrase
+  instance-b-keystore:
+    file: ./instance-b/bot-keystore.json
+  instance-b-passphrase:
+    file: ./instance-b/bot-keystore-passphrase
+  instance-c-keystore:
+    file: ./instance-c/bot-keystore.json
+  instance-c-passphrase:
+    file: ./instance-c/bot-keystore-passphrase
+
+volumes:
+  instance-a-state:
+  instance-a-secrets:
+  instance-b-state:
+  instance-b-secrets:
+  instance-c-state:
+  instance-c-secrets:

@@ -5,9 +5,12 @@ import WebSocket, { WebSocketServer } from 'ws'
 
 import { server as requestMockServer } from '../../setup-tests'
 import {
+  BitstampFeed,
   buildAggregate,
   CEX_MAX_PAYLOAD_BYTES,
   ExchangeFeed,
+  GeminiFeed,
+  KrakenFeed,
   rejectOutliers,
   validateQuote,
 } from './cexAggregator'
@@ -26,6 +29,102 @@ describe('CEX quote policy', () => {
 
   it('accepts a finite positive narrow market', () => {
     expect(validateQuote(3_000, 3_001)).toBe(3_000.5)
+  })
+
+  it('parses Kraken v2 tickers and ignores non-ticker frames', () => {
+    const feed = new KrakenFeed()
+    expect(() =>
+      feed.onMessage(Buffer.from(JSON.stringify({ method: 'subscribe', success: true }))),
+    ).not.toThrow()
+    expect(feed.getQuote()).toBeNull()
+
+    feed.onMessage(
+      Buffer.from(
+        JSON.stringify({
+          channel: 'ticker',
+          type: 'snapshot',
+          data: [{ symbol: 'ETH/USD', bid: 3_412.25, ask: 3_412.75 }],
+        }),
+      ),
+    )
+
+    expect(feed.getQuote()).toMatchObject({
+      exchange: 'kraken',
+      bid: 3_412.25,
+      ask: 3_412.75,
+      mid: 3_412.5,
+    })
+  })
+
+  it('parses Bitstamp order-book updates and ignores subscription acknowledgements', () => {
+    const feed = new BitstampFeed()
+    feed.onMessage(
+      Buffer.from(
+        JSON.stringify({
+          event: 'bts:subscription_succeeded',
+          channel: 'order_book_ethusd',
+          data: {},
+        }),
+      ),
+    )
+    expect(feed.getQuote()).toBeNull()
+
+    feed.onMessage(
+      Buffer.from(
+        JSON.stringify({
+          event: 'data',
+          channel: 'order_book_ethusd',
+          data: {
+            bids: [
+              ['3412.25', '1.5'],
+              ['3412.00', '2.0'],
+            ],
+            asks: [
+              ['3412.75', '1.25'],
+              ['3413.00', '3.0'],
+            ],
+          },
+        }),
+      ),
+    )
+
+    expect(feed.getQuote()).toMatchObject({
+      exchange: 'bitstamp',
+      bid: 3_412.25,
+      ask: 3_412.75,
+      mid: 3_412.5,
+    })
+  })
+
+  it('retains Gemini top-of-book state across one-sided updates', () => {
+    const feed = new GeminiFeed()
+    feed.onMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: 'update',
+          events: [
+            { type: 'change', side: 'ask', price: '3412.75', remaining: '1.5' },
+            { type: 'change', side: 'bid', price: '3412.25', remaining: '2.0' },
+          ],
+        }),
+      ),
+    )
+    expect(feed.getQuote()).toMatchObject({
+      exchange: 'gemini',
+      bid: 3_412.25,
+      ask: 3_412.75,
+      mid: 3_412.5,
+    })
+
+    feed.onMessage(
+      Buffer.from(
+        JSON.stringify({
+          type: 'update',
+          events: [{ type: 'change', side: 'bid', price: '3412.50', remaining: '1.0' }],
+        }),
+      ),
+    )
+    expect(feed.getQuote()).toMatchObject({ bid: 3_412.5, ask: 3_412.75, mid: 3_412.625 })
   })
 
   it('removes a compromised feed before medianization', () => {
@@ -139,6 +238,158 @@ describe('CEX WebSocket resource bounds', () => {
           }),
       ),
     )
+  })
+
+  it('subscribes to Kraken WebSocket API v2', async ({ skip }) => {
+    const httpServer = createServer()
+    httpServers.push(httpServer)
+    try {
+      await new Promise<void>((resolve, reject) => {
+        httpServer.once('error', reject)
+        httpServer.listen(0, '127.0.0.1', resolve)
+      })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EPERM') {
+        skip()
+        return
+      }
+      throw error
+    }
+    const server = new WebSocketServer({ server: httpServer })
+    servers.push(server)
+    const address = httpServer.address()
+    if (address === null || typeof address === 'string') throw new Error('missing test server port')
+    const { port } = address
+
+    class LocalKrakenFeed extends KrakenFeed {
+      get url(): string {
+        return `ws://127.0.0.1:${port}`
+      }
+    }
+
+    const subscription = new Promise<unknown>((resolve) => {
+      server.on('connection', (socket) => {
+        socket.once('message', (raw) => {
+          resolve(JSON.parse(raw.toString()) as unknown)
+          socket.send(
+            JSON.stringify({
+              channel: 'ticker',
+              type: 'snapshot',
+              data: [{ symbol: 'ETH/USD', bid: 3_412.25, ask: 3_412.75 }],
+            }),
+          )
+        })
+      })
+    })
+    const feed = new LocalKrakenFeed()
+    feed.connect()
+    await expect(subscription).resolves.toEqual({
+      method: 'subscribe',
+      params: { channel: 'ticker', symbol: ['ETH/USD'] },
+    })
+    await expect
+      .poll(() => feed.getQuote())
+      .toMatchObject({ exchange: 'kraken', bid: 3_412.25, ask: 3_412.75, mid: 3_412.5 })
+    feed.close()
+  })
+
+  it('subscribes to and receives Bitstamp order-book updates', async ({ skip }) => {
+    const httpServer = createServer()
+    httpServers.push(httpServer)
+    try {
+      await new Promise<void>((resolve, reject) => {
+        httpServer.once('error', reject)
+        httpServer.listen(0, '127.0.0.1', resolve)
+      })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EPERM') {
+        skip()
+        return
+      }
+      throw error
+    }
+    const server = new WebSocketServer({ server: httpServer })
+    servers.push(server)
+    const address = httpServer.address()
+    if (address === null || typeof address === 'string') throw new Error('missing test server port')
+    const { port } = address
+
+    class LocalBitstampFeed extends BitstampFeed {
+      get url(): string {
+        return `ws://127.0.0.1:${port}`
+      }
+    }
+
+    const subscription = new Promise<unknown>((resolve) => {
+      server.on('connection', (socket) => {
+        socket.once('message', (raw) => {
+          resolve(JSON.parse(raw.toString()) as unknown)
+          socket.send(
+            JSON.stringify({
+              event: 'data',
+              channel: 'order_book_ethusd',
+              data: { bids: [['3412.25', '1.5']], asks: [['3412.75', '1.25']] },
+            }),
+          )
+        })
+      })
+    })
+    const feed = new LocalBitstampFeed()
+    feed.connect()
+    await expect(subscription).resolves.toEqual({
+      event: 'bts:subscribe',
+      data: { channel: 'order_book_ethusd' },
+    })
+    await expect
+      .poll(() => feed.getQuote())
+      .toMatchObject({ exchange: 'bitstamp', bid: 3_412.25, ask: 3_412.75, mid: 3_412.5 })
+    feed.close()
+  })
+
+  it('receives Gemini top-of-book updates without a subscription message', async ({ skip }) => {
+    const httpServer = createServer()
+    httpServers.push(httpServer)
+    try {
+      await new Promise<void>((resolve, reject) => {
+        httpServer.once('error', reject)
+        httpServer.listen(0, '127.0.0.1', resolve)
+      })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EPERM') {
+        skip()
+        return
+      }
+      throw error
+    }
+    const server = new WebSocketServer({ server: httpServer })
+    servers.push(server)
+    const address = httpServer.address()
+    if (address === null || typeof address === 'string') throw new Error('missing test server port')
+    const { port } = address
+
+    class LocalGeminiFeed extends GeminiFeed {
+      get url(): string {
+        return `ws://127.0.0.1:${port}`
+      }
+    }
+
+    server.on('connection', (socket) => {
+      socket.send(
+        JSON.stringify({
+          type: 'update',
+          events: [
+            { type: 'change', side: 'ask', price: '3412.75', remaining: '1.5' },
+            { type: 'change', side: 'bid', price: '3412.25', remaining: '2.0' },
+          ],
+        }),
+      )
+    })
+    const feed = new LocalGeminiFeed()
+    feed.connect()
+    await expect
+      .poll(() => feed.getQuote())
+      .toMatchObject({ exchange: 'gemini', bid: 3_412.25, ask: 3_412.75, mid: 3_412.5 })
+    feed.close()
   })
 
   it('closes a feed whose fragmented message exceeds maxPayload', async ({ skip }) => {

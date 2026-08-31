@@ -2,6 +2,7 @@ import type { Address } from 'viem'
 
 import type { HedgerBotConfig } from '../../src/config'
 import {
+  type ActivationMarker,
   buildActivationEvidence,
   buildActivationMarker,
   writeActivation,
@@ -28,20 +29,60 @@ export function buildActivationCandidate(
 
 export type GuidedActivationResult = 'activated' | 'cancelled' | 'failed'
 
+export function buildReadOnlyActivationCandidate(config: HedgerBotConfig): HedgerBotConfig {
+  if (config.DRY_RUN) {
+    throw new Error(
+      'read-only-config activation requires DRY_RUN=false; update hedger.env and restart before activating',
+    )
+  }
+  return buildActivationCandidate(config, config.SFPM_SWAP_ENABLED)
+}
+
+export function persistGuidedActivation(args: {
+  marker: ActivationMarker
+  envPath: string
+  sfpmEnabled: boolean
+  readOnlyConfig: boolean
+}): void {
+  writeActivation(args.marker)
+  if (!args.readOnlyConfig) {
+    // The marker is written first while the existing .env is still dry-run.
+    // If this update fails, startup remains dry despite the marker.
+    updateEnvFile(args.envPath, {
+      SFPM_SWAP_ENABLED: args.sfpmEnabled,
+      DRY_RUN: false,
+    })
+  }
+  clearDeactivation()
+}
+
 export async function runGuidedActivation(args: {
   config: HedgerBotConfig
   envPath: string
   prompter: Prompter
+  readOnlyConfig?: boolean
 }): Promise<GuidedActivationResult> {
-  const { config, envPath, prompter } = args
-  const sfpmEnabled = config.SFPM_SWAP_PROVISIONED
-    ? await prompter.confirm(
-        `Allow the reviewed SFPM route when it saves at least ` +
-          `${config.SFPM_SWAP_MIN_SAVINGS_BPS} bps?`,
-        config.SFPM_SWAP_ENABLED,
-      )
-    : false
-  const candidate = buildActivationCandidate(config, sfpmEnabled)
+  const { config, envPath, prompter, readOnlyConfig = false } = args
+  let candidate: HedgerBotConfig
+  let sfpmEnabled: boolean
+  if (readOnlyConfig) {
+    try {
+      candidate = buildReadOnlyActivationCandidate(config)
+      sfpmEnabled = candidate.SFPM_SWAP_ENABLED
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : 'read-only activation rejected')
+      return 'failed'
+    }
+  } else {
+    sfpmEnabled = config.SFPM_SWAP_PROVISIONED
+      ? await prompter.confirm(
+          `Allow the reviewed SFPM route when it saves at least ` +
+            `${config.SFPM_SWAP_MIN_SAVINGS_BPS} bps?`,
+          config.SFPM_SWAP_ENABLED,
+        )
+      : false
+    candidate = buildActivationCandidate(config, sfpmEnabled)
+  }
 
   console.log('\nStep 1/3 — verifying configuration and on-chain permissions')
   const ctx = await buildDiagnosticsContext(candidate)
@@ -69,18 +110,24 @@ export async function runGuidedActivation(args: {
   }
 
   const evidence = await buildActivationEvidence(ctx.publicClient, candidate)
-  writeActivation(
-    buildActivationMarker(candidate, ctx.botAddress, evidence, true, new Date().toISOString()),
-  )
-  // The marker is written first while the existing .env is still dry-run.
-  // If this update fails, startup remains dry despite the marker.
-  updateEnvFile(envPath, {
-    SFPM_SWAP_ENABLED: sfpmEnabled,
-    DRY_RUN: false,
+  persistGuidedActivation({
+    marker: buildActivationMarker(
+      candidate,
+      ctx.botAddress,
+      evidence,
+      true,
+      new Date().toISOString(),
+    ),
+    envPath,
+    sfpmEnabled,
+    readOnlyConfig,
   })
-  clearDeactivation()
   renderReadinessReceipt(candidate, ctx.botAddress, inspection)
-  console.log('Start (or restart) with `pnpm start`.')
+  console.log(
+    readOnlyConfig
+      ? 'Activation marker written. Restart this Compose service before checking health.'
+      : 'Start (or restart) with `pnpm start`.',
+  )
   return 'activated'
 }
 

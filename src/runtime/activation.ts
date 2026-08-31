@@ -1,5 +1,3 @@
-import { unlinkSync } from 'node:fs'
-
 import type { Address, Hex, PublicClient } from 'viem'
 import { getAddress, keccak256, toHex } from 'viem'
 import { z } from 'zod'
@@ -12,7 +10,7 @@ import {
   resolveRolePolicy,
 } from '../security/productionProfile'
 import { runtimeDataPath } from './paths'
-import { readSecureJson, writeSecureJson } from './secureFile'
+import { readSecureJson, removeSecureFile, writeSecureJson } from './secureFile'
 import { botVersion } from './stateFile'
 
 const ACTIVATION_SCHEMA_VERSION = 2 as const
@@ -241,11 +239,7 @@ export function writeActivation(marker: ActivationMarker): void {
 }
 
 export function clearActivation(): void {
-  try {
-    unlinkSync(activationPath())
-  } catch {
-    // already gone
-  }
+  removeSecureFile(activationPath())
 }
 
 export function buildActivationMarker(

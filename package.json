@@ -18,7 +18,8 @@
     "activate": "tsx scripts/activate.ts",
     "deactivate": "tsx scripts/deactivate.ts",
     "health": "tsx scripts/health.ts",
-    "build:runtime": "esbuild src/main.ts scripts/health.ts --bundle --platform=node --format=esm --packages=external --outdir=dist",
+    "multi:check": "tsx scripts/multiCheck.ts",
+    "build:runtime": "esbuild src/main.ts scripts/status.ts scripts/doctor.ts scripts/inspectHedge.ts scripts/activate.ts scripts/deactivate.ts scripts/health.ts --bundle --platform=node --format=esm --packages=external --outdir=dist && node scripts/checkRuntimeBuild.mjs",
     "start:compiled": "node dist/src/main.js",
     "health:compiled": "node dist/scripts/health.js",
     "inspect:hedge": "tsx scripts/inspectHedge.ts",
@@ -36,7 +37,7 @@
     "docs:check": "node scripts/checkDocsLinks.mjs"
   },
   "dependencies": {
-    "@panoptic-eng/sdk": "1.0.44",
+    "@panoptic-eng/sdk": "1.0.46",
     "@tanstack/react-query": "5.45.1",
     "dotenv": "^17.2.3",
     "react": "18.2.0",

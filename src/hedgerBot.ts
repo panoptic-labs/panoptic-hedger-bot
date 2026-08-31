@@ -49,7 +49,9 @@ import {
 import { type PriceSignalSource, PriceSignalUnavailableError } from './priceSignal'
 import {
   type HedgeJournalAction,
+  type HedgeJournalCheckpoint,
   type HedgeJournalPort,
+  type RecoveryReport,
   createHedgeRecoveryClient,
 } from './runtime/hedgeJournal'
 import type { PendingSfpmSwapPort } from './runtime/pendingSfpmSwap'
@@ -121,7 +123,24 @@ export interface HedgerBotDeps {
   ) => void
 }
 
-export type CycleOutcome = 'complete' | 'signal-unavailable' | 'error' | 'in-flight'
+export type CycleOutcome =
+  | 'complete'
+  | 'signal-unavailable'
+  | 'error'
+  | 'in-flight'
+  | 'held-pending'
+
+/**
+ * A pending journal intent could not be resolved automatically (identity
+ * mismatch, reorg-grade inconsistency). Requires operator review; alerted once
+ * per distinct error rather than every cycle.
+ */
+export class AmbiguousPendingIntentError extends Error {
+  constructor(cause: unknown) {
+    super(`pending hedge intent recovery failed: ${sanitizeError(cause)}`)
+    this.name = 'AmbiguousPendingIntentError'
+  }
+}
 
 interface IntentExecutionResult {
   dispatch: HedgeExecutionResult
@@ -189,6 +208,10 @@ export class HedgerBot {
   private readonly deps: HedgerBotDeps
   private isCycleInFlight = false
   private lastDispatchTxHash?: Hex
+  /** Dedup key so a persistent recovery failure alerts once, not every cycle. */
+  private lastAlertedCycleErrorKey?: string
+  /** Dedup key so an unquotable pending SFPM swap alerts once, not every cycle. */
+  private sfpmQuoteHoldAlertedFor?: string
   private readonly incident?: DeleverageIncident
   private lastWalletRedepositCheckAt = 0
   private lastDeltaHedgeAt?: string
@@ -210,26 +233,74 @@ export class HedgerBot {
     await this.deps.hedgeJournal.recover(createHedgeRecoveryClient(this.deps.publicClient))
     const checkpoint = this.deps.hedgeJournal.checkpoint()
     this.lastDispatchTxHash = checkpoint.transactionHash
+    this.reconcilePendingSwapAfterRecovery(checkpoint)
+    await this.deps.notifier.notify('🤖 hedger-bot started')
+  }
+
+  /**
+   * After journal recovery resolves intents, the durable SFPM swap obligation
+   * must be reconciled against the confirmed checkpoint: a confirmed swap (or a
+   * recovered-away dispatch) means the obligation must be dropped, otherwise a
+   * stale entry would re-execute a swap against a neutral book.
+   */
+  private reconcilePendingSwapAfterRecovery(checkpoint: HedgeJournalCheckpoint): void {
     const venue = this.deps.sfpmVenue
     const pending = this.deps.pendingSwapStore?.read()
-    if (pending) {
-      if (!venue) {
-        throw new Error(
-          'a pending SFPM swap exists but SFPM_SWAP_ENABLED is false; refusing to plan',
-        )
-      }
-      const swapConfirmed =
-        checkpoint.action === 'sfpm_swap' &&
-        (pending.swapIntentId === undefined || checkpoint.intentId === pending.swapIntentId)
-      const dispatchConfirmed = checkpoint.intentId === pending.dispatchIntentId
-      if (swapConfirmed) this.deps.pendingSwapStore?.clear()
-      else if (!dispatchConfirmed) {
-        // Recovery removed a reverted dispatch journal entry. No imbalance was
-        // created, so the pre-dispatch obligation must not be executed.
-        this.deps.pendingSwapStore?.clear()
-      }
+    if (!pending) return
+    if (!venue) {
+      throw new Error('a pending SFPM swap exists but SFPM_SWAP_ENABLED is false; refusing to plan')
     }
-    await this.deps.notifier.notify('🤖 hedger-bot started')
+    const swapConfirmed =
+      checkpoint.action === 'sfpm_swap' &&
+      (pending.swapIntentId === undefined || checkpoint.intentId === pending.swapIntentId)
+    const dispatchConfirmed = checkpoint.intentId === pending.dispatchIntentId
+    if (swapConfirmed) this.deps.pendingSwapStore?.clear()
+    else if (!dispatchConfirmed) {
+      // Recovery removed a reverted dispatch journal entry. No imbalance was
+      // created, so the pre-dispatch obligation must not be executed.
+      this.deps.pendingSwapStore?.clear()
+    }
+  }
+
+  /**
+   * Per-cycle self-healing for a durably pending hedge intent (receipt timeout,
+   * crash mid-execution, confirm bookkeeping failure). Resolves it from chain
+   * state when possible; while a transaction is legitimately still in flight
+   * the cycle is held gracefully instead of erroring.
+   */
+  private async resolvePendingHedgeIntent(trigger: string): Promise<'clear' | 'held'> {
+    if (!this.deps.hedgeJournal.hasPendingIntent()) return 'clear'
+    let report: RecoveryReport
+    try {
+      report = await this.deps.hedgeJournal.recover(
+        createHedgeRecoveryClient(this.deps.publicClient),
+        { scope: 'pending' },
+      )
+    } catch (error) {
+      if (isRetryableRpcError(error)) {
+        botWarn(
+          `[hedger-bot] pending-intent recovery hit a transient RPC error (${trigger}); ` +
+            `holding until the next cycle: ${sanitizeError(error)}`,
+        )
+        return 'held'
+      }
+      throw new AmbiguousPendingIntentError(error)
+    }
+    if (report.held.length > 0) {
+      const held = report.held[0]
+      botLog(
+        `[hedger-bot] pending ${held.action} intent ${held.id} still in flight ` +
+          `(hash=${held.lastHash ?? 'none'}, nonce=${held.nonce ?? 'none'}, ` +
+          `~${held.blocksRemaining} blocks until auto-fail); skipping planning (${trigger})`,
+      )
+      return 'held'
+    }
+    const checkpoint = this.deps.hedgeJournal.checkpoint()
+    if (checkpoint.transactionHash) this.lastDispatchTxHash = checkpoint.transactionHash
+    this.reconcilePendingSwapAfterRecovery(checkpoint)
+    this.lastAlertedCycleErrorKey = undefined
+    botLog(`[hedger-bot] pending hedge intent resolved from chain state (${trigger})`)
+    return 'clear'
   }
 
   async runCycle(trigger: string): Promise<CycleOutcome> {
@@ -240,12 +311,21 @@ export class HedgerBot {
     this.isCycleInFlight = true
     try {
       const completed = await this.doCycle(trigger)
+      if (completed === 'held') return 'held-pending'
+      if (completed !== false) this.lastAlertedCycleErrorKey = undefined
       return completed === false ? 'signal-unavailable' : 'complete'
     } catch (error) {
       botError(`[hedger-bot] cycle error (${trigger})`, error)
       // Retryable transient RPC/nonce errors: let the next cycle retry silently.
       if (!isRetryableRpcError(error) && !isNonceError(error)) {
-        await this.deps.notifier.notify(formatError(trigger, error))
+        // A stuck recovery failure repeats identically every cycle — alert only
+        // when the error changes; ordinary cycle errors keep alerting each time.
+        const dedupKey =
+          error instanceof AmbiguousPendingIntentError ? sanitizeError(error) : undefined
+        if (dedupKey === undefined || dedupKey !== this.lastAlertedCycleErrorKey) {
+          await this.deps.notifier.notify(formatError(trigger, error))
+        }
+        this.lastAlertedCycleErrorKey = dedupKey
       }
       return 'error'
     } finally {
@@ -253,9 +333,12 @@ export class HedgerBot {
     }
   }
 
-  private async doCycle(trigger: string): Promise<void | false> {
+  private async doCycle(trigger: string): Promise<void | false | 'held'> {
     const { config, publicClient, priceSource, executor, notifier, gasPolicy } = this.deps
     this.deps.recordPoll?.(trigger)
+    // Self-heal any durably pending hedge intent before spending RPC on the
+    // cycle; while one is legitimately in flight, planning is skipped.
+    if ((await this.resolvePendingHedgeIntent(trigger)) === 'held') return 'held'
     const poolAddress = config.POOL_ADDRESS
     const safeAddress = config.SAFE_ADDRESS
     const chainId = BigInt(config.CHAIN_ID)
@@ -317,7 +400,9 @@ export class HedgerBot {
     // normal; the production reader always supplies the field.
     const safeModeLevel = snapshot.safeMode?.level ?? 0n
     this.deps.recordSafeMode?.(Number(safeModeLevel))
-    if (await this.recoverPendingSfpmSwap(snapshot, trigger)) return
+    const pendingSwapRecovery = await this.recoverPendingSfpmSwap(snapshot, trigger)
+    if (pendingSwapRecovery === 'held') return 'held'
+    if (pendingSwapRecovery === 'recovered') return
     const { pool, buyingPower: bp } = snapshot
     const walletBalances = snapshot.walletBalances ?? EMPTY_SAFE_WALLET_BALANCES
     const legCount = snapshot.positions.reduce((n, position) => n + position.legs.length, 0)
@@ -612,7 +697,7 @@ export class HedgerBot {
       )
     } catch (error) {
       // A receipt timeout is uncertain: one of the observed transactions may
-      // still land. Preserve that active intent for startup recovery rather
+      // still land. Preserve that active intent for per-cycle recovery rather
       // than deleting the only durable identity that can find it.
       const confirmedDispatchNeedsRecovery = dispatchConfirmed && activeJournal === plan.action
       if (
@@ -628,7 +713,7 @@ export class HedgerBot {
       }
       // The send confirmed nothing within the receipt budget despite fee-bumped
       // replacements. Alert and keep the best-guess hash; the durable pending
-      // intent prevents an unsafe duplicate until startup recovery resolves it.
+      // intent prevents an unsafe duplicate until per-cycle recovery resolves it.
       if (error instanceof TxNotMinedError) {
         this.lastDispatchTxHash = error.lastHash
         botError('[hedger-bot] dispatch not mined', error)
@@ -640,38 +725,50 @@ export class HedgerBot {
 
     const result = execution.dispatch
     // Only confirmed successful transactions may update the recovery journal.
+    // A bookkeeping failure here must NOT fail() the intent — the transaction
+    // succeeded on-chain, and per-cycle recovery is the designated healer: it
+    // confirms the entry from the receipt (the hash is already observed).
     if (!result.dryRun) {
-      const receipt = successfulReceipt(result, 'dispatch')
-      this.lastDispatchTxHash = receipt.transactionHash
-      if (execution.venue === null) {
-        this.deps.hedgeJournal.confirm({
-          transactionHash: receipt.transactionHash,
-          blockNumber: receipt.blockNumber,
-          blockHash: receipt.blockHash,
-        })
-        activeJournal = null
-        this.deps.pendingSwapStore?.clear()
-      } else if (execution.venue.swap !== null) {
-        const swapReceipt = successfulReceipt(execution.venue.swap, 'off-venue swap')
-        this.deps.hedgeJournal.confirm({
-          transactionHash: swapReceipt.transactionHash,
-          blockNumber: swapReceipt.blockNumber,
-          blockHash: swapReceipt.blockHash,
-        })
-        activeJournal = null
-        // The durable obligation is fulfilled; leaving it would make the next
-        // cycle's recovery re-execute the full swap against a neutral book.
-        this.deps.pendingSwapStore?.clear()
-        botLog(`[hedger-bot] off-venue swap confirmed: ${swapReceipt.transactionHash}`)
-      } else if (!(execution.venue.swapError instanceof TxNotMinedError)) {
-        this.deps.hedgeJournal.fail()
-        activeJournal = null
+      try {
+        const receipt = successfulReceipt(result, 'dispatch')
+        this.lastDispatchTxHash = receipt.transactionHash
+        if (execution.venue === null) {
+          this.deps.hedgeJournal.confirm({
+            transactionHash: receipt.transactionHash,
+            blockNumber: receipt.blockNumber,
+            blockHash: receipt.blockHash,
+          })
+          activeJournal = null
+          this.deps.pendingSwapStore?.clear()
+        } else if (execution.venue.swap !== null) {
+          const swapReceipt = successfulReceipt(execution.venue.swap, 'off-venue swap')
+          this.deps.hedgeJournal.confirm({
+            transactionHash: swapReceipt.transactionHash,
+            blockNumber: swapReceipt.blockNumber,
+            blockHash: swapReceipt.blockHash,
+          })
+          activeJournal = null
+          // The durable obligation is fulfilled; leaving it would make the next
+          // cycle's recovery re-execute the full swap against a neutral book.
+          this.deps.pendingSwapStore?.clear()
+          botLog(`[hedger-bot] off-venue swap confirmed: ${swapReceipt.transactionHash}`)
+        } else if (!(execution.venue.swapError instanceof TxNotMinedError)) {
+          this.deps.hedgeJournal.fail()
+          activeJournal = null
+        }
+        this.recordConfirmedHedge(
+          plan.action,
+          receipt.transactionHash,
+          plan.intent.swapAtMint && (execution.venue === null || execution.venue.swap !== null),
+        )
+      } catch (error) {
+        botError(
+          `[hedger-bot] post-execution journal bookkeeping failed (${trigger}); ` +
+            `intent stays pending for per-cycle recovery`,
+          error,
+        )
+        throw error
       }
-      this.recordConfirmedHedge(
-        plan.action,
-        receipt.transactionHash,
-        plan.intent.swapAtMint && (execution.venue === null || execution.venue.swap !== null),
-      )
     }
 
     // Same message to the console and Telegram, so an executed hedge is easy to
@@ -1113,18 +1210,49 @@ export class HedgerBot {
    * position list are refreshed. A failure keeps the obligation and blocks a
    * second hedge.
    */
-  private async recoverPendingSfpmSwap(snapshot: HedgeSnapshot, trigger: string): Promise<boolean> {
+  private async recoverPendingSfpmSwap(
+    snapshot: HedgeSnapshot,
+    trigger: string,
+  ): Promise<'none' | 'recovered' | 'held'> {
     const venue = this.deps.sfpmVenue
-    if (!venue) return false
+    if (!venue) return 'none'
     const store = this.deps.pendingSwapStore
-    if (!store) return false
+    if (!store) return 'none'
     const pending = store.read()
-    if (!pending) return false
+    if (!pending) return 'none'
+
+    const checkpoint = this.deps.hedgeJournal.checkpoint()
+    const swapAlreadyConfirmed =
+      pending.swapIntentId !== undefined &&
+      checkpoint.action === 'sfpm_swap' &&
+      checkpoint.intentId === pending.swapIntentId
+    if (swapAlreadyConfirmed) {
+      store.clear()
+      this.sfpmQuoteHoldAlertedFor = undefined
+      this.recordConfirmedDeltaChange()
+      botLog(`[hedger-bot] cleared already-confirmed pending off-venue swap (${trigger})`)
+      return 'recovered'
+    }
 
     const quote = await venue.coordinator.quoteSwap(pending.sellToken0, pending.amount)
     if (!quote) {
-      throw new Error('pending SFPM swap cannot be quoted; refusing to plan another hedge')
+      // Quote unavailability is usually transient. Hold planning (the durable
+      // obligation still blocks new hedges) and retry next cycle instead of
+      // erroring every cycle; alert once per stuck obligation.
+      botWarn(
+        `[hedger-bot] pending SFPM swap cannot be quoted (${trigger}); holding planning and ` +
+          `retrying next cycle (sellToken0=${pending.sellToken0}, amount=${pending.amount})`,
+      )
+      if (this.sfpmQuoteHoldAlertedFor !== pending.dispatchIntentId) {
+        this.sfpmQuoteHoldAlertedFor = pending.dispatchIntentId
+        await this.deps.notifier.notify(
+          `⚠️ pending off-venue SFPM swap cannot be quoted (${trigger}); ` +
+            `holding new hedges until a quote is available`,
+        )
+      }
+      return 'held'
     }
+    this.sfpmQuoteHoldAlertedFor = undefined
     const request = {
       sellToken0: pending.sellToken0,
       kind: 'exactIn' as const,
@@ -1162,7 +1290,7 @@ export class HedgerBot {
       }
       throw error
     }
-    return true
+    return 'recovered'
   }
 
   /**

@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@panoptic-eng/sdk':
-        specifier: 1.0.44
-        version: 1.0.44(@tanstack/react-query@5.45.1(react@18.2.0))(react@18.2.0)(viem@2.55.2(typescript@5.9.3)(zod@3.25.76))
+        specifier: 1.0.46
+        version: 1.0.46(@tanstack/react-query@5.45.1(react@18.2.0))(react@18.2.0)(viem@2.55.2(typescript@5.9.3)(zod@3.25.76))
       '@tanstack/react-query':
         specifier: 5.45.1
         version: 5.45.1(react@18.2.0)
@@ -824,8 +824,8 @@ packages:
   '@open-draft/until@2.1.0':
     resolution: {integrity: sha512-U69T3ItWHvLwGg5eJ0n3I62nWuE6ilHlmz7zM0npLBRvPRd7e6NYmg54vvRtP5mZG7kZqZCFVdsTWo7BPtBujg==}
 
-  '@panoptic-eng/sdk@1.0.44':
-    resolution: {integrity: sha512-riClWeq1hz/EHC2+fdpgHlTFj4jt+NrONcwyrhpT+wuxtBwTdOn1PI13PUKE6HTVMEbCVrl3bD8nPDO87CSNtw==}
+  '@panoptic-eng/sdk@1.0.46':
+    resolution: {integrity: sha512-Q3a/d3uY/EWEbqkc249ukpQo6cHvrKh2SvyN8DA45O1mlnz6W0EJ73JBA3LLAcWqqWlb8fDzD4LzptdEZzcs1A==}
     peerDependencies:
       '@tanstack/react-query': ^5.45.0
       react: ^18.2.0 || ^19.0.0
@@ -3616,7 +3616,7 @@ snapshots:
 
   '@open-draft/until@2.1.0': {}
 
-  '@panoptic-eng/sdk@1.0.44(@tanstack/react-query@5.45.1(react@18.2.0))(react@18.2.0)(viem@2.55.2(typescript@5.9.3)(zod@3.25.76))':
+  '@panoptic-eng/sdk@1.0.46(@tanstack/react-query@5.45.1(react@18.2.0))(react@18.2.0)(viem@2.55.2(typescript@5.9.3)(zod@3.25.76))':
     dependencies:
       decimal.js: 10.6.0
       graphql: 16.14.2

@@ -35,7 +35,9 @@ vi.mock('@panoptic-eng/sdk/v2', () => ({
     requiredCollateral1: 0n,
   })),
   isNonceError: () => false,
-  isRetryableRpcError: () => false,
+  // Marker-based so individual tests can flag an error as transient.
+  isRetryableRpcError: (error: unknown) =>
+    (error as { retryable?: boolean } | null)?.retryable === true,
   isGasError: () => false,
   parsePanopticError: () => null,
   tickToSqrtPriceX96: () => 1n << 96n,
@@ -288,7 +290,8 @@ async function makeBot(
       recordBroadcastAttempt: vi.fn(),
       confirm: vi.fn(),
       fail: vi.fn(),
-      recover: vi.fn(async () => undefined),
+      recover: vi.fn(async () => ({ held: [] })),
+      hasPendingIntent: () => false,
       checkpoint: () => ({}),
     },
     recordDeltaHedge: overrides.recordDeltaHedge,
@@ -914,7 +917,8 @@ describe('HedgerBot off-venue transaction journal', () => {
       recordBroadcastAttempt: vi.fn(),
       confirm: vi.fn((receipt) => order.push(`confirm:${receipt.transactionHash}`)),
       fail: vi.fn(),
-      recover: vi.fn(async () => undefined),
+      recover: vi.fn(async () => ({ held: [] })),
+      hasPendingIntent: () => false,
       checkpoint: () => ({}),
     } satisfies BotDeps['hedgeJournal']
     const executeOffVenue = vi.fn(async () => {
@@ -1079,7 +1083,8 @@ describe('HedgerBot off-venue transaction journal', () => {
       recordBroadcastAttempt: vi.fn(),
       confirm: vi.fn(),
       fail: vi.fn(),
-      recover: vi.fn(async () => undefined),
+      recover: vi.fn(async () => ({ held: [] })),
+      hasPendingIntent: () => false,
       checkpoint: () => ({}),
     } satisfies BotDeps['hedgeJournal']
     const { bot } = await makeBot(dispatchResult, 'success', {
@@ -1126,7 +1131,7 @@ describe('HedgerBot off-venue transaction journal', () => {
     expect(journal.fail).not.toHaveBeenCalled()
   })
 
-  it('finishes a durable swap obligation before planning another hedge', async () => {
+  it('does not repeat a confirmed durable swap when clearing its obligation initially fails', async () => {
     const recordDeltaHedge = vi.fn()
     const dispatchIntentId = '00000000-0000-4000-8000-000000000001'
     const swapIntentId = '00000000-0000-4000-8000-000000000002'
@@ -1135,30 +1140,45 @@ describe('HedgerBot off-venue transaction journal', () => {
       swapIntentId?: string
       sellToken0: boolean
       amount: bigint
-    } = {
+    } | null = {
       dispatchIntentId,
       sellToken0: true,
       amount: 500n,
+    }
+    let checkpoint: ReturnType<BotDeps['hedgeJournal']['checkpoint']> = {
+      intentId: dispatchIntentId,
+      action: 'close_all',
+      transactionHash: '0x01' as const,
     }
     const store = {
       read: vi.fn(() => pending),
       save: vi.fn((value) => {
         pending = value
       }),
-      clear: vi.fn(),
+      clear: vi
+        .fn()
+        .mockImplementationOnce(() => {
+          throw new Error('failed to clear pending swap')
+        })
+        .mockImplementation(() => {
+          pending = null
+        }),
     }
     const journal = {
       begin: vi.fn(() => swapIntentId),
       observeTransaction: vi.fn(),
       recordBroadcastAttempt: vi.fn(),
-      confirm: vi.fn(),
-      fail: vi.fn(),
-      recover: vi.fn(async () => undefined),
-      checkpoint: () => ({
-        intentId: dispatchIntentId,
-        action: 'close_all' as const,
-        transactionHash: '0x01' as const,
+      confirm: vi.fn(() => {
+        checkpoint = {
+          intentId: swapIntentId,
+          action: 'sfpm_swap',
+          transactionHash: '0x02',
+        }
       }),
+      fail: vi.fn(),
+      recover: vi.fn(async () => ({ held: [] })),
+      hasPendingIntent: () => false,
+      checkpoint: () => checkpoint,
     } satisfies BotDeps['hedgeJournal']
     const recoveredReceipt = {
       status: 'success',
@@ -1201,10 +1221,12 @@ describe('HedgerBot off-venue transaction journal', () => {
       },
     })
 
-    expect(await bot.runCycle('recovery')).toBe('complete')
+    expect(await bot.runCycle('recovery-1')).toBe('error')
+    expect(await bot.runCycle('recovery-2')).toBe('complete')
     expect(sfpmExecute).toHaveBeenCalledOnce()
     expect(vi.mocked(computeHedgePlan)).not.toHaveBeenCalled()
-    expect(store.clear).toHaveBeenCalledOnce()
+    expect(store.clear).toHaveBeenCalledTimes(2)
+    expect(pending).toBeNull()
     expect(journal.begin).toHaveBeenCalledWith('sfpm_swap')
     expect(recordDeltaHedge).toHaveBeenCalledOnce()
   })
@@ -1228,7 +1250,8 @@ describe('HedgerBot hedge classification', () => {
           recordBroadcastAttempt: vi.fn(),
           confirm: vi.fn(),
           fail: vi.fn(),
-          recover: vi.fn(async () => undefined),
+          recover: vi.fn(async () => ({ held: [] })),
+          hasPendingIntent: () => false,
           checkpoint: () => ({}),
         },
       },
@@ -1392,5 +1415,190 @@ describe('HedgerBot deleverage path', () => {
     expect(deleveragerExecute).toHaveBeenCalledTimes(1) // burn still lands while paused
     expect(loanExecute).not.toHaveBeenCalled() // rehedge mint deferred
     expect(notify.mock.calls.some((c) => String(c[0]).includes('paused'))).toBe(true)
+  })
+})
+
+describe('HedgerBot per-cycle pending intent recovery', () => {
+  const okResult = {
+    transactionHash: '0x01',
+    receipt: {
+      status: 'success',
+      transactionHash: '0x01',
+      blockNumber: 123n,
+      blockHash: `0x${'ab'.repeat(32)}`,
+    },
+    openedTokenId: null,
+    closedTokenIds: [7n],
+    dryRun: false,
+  } as unknown as HedgeExecutionResult
+
+  const heldEntry = {
+    id: '00000000-0000-4000-8000-00000000dead',
+    action: 'open' as const,
+    nonce: 4,
+    lastHash: `0x${'aa'.repeat(32)}` as const,
+    blocksSinceSubmit: 10n,
+    blocksRemaining: 54n,
+  }
+
+  function journalFake(overrides: Partial<BotDeps['hedgeJournal']> = {}) {
+    return {
+      begin: vi.fn(() => '00000000-0000-4000-8000-000000000001'),
+      observeTransaction: vi.fn(),
+      recordBroadcastAttempt: vi.fn(),
+      confirm: vi.fn(),
+      fail: vi.fn(),
+      recover: vi.fn(async () => ({ held: [] })),
+      hasPendingIntent: vi.fn(() => false),
+      checkpoint: () => ({}),
+      ...overrides,
+    } satisfies BotDeps['hedgeJournal']
+  }
+
+  it('holds the cycle gracefully while a pending intent is still in flight', async () => {
+    let pendingSwap: { dispatchIntentId: string; sellToken0: boolean; amount: bigint } | null = null
+    const clearPendingSwap = vi.fn(() => {
+      pendingSwap = null
+    })
+    const journal = journalFake({
+      hasPendingIntent: vi.fn(() => true),
+      recover: vi.fn(async () => ({ held: [heldEntry] })),
+    })
+    const notify = vi.fn(async (_message: unknown) => undefined)
+    const { bot, execute } = await makeBot(okResult, 'success', {
+      hedgeJournal: journal,
+      notifier: { notify },
+      pendingSwapStore: {
+        read: () => pendingSwap,
+        save: (value) => {
+          pendingSwap = value
+        },
+        clear: clearPendingSwap,
+      },
+      sfpmVenue: {
+        coordinator: {
+          evaluate: vi.fn(async () => null),
+          quoteSwap: vi.fn(async () => null),
+        },
+        sfpmExecutor: { simulate: vi.fn(), execute: vi.fn() } as never,
+      },
+    })
+    pendingSwap = { dispatchIntentId: heldEntry.id, sellToken0: true, amount: 100n }
+    vi.mocked(readHedgeSnapshot).mockClear()
+
+    const outcome = await bot.runCycle('c1')
+
+    expect(outcome).toBe('held-pending')
+    expect(journal.recover).toHaveBeenLastCalledWith(expect.anything(), { scope: 'pending' })
+    expect(readHedgeSnapshot).not.toHaveBeenCalled()
+    expect(execute).not.toHaveBeenCalled()
+    expect(notify).not.toHaveBeenCalled()
+    expect(clearPendingSwap).not.toHaveBeenCalled()
+    expect(pendingSwap).not.toBeNull()
+  })
+
+  it('resolves a recoverable pending intent in-process and completes the cycle', async () => {
+    let pending = true
+    const journal = journalFake({
+      hasPendingIntent: vi.fn(() => pending),
+      recover: vi.fn(async () => {
+        pending = false
+        return { held: [] }
+      }),
+    })
+    const { bot, execute } = await makeBot(okResult, 'success', { hedgeJournal: journal })
+    pending = true
+
+    const outcome = await bot.runCycle('c1')
+
+    expect(outcome).toBe('complete')
+    expect(execute).toHaveBeenCalledTimes(1)
+  })
+
+  it('treats a transient RPC failure during recovery as a hold, not an error', async () => {
+    const journal = journalFake()
+    const notify = vi.fn(async (_message: unknown) => undefined)
+    const { bot } = await makeBot(okResult, 'success', {
+      hedgeJournal: journal,
+      notifier: { notify },
+    })
+    vi.mocked(journal.hasPendingIntent).mockReturnValue(true)
+    vi.mocked(journal.recover).mockImplementation(async () => {
+      throw Object.assign(new Error('socket hang up'), { retryable: true })
+    })
+
+    expect(await bot.runCycle('c1')).toBe('held-pending')
+    expect(notify).not.toHaveBeenCalled()
+  })
+
+  it('alerts once (not per cycle) on a persistent recovery invariant failure', async () => {
+    const journal = journalFake()
+    const notify = vi.fn(async (_message: unknown) => undefined)
+    const { bot } = await makeBot(okResult, 'success', {
+      hedgeJournal: journal,
+      notifier: { notify },
+    })
+    vi.mocked(journal.hasPendingIntent).mockReturnValue(true)
+    vi.mocked(journal.recover).mockImplementation(async () => {
+      throw new Error('mined replacement does not match the durable hedge transaction identity')
+    })
+
+    expect(await bot.runCycle('c1')).toBe('error')
+    expect(await bot.runCycle('c2')).toBe('error')
+    expect(notify).toHaveBeenCalledTimes(1)
+  })
+
+  it('soft-holds an unquotable pending SFPM swap until a quote becomes available', async () => {
+    let pendingSwap: { dispatchIntentId: string; sellToken0: boolean; amount: bigint } | null = null
+    const store = {
+      read: () => pendingSwap,
+      save: (value: typeof pendingSwap) => {
+        pendingSwap = value
+      },
+      clear: () => {
+        pendingSwap = null
+      },
+    }
+    const notify = vi.fn(async (_message: unknown) => undefined)
+    const quoteSwap = vi
+      .fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValue({ amountOut: 90n, swapPoolTick: 0 })
+    const executePendingSwap = vi.fn(async () => ({
+      transactionHash: '0x02' as const,
+      receipt: {
+        status: 'success',
+        transactionHash: '0x02',
+        blockNumber: 124n,
+        blockHash: `0x${'cd'.repeat(32)}`,
+      } as never,
+      amountIn: 100n,
+      amountOut: 90n,
+      dryRun: false,
+    }))
+    const { bot, execute } = await makeBot(okResult, 'success', {
+      notifier: { notify },
+      pendingSwapStore: store as never,
+      sfpmVenue: {
+        coordinator: {
+          evaluate: vi.fn(async () => null),
+          quoteSwap,
+        },
+        sfpmExecutor: {
+          simulate: vi.fn(async () => undefined),
+          execute: executePendingSwap,
+        } as never,
+      },
+    })
+    pendingSwap = { dispatchIntentId: 'intent-1', sellToken0: true, amount: 100n }
+
+    expect(await bot.runCycle('c1')).toBe('held-pending')
+    expect(await bot.runCycle('c2')).toBe('held-pending')
+    expect(await bot.runCycle('c3')).toBe('complete')
+    expect(execute).not.toHaveBeenCalled()
+    expect(executePendingSwap).toHaveBeenCalledOnce()
+    expect(pendingSwap).toBeNull()
+    expect(notify).toHaveBeenCalledTimes(2)
   })
 })

@@ -501,17 +501,22 @@ async function main(): Promise<void> {
     }
     const signalFailures =
       outcome === 'signal-unavailable' ? (state.consecutiveSignalFailures ?? 0) + 1 : 0
+    // A held-pending cycle is a graceful hold (a hedge tx is still in flight or
+    // its required swap is temporarily unquotable), not a failure — but a long
+    // streak means operator attention may be needed.
+    const pendingHolds = outcome === 'held-pending' ? (state.consecutivePendingHolds ?? 0) + 1 : 0
     patchRuntimeState(instanceId, {
       lastPollCompletedAt: new Date().toISOString(),
       lastCycleOutcome: outcome,
       consecutiveSignalFailures: signalFailures,
+      consecutivePendingHolds: pendingHolds,
       ready: outcome === 'complete' ? true : state.ready,
       lifecycle:
         outcome === 'complete'
           ? (state.notificationConsecutiveFailures ?? 0) >= 3
             ? 'degraded'
             : 'ready'
-          : outcome === 'error' || signalFailures >= 3
+          : outcome === 'error' || signalFailures >= 3 || pendingHolds >= 3
             ? 'degraded'
             : state.lifecycle,
     })
@@ -831,7 +836,9 @@ async function main(): Promise<void> {
   // startup cycle shouldn't abort boot.
   await initWithRetry(async () => {
     const outcome = await runAndRecord('startup')
-    if (outcome !== 'complete') {
+    // held-pending is a graceful hold: a prior hedge tx is still legitimately
+    // in flight; per-cycle recovery will resolve it — don't fail the boot.
+    if (outcome !== 'complete' && outcome !== 'held-pending') {
       throw new Error('startup cycle did not reach readiness')
     }
   }, recordInitFailure)

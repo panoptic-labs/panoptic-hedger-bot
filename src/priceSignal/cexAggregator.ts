@@ -56,13 +56,35 @@ const COINBASE_MESSAGE_SCHEMA = z
   })
   .passthrough()
 const KRAKEN_MESSAGE_SCHEMA = z
-  .tuple([
-    z.unknown(),
-    z.object({ b: z.array(z.string()).min(1), a: z.array(z.string()).min(1) }),
-    z.literal('ticker'),
-  ])
-  .rest(z.unknown())
+  .object({
+    channel: z.literal('ticker'),
+    data: z.array(z.object({ bid: z.number(), ask: z.number() })).min(1),
+  })
+  .passthrough()
 const BOOK_LEVEL_SCHEMA = z.tuple([z.string()]).rest(z.unknown())
+const BITSTAMP_MESSAGE_SCHEMA = z
+  .object({
+    event: z.literal('data'),
+    data: z.object({
+      bids: z.array(BOOK_LEVEL_SCHEMA).min(1),
+      asks: z.array(BOOK_LEVEL_SCHEMA).min(1),
+    }),
+  })
+  .passthrough()
+const GEMINI_MESSAGE_SCHEMA = z
+  .object({
+    type: z.literal('update'),
+    events: z.array(
+      z
+        .object({
+          type: z.literal('change'),
+          side: z.enum(['bid', 'ask']),
+          price: z.string(),
+        })
+        .passthrough(),
+    ),
+  })
+  .passthrough()
 const OKX_MESSAGE_SCHEMA = z
   .object({
     data: z
@@ -253,26 +275,78 @@ class CoinbaseFeed extends ExchangeFeed {
   }
 }
 
-class KrakenFeed extends ExchangeFeed {
+export class KrakenFeed extends ExchangeFeed {
   constructor() {
     super('kraken')
   }
   get url(): string {
-    return 'wss://ws.kraken.com'
+    return 'wss://ws.kraken.com/v2'
   }
   onOpen(ws: WebSocket): void {
     ws.send(
       JSON.stringify({
-        event: 'subscribe',
-        pair: ['ETH/USD'],
-        subscription: { name: 'ticker' },
+        method: 'subscribe',
+        params: { channel: 'ticker', symbol: ['ETH/USD'] },
       }),
     )
   }
   onMessage(raw: WebSocket.RawData): void {
     const parsed = KRAKEN_MESSAGE_SCHEMA.safeParse(JSON.parse(raw.toString()) as unknown)
     if (parsed.success) {
-      this.setQuote(Number(parsed.data[1].b[0]), Number(parsed.data[1].a[0]))
+      const { bid, ask } = parsed.data.data[0]
+      this.setQuote(bid, ask)
+    }
+  }
+}
+
+export class BitstampFeed extends ExchangeFeed {
+  constructor() {
+    super('bitstamp')
+  }
+  get url(): string {
+    return 'wss://ws.bitstamp.net'
+  }
+  onOpen(ws: WebSocket): void {
+    ws.send(
+      JSON.stringify({
+        event: 'bts:subscribe',
+        data: { channel: 'order_book_ethusd' },
+      }),
+    )
+  }
+  onMessage(raw: WebSocket.RawData): void {
+    const parsed = BITSTAMP_MESSAGE_SCHEMA.safeParse(JSON.parse(raw.toString()) as unknown)
+    if (parsed.success) {
+      this.setQuote(Number(parsed.data.data.bids[0][0]), Number(parsed.data.data.asks[0][0]))
+    }
+  }
+}
+
+export class GeminiFeed extends ExchangeFeed {
+  private bestBid: number | null = null
+  private bestAsk: number | null = null
+
+  constructor() {
+    super('gemini')
+  }
+  get url(): string {
+    return 'wss://api.gemini.com/v1/marketdata/ETHUSD?top_of_book=true&bids=true&offers=true'
+  }
+  onOpen(): void {}
+  onMessage(raw: WebSocket.RawData): void {
+    const parsed = GEMINI_MESSAGE_SCHEMA.safeParse(JSON.parse(raw.toString()) as unknown)
+    if (!parsed.success) return
+
+    const bids = parsed.data.events
+      .filter((event) => event.side === 'bid')
+      .map((event) => Number(event.price))
+    const asks = parsed.data.events
+      .filter((event) => event.side === 'ask')
+      .map((event) => Number(event.price))
+    if (bids.length > 0) this.bestBid = Math.max(...bids)
+    if (asks.length > 0) this.bestAsk = Math.min(...asks)
+    if (this.bestBid !== null && this.bestAsk !== null) {
+      this.setQuote(this.bestBid, this.bestAsk)
     }
   }
 }
@@ -346,6 +420,8 @@ export class PriceAggregator extends EventEmitter implements LatestPriceProvider
       new BinanceFeed(),
       new CoinbaseFeed(),
       new KrakenFeed(),
+      new BitstampFeed(),
+      new GeminiFeed(),
       new OkxFeed(),
       new BybitFeed(),
     ]

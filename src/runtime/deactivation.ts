@@ -1,5 +1,6 @@
 import { z } from 'zod'
 
+import { clearActivation } from './activation'
 import { runtimeDataPath } from './paths'
 import { readSecureJson, removeSecureFile, writeSecureJson } from './secureFile'
 
@@ -38,4 +39,10 @@ export function writeDeactivation(now = new Date()): void {
 
 export function clearDeactivation(): void {
   removeSecureFile(deactivationPath())
+}
+
+/** Persist the immediate kill switch before removing live-start eligibility. */
+export function deactivateRuntime(now = new Date()): void {
+  writeDeactivation(now)
+  clearActivation()
 }

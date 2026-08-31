@@ -133,12 +133,14 @@ const poolLockAbi = [
 
 /** A no-op journal — the fork test asserts on-chain state, not journal durability. */
 const noopJournal: HedgeJournalPort = {
-  begin: () => {},
+  begin: () => 'noop-intent',
   observeTransaction: () => {},
+  recordBroadcastAttempt: () => {},
   confirm: () => {},
   fail: () => {},
-  recover: async () => {},
-  checkpoint: () => ({}) as never,
+  recover: async () => ({ held: [] }),
+  checkpoint: () => ({}),
+  hasPendingIntent: () => false,
 }
 
 /** Permissive gas policy: never defers; lets the wallet estimate fees on anvil. */
@@ -558,12 +560,13 @@ describe('hedger-bot deleverager end-to-end (mainnet fork)', () => {
       chain: mainnet,
       transport: http(RPC_URL),
     })
-    await reWallet.writeContract({
+    const lockHash = await reWallet.writeContract({
       address: POOL_ADDRESS,
       abi: poolLockAbi,
       functionName: 'lockSafeMode',
       args: [],
     })
+    await publicClient.waitForTransactionReceipt({ hash: lockHash })
     await testClient.stopImpersonatingAccount({ address: riskEngineAddress })
     const mode = await publicClient.readContract({
       address: POOL_ADDRESS,

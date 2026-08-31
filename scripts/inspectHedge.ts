@@ -1,6 +1,6 @@
 import 'dotenv/config'
 
-import { fileURLToPath } from 'node:url'
+import path from 'node:path'
 
 import { createMemoryStorage } from '@panoptic-eng/sdk/v2'
 import { createPublicClient, formatUnits, http } from 'viem'
@@ -217,7 +217,7 @@ export async function runHedgeInspection(config: HedgerBotConfig): Promise<Hedge
 }
 
 const entrypoint = process.argv[1]
-if (entrypoint && fileURLToPath(import.meta.url) === entrypoint) {
+if (entrypoint && ['inspectHedge.ts', 'inspectHedge.js'].includes(path.basename(entrypoint))) {
   runHedgeInspection(parseHedgerBotConfig()).catch((err) => {
     console.error(sanitizeError(err))
     process.exit(1)

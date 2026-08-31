@@ -128,6 +128,28 @@ export interface HedgeJournalCheckpoint {
   fromBlock?: bigint
 }
 
+export interface HeldIntent {
+  id: string
+  action: HedgeJournalAction
+  nonce: number | null
+  lastHash: Hex | null
+  blocksSinceSubmit: bigint
+  blocksRemaining: bigint
+}
+
+export interface RecoveryReport {
+  held: HeldIntent[]
+}
+
+export interface RecoverOptions {
+  /**
+   * 'full' (default, startup): also recheck recent confirmed entries for reorgs.
+   * 'pending' (per-cycle): only resolve pending entries; skips the confirmed
+   * recheck so a transient reorg-probe failure cannot fail a cycle.
+   */
+  scope?: 'full' | 'pending'
+}
+
 export interface HedgeRecoveryClient {
   getBlockNumber(): Promise<bigint>
   getBlock(args: { blockNumber: bigint }): Promise<{ hash: Hex | null }>
@@ -158,8 +180,9 @@ export interface HedgeJournalPort {
   recordBroadcastAttempt(): void
   confirm(receipt: { transactionHash: Hex; blockNumber: bigint; blockHash: Hex }): void
   fail(): void
-  recover(publicClient: HedgeRecoveryClient): Promise<void>
+  recover(publicClient: HedgeRecoveryClient, options?: RecoverOptions): Promise<RecoveryReport>
   checkpoint(): HedgeJournalCheckpoint
+  hasPendingIntent(): boolean
 }
 
 function lower(address: Address): Address {
@@ -325,10 +348,20 @@ export class HedgeJournal implements HedgeJournalPort {
     this.persist()
   }
 
-  async recover(publicClient: HedgeRecoveryClient): Promise<void> {
+  hasPendingIntent(): boolean {
+    return this.data.intents.some((entry) => entry.status === 'pending')
+  }
+
+  async recover(
+    publicClient: HedgeRecoveryClient,
+    options: RecoverOptions = {},
+  ): Promise<RecoveryReport> {
+    const scope = options.scope ?? 'full'
+    const held: HeldIntent[] = []
     const latestBlock = await publicClient.getBlockNumber()
     for (const entry of [...this.data.intents]) {
       if (entry.status === 'confirmed') {
+        if (scope === 'pending') continue
         if (
           entry.blockNumber === null ||
           entry.blockHash === null ||
@@ -435,13 +468,22 @@ export class HedgeJournal implements HedgeJournalPort {
       const blocksSinceSubmit = latestBlock > submittedAt ? latestBlock - submittedAt : 0n
       if (blocksSinceSubmit < this.nonceStallBlocks) {
         // Nonce slot still open and it's too early to declare the send lost.
-        // Keep the entry pending; next cycle's begin() will bounce and recovery
-        // will retry when the wait exceeds the stall window.
+        // Keep the entry pending; per-cycle recovery re-evaluates it until the
+        // wait exceeds the stall window.
         botLog(
           `[hedger-bot] pending intent ${entry.id} (action=${entry.action}, nonce=${entry.nonce}) ` +
             `still legitimately in flight (chainNonce=${chainNonce}, blocksSinceSubmit=` +
             `${blocksSinceSubmit}); keeping pending`,
         )
+        held.push({
+          id: entry.id,
+          action: entry.action,
+          nonce: entry.nonce,
+          lastHash:
+            entry.hashes.length > 0 ? checkedHex(entry.hashes[entry.hashes.length - 1]) : null,
+          blocksSinceSubmit,
+          blocksRemaining: this.nonceStallBlocks - blocksSinceSubmit,
+        })
         continue
       }
       botWarn(
@@ -454,6 +496,7 @@ export class HedgeJournal implements HedgeJournalPort {
     }
     this.pruneTerminalIntents(latestBlock)
     this.persist()
+    return { held }
   }
 
   checkpoint(): HedgeJournalCheckpoint {

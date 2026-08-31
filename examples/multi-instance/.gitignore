@@ -1,0 +1,5 @@
+.env
+instance-*/hedger.env
+instance-*/bot-keystore.json
+instance-*/bot-keystore-passphrase
+backups/

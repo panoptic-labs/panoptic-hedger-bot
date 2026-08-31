@@ -104,8 +104,65 @@ describe('HedgeJournal', () => {
 
     const restarted = journal()
     // chainNonce still at 4 (== entry.nonce), 10 blocks since submit — inside the stall window.
-    await restarted.recover(client(new Map(), BLOCK_HASH, 4, 110n))
+    const report = await restarted.recover(client(new Map(), BLOCK_HASH, 4, 110n))
+    expect(report.held).toHaveLength(1)
+    expect(report.held[0]).toMatchObject({
+      action: 'open',
+      nonce: 4,
+      lastHash: HASH_A,
+      blocksSinceSubmit: 10n,
+      blocksRemaining: 54n,
+    })
+    expect(restarted.hasPendingIntent()).toBe(true)
     expect(() => restarted.begin('grow')).toThrow(/ambiguous pending hedge intent/)
+  })
+
+  it('per-cycle recovery confirms a held intent once its transaction mines', async () => {
+    const first = journal()
+    first.begin('open')
+    broadcast(first, [HASH_A])
+
+    const restarted = journal()
+    // First pass: still in flight, held.
+    const holdReport = await restarted.recover(client(new Map(), BLOCK_HASH, 4, 110n), {
+      scope: 'pending',
+    })
+    expect(holdReport.held).toHaveLength(1)
+    expect(restarted.hasPendingIntent()).toBe(true)
+
+    // Second pass: the transaction mined; recovery confirms it in-process.
+    const resolveReport = await restarted.recover(client(new Map([[HASH_A, 'success']])), {
+      scope: 'pending',
+    })
+    expect(resolveReport.held).toHaveLength(0)
+    expect(restarted.hasPendingIntent()).toBe(false)
+    expect(restarted.checkpoint()).toMatchObject({ transactionHash: HASH_A })
+    restarted.begin('grow')
+  })
+
+  it("scope 'pending' skips the confirmed-entry reorg recheck", async () => {
+    const first = journal()
+    first.begin('open')
+    broadcast(first, [HASH_A])
+    const restarted = journal()
+    // Confirm the entry so the journal holds a recent confirmed record.
+    await restarted.recover(client(new Map([[HASH_A, 'success']])))
+    expect(restarted.hasPendingIntent()).toBe(false)
+
+    const probing: HedgeRecoveryClient = {
+      getBlockNumber: async () => 102n,
+      getBlock: async () => {
+        throw new Error('confirmed recheck must not run under pending scope')
+      },
+      getTransactionReceipt: async () => {
+        throw new Error('confirmed recheck must not run under pending scope')
+      },
+      getTransactionCount: async () => 5,
+    }
+    const report = await restarted.recover(probing, { scope: 'pending' })
+    expect(report.held).toHaveLength(0)
+    // Full scope on the same client does probe the confirmed entry and throws.
+    await expect(restarted.recover(probing)).rejects.toThrow(/must not run under pending scope/)
   })
 
   it('auto-fails a stalled pending intent whose nonce slot never advanced', async () => {

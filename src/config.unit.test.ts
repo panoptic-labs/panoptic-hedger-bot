@@ -253,6 +253,12 @@ describe('parseHedgerBotConfig', () => {
     expect(() =>
       parseHedgerBotConfig({ ...BASE_ENV, RPC_URL: 'http://127.0.0.1:8545' }),
     ).not.toThrow()
+    expect(() =>
+      parseHedgerBotConfig({
+        ...BASE_ENV,
+        RPC_URL: 'http://host.docker.internal:8545',
+      }),
+    ).not.toThrow()
   })
 
   it('allows at most one non-interactive keystore passphrase source', () => {

@@ -584,6 +584,103 @@ Set `SOURCE_SHA` to the exact reviewed 40-character commit before building; the
 image embeds it in `HEDGER_BUILD_ID`, and activation is invalidated when that
 artifact identity changes.
 
+### Running multiple instances on one host
+
+The default `docker-compose.yml` intentionally describes one bot. To operate
+several independent Safe/pool configurations on the same host, use one reviewed,
+commit-tagged image with a separate env file, encrypted keystore, passphrase,
+state volume, and secrets volume for every instance. No host ports are needed:
+the hedger is an outbound worker.
+
+Copy the reusable [`examples/multi-instance`](./examples/multi-instance/)
+directory to a private operations checkout. Do not put credentials in the
+source repository:
+
+```bash
+cp -R examples/multi-instance ../hedger-ops
+cd ../hedger-ops
+cp .env.example .env
+for instance in instance-a instance-b instance-c; do
+  mkdir "$instance"
+  cp instance.env.example "$instance/hedger.env"
+done
+```
+
+Complete each config, place its encrypted keystore and passphrase beside it,
+and make both secret files owner-only. The resulting layout is:
+
+```text
+hedger-ops/
+├── compose.yml
+├── .env                         # SOURCE_SHA only; copied from .env.example
+├── instance-a/
+│   ├── hedger.env
+│   ├── bot-keystore.json
+│   └── bot-keystore-passphrase
+├── instance-b/                  # same three files
+└── instance-c/                  # same three files
+```
+
+Build the reviewed source once, then start all instances from the operations
+directory. `SOURCE_SHA` must be the full commit used as the build context:
+
+```bash
+SOURCE_REPO=../panoptic-hedger-bot
+SOURCE_SHA=$(git -C "$SOURCE_REPO" rev-parse HEAD)
+git -C "$SOURCE_REPO" archive "$SOURCE_SHA" | \
+  docker build \
+    --build-arg SOURCE_SHA="$SOURCE_SHA" \
+    --tag "panoptic-hedger-bot:$SOURCE_SHA" \
+    -
+printf 'SOURCE_SHA=%s\n' "$SOURCE_SHA" > .env
+pnpm --dir ../panoptic-hedger-bot multi:check -- "$PWD"
+docker compose up -d
+```
+
+Each `hedger.env` contains that instance's normal configuration, but must not
+contain `BOT_PRIVATE_KEY`, `BOT_KEYSTORE_PASSPHRASE`, or override
+`HEDGER_STATE_DIR`, `BOT_KEYSTORE_PATH`, or
+`BOT_KEYSTORE_PASSPHRASE_FILE`; Compose supplies the file-backed key paths.
+`pnpm multi:check -- <ops-directory>` validates every discovered `hedger.env`,
+secret file, signer, and portfolio without a network call or key decryption. Its
+success output contains public identities only.
+
+Set `DRY_RUN=false` in each config. A fresh state volume has no activation
+marker, so the runtime still forces dry-run. Activate one service at a time:
+
+```bash
+SERVICE=instance-a
+docker compose logs -f "$SERVICE" # observe at least one dry-run cycle; then Ctrl-C
+docker compose exec "$SERVICE" node dist/scripts/doctor.js
+docker compose exec "$SERVICE" node dist/scripts/inspectHedge.js
+docker compose exec "$SERVICE" node dist/scripts/activate.js --read-only-config
+docker compose restart "$SERVICE" # required: main re-evaluates the new marker at startup
+docker compose exec "$SERVICE" node dist/scripts/health.js
+docker compose exec "$SERVICE" node dist/scripts/status.js
+```
+
+Repeat only after the prior instance is healthy. Container activation never
+edits `hedger.env`; it requires `DRY_RUN=false` and uses that file's fixed
+`SFPM_SWAP_ENABLED` choice. Ordinary `pnpm activate` on a host checkout keeps
+its existing behavior of choosing SFPM interactively and updating `.env`.
+
+> **Do not deploy the same signer + Safe + pool identity in two isolated state
+> volumes.** The single-writer lease is stored in the instance's state volume,
+> so containers with separate volumes cannot fence one another. Duplicate live
+> instances could race the same signer nonce. Give every concurrently running
+> instance a distinct scoped signer and Safe/pool assignment.
+
+Named volumes preserve each instance's activation marker, transaction journal,
+cadence checkpoint, and staged secrets across container replacement. Ordinary
+`docker compose down` preserves them; `docker compose down --volumes` deletes
+them and should not be used as a routine stop command.
+
+The template intentionally supplies one `${SOURCE_SHA}` to all three services.
+Long-lived divergent versions require separate image variables or separate
+deployments, not edits that silently detach one service from the reviewed tag.
+See the [runbook multi-instance operations section](./runbook.md#multi-instance-host-operations)
+for rolling upgrades, backups/restores, secret rotation, and dependency capacity.
+
 Operational notes:
 
 - **Durable and fenced** — mount `/var/lib/hedger` persistently. The transaction
@@ -600,34 +697,37 @@ Operational notes:
 
 ### Operating a running container
 
-The container runs the bot (`pnpm start`) as its single long-lived process — the
+The container runs the compiled bot as its single long-lived process — the
 terminal that launched it only shows the logs. To read logs or run the
-operator commands (`status`, `health`, `doctor`) you don't attach to that
+operator commands you don't attach to that
 process; you ask Docker to run a **new** one-shot command *inside the same
 container* with `docker compose exec` (the service is named `hedger-bot`). Any
 terminal on the Docker host can do this while the container is up:
 
 ```bash
-docker compose logs -f hedger-bot          # follow the live bot output
-docker compose exec hedger-bot pnpm status # operator snapshot (runs inside, then exits)
-docker compose exec hedger-bot pnpm health # machine-readable readiness (exit code)
-docker compose exec hedger-bot pnpm run doctor  # read-only preflight
+docker compose logs -f hedger-bot
+docker compose exec hedger-bot node dist/scripts/status.js
+docker compose exec hedger-bot node dist/scripts/health.js
+docker compose exec hedger-bot node dist/scripts/doctor.js
+docker compose exec hedger-bot node dist/scripts/inspectHedge.js
+docker compose exec hedger-bot node dist/scripts/deactivate.js
 ```
 
 These run against the **same** `.env`, RPC view, and `/var/lib/hedger` state
 volume as the live bot, so they report a consistent picture — the reason to use
 `exec` rather than running `pnpm status` on the host (which has neither the state
-volume nor the keystore). They are read-only and touch only `/tmp`, so the
-read-only root filesystem is not a problem.
+volume nor the keystore). Status, health, doctor, and inspection are read-only;
+deactivation writes its safety markers only to the state volume. The read-only
+root filesystem is not a problem.
 
 Notes:
 
 - In non-interactive contexts (cron, CI) add `-T` to disable the TTY:
-  `docker compose exec -T hedger-bot pnpm health`.
+  `docker compose exec -T hedger-bot node dist/scripts/health.js`.
 - Inside the monorepo, point at the compose file from the repo root:
-  `docker compose -f ./docker-compose.yml exec hedger-bot pnpm status`.
+  `docker compose -f ./docker-compose.yml exec hedger-bot node dist/scripts/status.js`.
 - Plain-Docker equivalent (no Compose): `docker ps` to find the container name,
-  then `docker exec -it <name> pnpm status`.
+  then `docker exec -it <name> node dist/scripts/status.js`.
 
 ## Troubleshooting
 
@@ -657,6 +757,7 @@ Notes:
 | `pnpm health` | Signer-free machine-readable liveness/readiness check |
 | `pnpm status` | Operator snapshot: running, mode, positions, delta, last poll/hedge |
 | `pnpm inspect:hedge` | Dry-run one cycle, print the plan, send nothing |
+| `pnpm multi:check -- <ops-directory>` | Offline validation of a multi-instance operations directory and its public identities |
 | `pnpm deploy:safe-roles` | Deploy Safe + Roles modifier and scope the bot |
 | `pnpm scope:bot-role` | (Re)scope the bot EOA on an existing modifier |
 | `pnpm migrate:sfpm-venue` | Generate an unsigned Safe batch that adds the complete SFPM venue to an existing Safe |
@@ -681,6 +782,7 @@ Notes:
 ├── scripts/             # setup (wizard), deploySafeAndRoles, scopeBotRole, inspectHedge
 │   └── lib/             # deployCore, verifyScope, safeZodiacRegistry, renderEnv, prompts, rolesScope
 │
+├── examples/multi-instance/ # Three-instance Compose and sanitized operations templates
 ├── runbook.md           # Deployment & operations runbook
 ├── Dockerfile · docker-compose.yml
 └── .env.example         # Annotated configuration template
@@ -692,6 +794,7 @@ Notes:
 |----------|-------------|
 | [runbook.md](./runbook.md) | Full deployment & ops guide: architecture, role scope, and fork verification |
 | [.env.example](./.env.example) | Annotated configuration reference |
+| [examples/multi-instance](./examples/multi-instance/) | Reusable three-instance operations template |
 
 ## License
 

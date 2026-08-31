@@ -14,6 +14,7 @@ async function main(): Promise<void> {
       config: parseHedgerBotConfig(),
       envPath: path.resolve(process.cwd(), '.env'),
       prompter,
+      readOnlyConfig: process.argv.includes('--read-only-config'),
     })
     if (result === 'failed') process.exitCode = 1
   } finally {

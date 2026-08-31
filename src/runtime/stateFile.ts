@@ -28,7 +28,9 @@ const runtimeStateSchema = z
     lastPollAt: iso.optional(),
     lastPollCompletedAt: iso.optional(),
     lastPollTrigger: z.string().min(1).max(64).optional(),
-    lastCycleOutcome: z.enum(['complete', 'signal-unavailable', 'error']).optional(),
+    lastCycleOutcome: z
+      .enum(['complete', 'signal-unavailable', 'error', 'held-pending'])
+      .optional(),
     lastReconcileAt: iso.optional(),
     lastPriceObservedAt: iso.optional(),
     lastPriceBlock: z.string().regex(/^\d+$/).optional(),
@@ -64,6 +66,7 @@ const runtimeStateSchema = z
       .optional(),
     lastOraclePokeResult: z.enum(['confirmed', 'dry-run', 'deferred', 'failed']).optional(),
     consecutiveSignalFailures: z.number().int().nonnegative().optional(),
+    consecutivePendingHolds: z.number().int().nonnegative().optional(),
     lastHedgeAt: iso.optional(),
     lastHedgeAction: z.string().min(1).max(64).optional(),
     lastHedgeTx: z

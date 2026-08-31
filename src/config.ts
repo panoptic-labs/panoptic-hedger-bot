@@ -45,7 +45,9 @@ const rpcUrlSchema = z
   .url()
   .superRefine((value, ctx) => {
     const url = new URL(value)
-    const loopback = ['localhost', '127.0.0.1', '::1'].includes(url.hostname)
+    const loopback = ['localhost', '127.0.0.1', '::1', 'host.docker.internal'].includes(
+      url.hostname,
+    )
     if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
