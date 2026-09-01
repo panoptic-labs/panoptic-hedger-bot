@@ -41,8 +41,8 @@ FROM deps AS builder
 
 COPY src ./src
 COPY scripts ./scripts
-COPY tsconfig.json tsconfig.build.json ./
-RUN pnpm build:runtime && pnpm deploy --legacy --prod /opt/hedger
+COPY tsconfig.json tsconfig.build.json tsconfig.apps.json tsconfig.base.json ./
+RUN pnpm build:runtime && pnpm --filter @panoptic-eng/hedger-bot deploy --legacy --prod /opt/hedger
 
 FROM ${NODE_IMAGE} AS runner
 
