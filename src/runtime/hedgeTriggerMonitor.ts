@@ -14,6 +14,7 @@ export interface HedgeTriggerConfig {
   deltaThresholdBps: bigint
   deltaOffsetBps: bigint
   includeLp: boolean
+  includeWalletBalances?: boolean
 }
 
 export interface HedgeTickBoundaries {
@@ -188,6 +189,7 @@ export class HedgeTriggerMonitor {
         pool: { ...snapshot.pool, currentTick: tick },
         collateral: snapshot.collateral,
         walletBalances: snapshot.walletBalances,
+        includeWalletBalances: this.config.includeWalletBalances,
         assetIndex: this.config.assetIndex,
         positions: snapshot.positions,
         hedgePositions: snapshot.hedgePositions,

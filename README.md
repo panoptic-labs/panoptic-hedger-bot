@@ -259,6 +259,7 @@ it writes (and for the manual path). The full annotated list lives in
 | `TIMED_HEDGE_MIN_DRIFT_BPS` | | Timed trigger's inner drift band, default `100`; when enabled it must be positive and below `DELTA_THRESHOLD_BPS` |
 | `MAX_HEDGE_SLOTS` | | Consolidate hedge loans above this count, default `4` |
 | `SLIPPAGE_BPS` | | Hedge swap slippage tolerance, default `100` (±100 ticks for in-pool loans) |
+| `HEDGE_WALLET_BALANCES` | | `true` includes loose assets held directly by the Safe in hedge delta; default `false` excludes them. |
 | `PRICE_SIGNAL_SOURCE` | | `pool-tick` \| `cex` (supported); `uniswap-pool` (experimental) |
 | `HEDGE_VENUE` | | `in-pool` (the only supported execution venue) |
 | `POLL_INTERVAL_MS` | | Full account reconciliation interval, default `300000`, minimum `5000`, with no configured maximum; pool price and relevant account events are monitored every 12 seconds between reconciliations |

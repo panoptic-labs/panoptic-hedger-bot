@@ -351,6 +351,33 @@ export interface ConfigureCall {
   data: `0x${string}`
 }
 
+/** ERC20 allowance the Safe must grant for an owner-authorized workflow. */
+export interface SafeTokenApproval {
+  token: `0x${string}`
+  spender: `0x${string}`
+}
+
+export function buildTokenApprovalCalls(approvals: readonly SafeTokenApproval[]): ConfigureCall[] {
+  const seen = new Set<string>()
+  return approvals.flatMap(({ token, spender }) => {
+    const key = `${token.toLowerCase()}:${spender.toLowerCase()}`
+    if (seen.has(key)) return []
+    seen.add(key)
+    return [
+      {
+        description: `approve(${spender}, max) for ${token} from the Safe`,
+        to: token,
+        value: 0n,
+        data: encodeFunctionData({
+          abi: erc20ApproveAbi,
+          functionName: 'approve',
+          args: [spender, MAX_UINT256],
+        }),
+      },
+    ]
+  })
+}
+
 /**
  * Build the ordered owner-authorized calls that wire a Roles modifier to a Safe
  * for loan-only hedging: (optional) `enableModule`, then `assignRoles`,
@@ -385,7 +412,7 @@ export interface SfpmSwapConfigureInput {
    * collateral asset -> its CollateralTracker (pulled by the deposit leg). The
    * caller states these explicitly so no token-ordering is inferred here.
    */
-  approvals: Array<{ token: `0x${string}`; spender: `0x${string}` }>
+  approvals: SafeTokenApproval[]
 }
 
 /**
@@ -422,18 +449,7 @@ export function buildSfpmSwapConfigureCalls(params: {
       args: step.args as never,
     }),
   }))
-  for (const { token, spender } of params.sfpmSwap.approvals) {
-    calls.push({
-      description: `approve(${spender}, max) for ${token} from the Safe`,
-      to: token,
-      value: 0n,
-      data: encodeFunctionData({
-        abi: erc20ApproveAbi,
-        functionName: 'approve',
-        args: [spender, MAX_UINT256],
-      }),
-    })
-  }
+  calls.push(...buildTokenApprovalCalls(params.sfpmSwap.approvals))
   return calls
 }
 
@@ -444,6 +460,8 @@ export function buildConfigureCalls(params: {
   roleKey: `0x${string}`
   poolAddress: `0x${string}`
   extraRoles?: ExtraRoleSpec[]
+  /** Core asset -> CollateralTracker approvals used by Safe-owned deposits. */
+  collateralApprovals?: SafeTokenApproval[]
   sfpmSwap?: SfpmSwapConfigureInput
   /** Existing Safe only: set the reviewed handler when the Safe currently has none. */
   fallbackHandler?: `0x${string}`
@@ -516,13 +534,27 @@ export function buildConfigureCalls(params: {
     })
   }
 
+  const collateralApprovals = params.collateralApprovals ?? []
+  calls.push(...buildTokenApprovalCalls(collateralApprovals))
+
   if (params.sfpmSwap) {
+    const coreApprovalKeys = new Set(
+      collateralApprovals.map(
+        ({ token, spender }) => `${token.toLowerCase()}:${spender.toLowerCase()}`,
+      ),
+    )
     calls.push(
       ...buildSfpmSwapConfigureCalls({
         safeAddress,
         rolesModifierAddress,
         roleKey,
-        sfpmSwap: params.sfpmSwap,
+        sfpmSwap: {
+          ...params.sfpmSwap,
+          approvals: params.sfpmSwap.approvals.filter(
+            ({ token, spender }) =>
+              !coreApprovalKeys.has(`${token.toLowerCase()}:${spender.toLowerCase()}`),
+          ),
+        },
       }),
     )
   }
@@ -564,6 +596,8 @@ export interface DeploySafeAndRolesParams {
   saltNonce: bigint
   /** Optional extra keeper roles to scope (deleverager/maintenance/roller/size-adjuster). */
   extraRoles?: ExtraRoleSpec[]
+  /** Core asset -> CollateralTracker approvals included in the Safe configure tx. */
+  collateralApprovals?: SafeTokenApproval[]
   /** Optional off-venue SFPM swap scoping + approvals to include in the configure batch. */
   sfpmSwap?: SfpmSwapConfigureInput
   /**
@@ -808,6 +842,7 @@ export async function deploySafeAndRoles(
       roleKey,
       poolAddress,
       extraRoles,
+      collateralApprovals: params.collateralApprovals,
       sfpmSwap: params.sfpmSwap,
       includeEnableModule: true,
       swapOwnerFrom: deployer.address,

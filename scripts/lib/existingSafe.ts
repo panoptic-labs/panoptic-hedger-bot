@@ -17,6 +17,7 @@ import {
 import {
   type ConfigureCall,
   type ExtraRoleSpec,
+  type SafeTokenApproval,
   type SfpmSwapConfigureInput,
   buildConfigureCalls,
   deployRolesModifier,
@@ -95,6 +96,24 @@ const erc20AllowanceAbi = [
  * missing approvals, so treat anything at or above 2^255 as "effectively max".
  */
 const MIN_EFFECTIVE_MAX_ALLOWANCE = 1n << 255n
+
+async function approvalsReady(
+  publicClient: PublicClient,
+  safeAddress: `0x${string}`,
+  approvals: readonly SafeTokenApproval[],
+): Promise<boolean> {
+  const allowances = await Promise.all(
+    approvals.map(({ token, spender }) =>
+      publicClient.readContract({
+        address: token,
+        abi: erc20AllowanceAbi,
+        functionName: 'allowance',
+        args: [safeAddress, spender],
+      }),
+    ),
+  )
+  return allowances.every((allowance) => allowance >= MIN_EFFECTIVE_MAX_ALLOWANCE)
+}
 
 export { readSafeOwners }
 
@@ -298,6 +317,8 @@ export interface ConfigureExistingSafeParams {
   poolId: bigint
   /** Additional à-la-carte roles to scope (owner executes; verified in the poll). */
   extraRoles?: ExtraRoleSpec[]
+  /** Core asset -> CollateralTracker approvals for Safe-owned deposits. */
+  collateralApprovals?: SafeTokenApproval[]
   /** Optional off-venue SFPM swap scoping + approvals for the owner to execute. */
   sfpmSwap?: SfpmSwapConfigureInput
   /** Salt for the modifier proxy deploy (only used when deploying a new one). */
@@ -415,6 +436,9 @@ export async function configureExistingSafe(
 
   const ready = async (): Promise<boolean> => {
     if (!(await scopeReady(publicClient, readyArgs))) return false
+    if (!(await approvalsReady(publicClient, safeAddress, params.collateralApprovals ?? []))) {
+      return false
+    }
     if (
       modifierToDisable &&
       (await isModuleEnabled(publicClient, safeAddress, modifierToDisable))
@@ -452,6 +476,7 @@ export async function configureExistingSafe(
     roleKey: params.roleKey,
     poolAddress: params.poolAddress,
     extraRoles: params.extraRoles,
+    collateralApprovals: params.collateralApprovals,
     sfpmSwap: params.sfpmSwap,
     fallbackHandler,
     includeEnableModule,

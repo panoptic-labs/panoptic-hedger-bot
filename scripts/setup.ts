@@ -56,6 +56,7 @@ import { runGenerateIdea } from './generateIdea'
 import {
   type ExtraRoleKind,
   type ExtraRoleSpec,
+  type SafeTokenApproval,
   type SfpmSwapConfigureInput,
   buildSafeSetupInitializer,
   deploySafeAndRoles,
@@ -129,6 +130,8 @@ interface DeployState {
   uniswapLpOwner?: `0x${string}`
   /** Fold Uniswap LP delta into the hedge (vs observe-only). */
   hedgeIncludeLp: boolean
+  /** Fold loose Safe wallet balances into net delta. */
+  hedgeWalletBalances: boolean
   /** Explicit consent to install the expanded SFPM swap authorization surface. */
   sfpmSwapProvisioned: boolean
   storage: 'keystore' | 'plaintext'
@@ -178,6 +181,9 @@ export const deployStateSchema: z.ZodType<DeployState, z.ZodTypeDef, unknown> = 
     // Optional for resume compatibility: a version-1 state file written before
     // LP hedging existed has no hedgeIncludeLp; default it to observe-only.
     hedgeIncludeLp: z.boolean().optional().default(false),
+    // Optional for resume compatibility with state written before wallet balance
+    // hedging became opt-in.
+    hedgeWalletBalances: z.boolean().optional().default(false),
     sfpmSwapProvisioned: z.boolean().optional().default(false),
     storage: z.enum(['keystore', 'plaintext']),
     extraRoles: z.array(
@@ -440,6 +446,7 @@ async function repairConfiguredBot(p: Prompter, envPath: string): Promise<void> 
     client: asSdkClient<typeof getPoolMetadata>(publicClient),
     poolAddress: config.POOL_ADDRESS,
   })
+  const collateralApprovals = collateralTrackerApprovals(metadata)
   const sfpmRequested =
     sfpmAlreadyRequested ||
     (await p.confirm(
@@ -479,6 +486,7 @@ async function repairConfiguredBot(p: Prompter, envPath: string): Promise<void> 
     extraRoles: config.DELEVERAGER_ENABLED
       ? [{ kind: 'deleverager', member: account.address }]
       : [],
+    collateralApprovals,
     sfpmSwap: sfpmSwap?.configure,
     saltNonce: randomSaltNonce(),
     onModifierDeployed: (rolesModifierAddress) => {
@@ -618,6 +626,10 @@ async function main(): Promise<void> {
       }),
     )
     const dryRun = await p.confirm('Start in DRY_RUN (simulate, send nothing)?', true)
+    const hedgeWalletBalances = await p.confirm(
+      'Include loose Safe wallet balances in the delta hedge?',
+      false,
+    )
 
     // Optional: an extra address (besides the Safe) holding plain Uniswap v3/v4
     // LP positions on this pool's token pair. Recorded as UNISWAP_LP_OWNER and
@@ -872,6 +884,7 @@ async function main(): Promise<void> {
       console.log(`   • Safe (owner ${finalSafeOwner}, threshold 1) — deployed by the bot`)
       console.log(`   • Zodiac Roles v2 modifier scoped loan-only to pool ${poolAddress}`)
       console.log(`   • bot ${botAccount.address} assigned to role ${roleKey}`)
+      console.log('   • collateral assets approved to their CollateralTrackers from the Safe')
       console.log(`   • then Safe ownership handed to ${finalSafeOwner} (bot keeps only its role)`)
     } else {
       console.log('\n About to configure your EXISTING Safe:')
@@ -884,6 +897,7 @@ async function main(): Promise<void> {
       console.log(
         `   • bot ${botAccount.address} assigned to role ${roleKey}, scoped loan-only to ${poolAddress}`,
       )
+      console.log('   • collateral assets approved to their CollateralTrackers from the Safe')
       console.log(
         '   • You then execute the enable/scope tx(s) from your Safe owner in the Safe UI',
       )
@@ -903,6 +917,9 @@ async function main(): Promise<void> {
     }
     console.log(
       `\n SFPM off-venue surface: ${sfpmSwapProvisioned ? 'PROVISION (execution remains disabled)' : 'not provisioned'}`,
+    )
+    console.log(
+      ` Wallet balances in hedge delta: ${hedgeWalletBalances ? 'INCLUDED' : 'excluded (default)'}`,
     )
     if (!(await p.confirm('\n Proceed?', false))) {
       console.log('Aborted. Nothing was deployed.')
@@ -951,6 +968,7 @@ async function main(): Promise<void> {
       dryRun,
       uniswapLpOwner,
       hedgeIncludeLp,
+      hedgeWalletBalances,
       sfpmSwapProvisioned,
       storage: botStorage,
       extraRoles: extraRoles.map((r) => ({
@@ -997,6 +1015,7 @@ async function main(): Promise<void> {
       botKey,
       keystorePath: botKeystorePath,
       poolId: metadata.poolId,
+      collateralApprovals: collateralTrackerApprovals(metadata),
       envPath,
       prompter: p,
     })
@@ -1051,6 +1070,7 @@ async function runResume(p: Prompter, state: DeployState, envPath: string): Prom
     botKey,
     keystorePath,
     poolId: metadata.poolId,
+    collateralApprovals: collateralTrackerApprovals(metadata),
     envPath,
     prompter: p,
   })
@@ -1061,6 +1081,18 @@ async function runResume(p: Prompter, state: DeployState, envPath: string): Prom
  * verify the loan-only boundary, write `.env`, and clear the resume state.
  */
 const NATIVE_ASSET = '0x0000000000000000000000000000000000000000'
+
+export function collateralTrackerApprovals(metadata: {
+  token0Asset: `0x${string}`
+  token1Asset: `0x${string}`
+  collateralToken0Address: `0x${string}`
+  collateralToken1Address: `0x${string}`
+}): SafeTokenApproval[] {
+  return [
+    { token: metadata.token0Asset, spender: metadata.collateralToken0Address },
+    { token: metadata.token1Asset, spender: metadata.collateralToken1Address },
+  ].filter(({ token }) => token.toLowerCase() !== NATIVE_ASSET)
+}
 
 /**
  * Resolve the off-venue SFPM swap wiring for a chain from the deployments
@@ -1089,10 +1121,9 @@ export async function resolveSfpmSwap(args: {
   const nativeSide = sides.find((s) => s.asset.toLowerCase() === NATIVE_ASSET)
   const nativeCollateral = nativeSide?.key ?? 'none'
 
-  // Approvals: each ERC20 collateral -> SFPM (swap input) + -> its CT (deposit
-  // leg). A native side deposits by value (no CT approval) but the SFPM pulls
-  // its wrapped form, so approve WETH -> SFPM when any side is native.
-  const approvals: Array<{ token: `0x${string}`; spender: `0x${string}` }> = []
+  // Complete venue/migration approvals. The normal onboard path also supplies
+  // core CT approvals independently; buildConfigureCalls de-duplicates them.
+  const approvals: SafeTokenApproval[] = []
   for (const s of sides) {
     if (s.asset.toLowerCase() === NATIVE_ASSET) continue
     approvals.push({ token: s.asset, spender: market.sfpm })
@@ -1133,10 +1164,11 @@ async function finalizeDeployment(args: {
   botKey: `0x${string}`
   keystorePath?: string
   poolId: bigint
+  collateralApprovals: SafeTokenApproval[]
   envPath: string
   prompter: Prompter
 }): Promise<void> {
-  const { state, botKey, keystorePath, poolId, envPath, prompter } = args
+  const { state, botKey, keystorePath, poolId, collateralApprovals, envPath, prompter } = args
   const chain = defineBotChain(state.chainId, state.rpcUrl)
   const publicClient = createPublicClient({ chain, transport: http(state.rpcUrl) })
   const botAccount = privateKeyToAccount(botKey)
@@ -1185,6 +1217,7 @@ async function finalizeDeployment(args: {
       poolAddress: state.poolAddress,
       poolId,
       extraRoles: toExtraRoleSpecs(state),
+      collateralApprovals,
       sfpmSwap: sfpmSwap?.configure,
       saltNonce: BigInt(state.saltNonce),
       // Persist the modifier address as soon as it lands, for a clean resume.
@@ -1209,6 +1242,7 @@ async function finalizeDeployment(args: {
       addresses,
       saltNonce: BigInt(state.saltNonce),
       extraRoles: toExtraRoleSpecs(state),
+      collateralApprovals,
       sfpmSwap: sfpmSwap?.configure,
       finalSafeOwner: state.finalSafeOwner,
       known: { safeAddress: state.safeAddress, rolesModifierAddress: state.rolesModifierAddress },
@@ -1264,6 +1298,7 @@ async function finalizeDeployment(args: {
     DRY_RUN: state.dryRun,
     UNISWAP_LP_OWNER: state.uniswapLpOwner,
     HEDGE_INCLUDE_LP: state.hedgeIncludeLp,
+    HEDGE_WALLET_BALANCES: state.hedgeWalletBalances,
     DELEVERAGER_ENABLED: deleveragerSpec ? true : undefined,
     ...sfpmSwap?.env,
   }

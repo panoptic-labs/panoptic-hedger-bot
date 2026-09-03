@@ -237,6 +237,7 @@ export async function gatherStatus(ctx: StatusDiagnosticsContext): Promise<Statu
       pool: snapshot.pool,
       collateral: snapshot.collateral,
       walletBalances: snapshot.walletBalances,
+      includeWalletBalances: config.HEDGE_WALLET_BALANCES,
       signalTick,
       assetIndex: config.ASSET_INDEX as 0n | 1n,
       deltaThresholdBps: config.DELTA_THRESHOLD_BPS,

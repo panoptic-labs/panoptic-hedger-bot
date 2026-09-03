@@ -41,6 +41,8 @@ describe('renderEnvFile', () => {
     expect(cfg.DRY_RUN).toBe(true)
     expect(cfg.HEDGE_VENUE).toBe('in-pool')
     expect(cfg.TIMED_HEDGE_INTERVAL_MS).toBe(14_400_000)
+    expect(cfg.HEDGE_WALLET_BALANCES).toBe(false)
+    expect(body).toContain('HEDGE_WALLET_BALANCES=false')
   })
 
   it('omits undefined optional fields', () => {

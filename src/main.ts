@@ -400,6 +400,7 @@ async function main(): Promise<void> {
     deltaThresholdBps: config.DELTA_THRESHOLD_BPS,
     deltaOffsetBps: config.DELTA_OFFSET_BPS,
     includeLp: config.HEDGE_INCLUDE_LP,
+    includeWalletBalances: config.HEDGE_WALLET_BALANCES,
   })
   const accountEventMonitor = new AccountEventMonitor(
     publicClient,

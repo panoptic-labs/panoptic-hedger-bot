@@ -27,6 +27,7 @@ export interface EnvValues {
   DELTA_OFFSET_BPS?: number
   MAX_HEDGE_SLOTS?: number
   SLIPPAGE_BPS?: number
+  HEDGE_WALLET_BALANCES?: boolean
   // Price signal
   PRICE_SIGNAL_SOURCE?: string
   // Hedge venue
@@ -111,6 +112,7 @@ export function renderEnvFile(values: EnvValues): string {
         { key: 'DELTA_OFFSET_BPS', value: values.DELTA_OFFSET_BPS },
         { key: 'MAX_HEDGE_SLOTS', value: values.MAX_HEDGE_SLOTS },
         { key: 'SLIPPAGE_BPS', value: values.SLIPPAGE_BPS },
+        { key: 'HEDGE_WALLET_BALANCES', value: values.HEDGE_WALLET_BALANCES ?? false },
       ],
     },
     {

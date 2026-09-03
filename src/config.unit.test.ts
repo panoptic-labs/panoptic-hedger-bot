@@ -30,6 +30,13 @@ describe('parseHedgerBotConfig', () => {
     expect(cfg.ORACLE_POKE_ENABLED).toBe(false)
     expect(cfg.DRY_RUN).toBe(false)
     expect(cfg.SFPM_SWAP_PROVISIONED).toBe(false)
+    expect(cfg.HEDGE_WALLET_BALANCES).toBe(false)
+  })
+
+  it('allows explicit wallet-balance hedging opt-in', () => {
+    expect(
+      parseHedgerBotConfig({ ...BASE_ENV, HEDGE_WALLET_BALANCES: 'true' }).HEDGE_WALLET_BALANCES,
+    ).toBe(true)
   })
 
   it('requires explicit SFPM provisioning before execution can be enabled', () => {

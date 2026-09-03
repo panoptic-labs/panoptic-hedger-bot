@@ -75,8 +75,8 @@ describe('computeHedgePlan — collateral delta', () => {
     expect(plan.intent.skippedCollidingTokenIds).toEqual([])
   })
 
-  it('includes loose Safe balance on the vault-asset side', () => {
-    const plan = computeHedgePlan({
+  const planWithWalletBalance = (includeWalletBalances?: boolean) =>
+    computeHedgePlan({
       pool: {
         currentTick: 0n,
         poolId: 1n,
@@ -91,6 +91,7 @@ describe('computeHedgePlan — collateral delta', () => {
         token0: { token: 20n, native: 30n, total: 50n },
         token1: { token: 9_000n, native: 0n, total: 9_000n },
       },
+      includeWalletBalances,
       signalTick: 0n,
       assetIndex: 0n,
       deltaThresholdBps: 200n,
@@ -101,8 +102,22 @@ describe('computeHedgePlan — collateral delta', () => {
       hedgePositions: [],
     })
 
+  it('excludes loose Safe balances from delta by default', () => {
+    const plan = planWithWalletBalance()
+
     expect(plan.breakdown.walletToken0Assets).toBe(50n)
     expect(plan.breakdown.walletToken1Assets).toBe(9_000n)
+    expect(plan.breakdown.walletBalancesIncluded).toBe(false)
+    expect(plan.breakdown.collateralDelta).toBe(10n)
+    expect(plan.netDelta).toBe(10n)
+  })
+
+  it('includes loose Safe balances only when explicitly enabled', () => {
+    const plan = planWithWalletBalance(true)
+
+    expect(plan.breakdown.walletToken0Assets).toBe(50n)
+    expect(plan.breakdown.walletToken1Assets).toBe(9_000n)
+    expect(plan.breakdown.walletBalancesIncluded).toBe(true)
     expect(plan.breakdown.collateralDelta).toBe(60n)
     expect(plan.netDelta).toBe(60n)
   })

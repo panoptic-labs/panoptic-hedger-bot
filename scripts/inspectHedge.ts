@@ -104,6 +104,7 @@ export async function runHedgeInspection(config: HedgerBotConfig): Promise<Hedge
     pool: snapshot.pool,
     collateral: snapshot.collateral,
     walletBalances: snapshot.walletBalances,
+    includeWalletBalances: config.HEDGE_WALLET_BALANCES,
     signalTick: signal.tick,
     assetIndex: config.ASSET_INDEX as 0n | 1n,
     deltaThresholdBps: config.DELTA_THRESHOLD_BPS,
@@ -122,6 +123,7 @@ export async function runHedgeInspection(config: HedgerBotConfig): Promise<Hedge
     deltaThresholdBps: config.DELTA_THRESHOLD_BPS,
     deltaOffsetBps: config.DELTA_OFFSET_BPS,
     includeLp: config.HEDGE_INCLUDE_LP,
+    includeWalletBalances: config.HEDGE_WALLET_BALANCES,
   }).refresh(snapshot)
 
   // ---- Step-by-step delta breakdown (vault-asset frame) --------------------
@@ -153,7 +155,8 @@ export async function runHedgeInspection(config: HedgerBotConfig): Promise<Hedge
     `collateral      token0.assets=${b.collateralToken0Assets}  token1.assets=${b.collateralToken1Assets}`,
   )
   console.log(
-    `safe wallet     token0.assets=${b.walletToken0Assets}  token1.assets=${b.walletToken1Assets}`,
+    `safe wallet     token0.assets=${b.walletToken0Assets}  token1.assets=${b.walletToken1Assets}  ` +
+      `(${b.walletBalancesIncluded ? 'applied' : 'observed, not applied (HEDGE_WALLET_BALANCES=false)'})`,
   )
   console.log(`collateralDelta (asset-side, vault frame)            = ${h(b.collateralDelta)}`)
   const lpCount = snapshot.lp?.positions.length ?? 0

@@ -9,6 +9,8 @@ const MODIFIER = '0x3333333333333333333333333333333333333333'
 const BOT = '0x4444444444444444444444444444444444444444'
 const POOL = '0x5555555555555555555555555555555555555555'
 const HANDLER = '0x6666666666666666666666666666666666666666'
+const ASSET = '0x8888888888888888888888888888888888888888'
+const COLLATERAL_TRACKER = '0x9999999999999999999999999999999999999999'
 const ROLE = `0x${'77'.repeat(32)}` as `0x${string}`
 
 const safeConfigurationAbi = [
@@ -34,6 +36,18 @@ const safeConfigurationAbi = [
     stateMutability: 'nonpayable',
     inputs: [{ name: 'handler', type: 'address' }],
     outputs: [],
+  },
+] as const
+const erc20ApproveAbi = [
+  {
+    type: 'function',
+    name: 'approve',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'spender', type: 'address' },
+      { name: 'amount', type: 'uint256' },
+    ],
+    outputs: [{ type: 'bool' }],
   },
 ] as const
 
@@ -79,6 +93,25 @@ describe('Safe onboarding configuration', () => {
     ).toEqual({
       functionName: 'setFallbackHandler',
       args: [HANDLER],
+    })
+  })
+
+  it('adds collateral tracker approval to the Safe configure batch', () => {
+    const calls = buildConfigureCalls({
+      safeAddress: SAFE,
+      rolesModifierAddress: MODIFIER,
+      botAddress: BOT,
+      roleKey: ROLE,
+      poolAddress: POOL,
+      collateralApprovals: [{ token: ASSET, spender: COLLATERAL_TRACKER }],
+      includeEnableModule: false,
+    })
+    const approval = calls.find((call) => call.to === ASSET)
+    if (approval === undefined) throw new Error('expected collateral approval call')
+
+    expect(decodeFunctionData({ abi: erc20ApproveAbi, data: approval.data })).toEqual({
+      functionName: 'approve',
+      args: [COLLATERAL_TRACKER, (1n << 256n) - 1n],
     })
   })
 })

@@ -274,6 +274,8 @@ export interface ComputeHedgePlanDeps {
   collateral: HedgeSnapshot['collateral']
   /** Loose collateral assets held by the Safe at the snapshot block. */
   walletBalances?: SafeWalletBalances
+  /** Apply loose Safe wallet balances to net delta. Defaults to false. */
+  includeWalletBalances?: boolean
   /** Reference tick used to choose a collision-free loan strike. */
   signalTick: bigint
   assetIndex: 0n | 1n
@@ -313,7 +315,9 @@ export interface HedgeDeltaBreakdown {
   /** Loose Safe balances, with ETH + WETH combined on a native side. */
   walletToken0Assets: bigint
   walletToken1Assets: bigint
-  /** Asset-side CT + loose-wallet collateral in the vault frame. */
+  /** Whether loose Safe wallet balances were applied to collateralDelta. */
+  walletBalancesIncluded: boolean
+  /** Asset-side CT collateral, plus loose wallet assets only when opted in. */
   collateralDelta: bigint
   /** Delta of same-pair Uniswap LP positions (vault-asset frame). */
   lpDelta: bigint
@@ -342,6 +346,7 @@ export type ComputeHedgeExposureDeps = Pick<
   | 'pool'
   | 'collateral'
   | 'walletBalances'
+  | 'includeWalletBalances'
   | 'assetIndex'
   | 'positions'
   | 'hedgePositions'
@@ -361,6 +366,7 @@ export interface HedgeExposure {
   lpDelta: bigint
   lpIncluded: boolean
   walletBalances: SafeWalletBalances
+  walletBalancesIncluded: boolean
 }
 
 /** Pure exposure calculation shared by authoritative planning and the fast price monitor. */
@@ -373,8 +379,9 @@ export function computeHedgeExposure(deps: ComputeHedgeExposureDeps): HedgeExpos
   const walletBalances = deps.walletBalances ?? EMPTY_SAFE_WALLET_BALANCES
   const walletAssetSide =
     assetIndex === 0n ? walletBalances.token0.total : walletBalances.token1.total
+  const walletBalancesIncluded = deps.includeWalletBalances === true
   const collateralDelta = toVaultFrameAtTick(
-    collateralAssetSide + walletAssetSide,
+    collateralAssetSide + (walletBalancesIncluded ? walletAssetSide : 0n),
     assetIndex,
     assetIndex,
     markTick,
@@ -447,6 +454,7 @@ export function computeHedgeExposure(deps: ComputeHedgeExposureDeps): HedgeExpos
     lpDelta,
     lpIncluded,
     walletBalances,
+    walletBalancesIncluded,
   }
 }
 
@@ -473,6 +481,7 @@ export function computeHedgePlan(deps: ComputeHedgePlanDeps): HedgePlan {
     lpDelta,
     lpIncluded,
     walletBalances,
+    walletBalancesIncluded,
   } = exposure
 
   const plan = planHedge(netDelta, H_short, H_long, hedgeItems, portfolioSize, {
@@ -529,6 +538,7 @@ export function computeHedgePlan(deps: ComputeHedgePlanDeps): HedgePlan {
     collateralToken1Assets: collateral.token1.assets,
     walletToken0Assets: walletBalances.token0.total,
     walletToken1Assets: walletBalances.token1.total,
+    walletBalancesIncluded,
     collateralDelta,
     lpDelta,
     lpIncluded,

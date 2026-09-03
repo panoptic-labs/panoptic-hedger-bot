@@ -198,6 +198,9 @@ const rawEnvSchema = z
     // 100 bps maps conservatively to a ±100 tick execution band for in-pool loans.
     SLIPPAGE_BPS: boundedInteger(0, 500, 100),
     MIN_MARGIN_RESERVE_BPS: boundedBigint(500n, 9_000n, 2_000n),
+    // Loose Safe balances are visible in diagnostics but excluded from hedge
+    // delta unless the operator explicitly opts in.
+    HEDGE_WALLET_BALANCES: booleanSchema.default('false'),
 
     // Emergency deleverager (optional, opt-in; see README). When enabled the bot
     // EOA holds a second, burn-only role key on the same Roles modifier and
