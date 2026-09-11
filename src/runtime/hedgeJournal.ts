@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 
 import type { Address, Hex, PublicClient } from 'viem'
-import { getAddress, isHex, TransactionReceiptNotFoundError } from 'viem'
+import { getAddress, isHex, TransactionNotFoundError, TransactionReceiptNotFoundError } from 'viem'
 import { z } from 'zod'
 
 import type { HedgeAction } from '../executor/types'
@@ -44,6 +44,7 @@ const journalIntentSchema = z
       .nullable(),
     submittedAtBlock: tokenIdSchema.nullable(),
     broadcastAttempts: z.number().int().nonnegative(),
+    rejectedBroadcastAttempts: z.number().int().nonnegative().default(0),
     hashes: hexSchema.array().max(32),
     status: z.enum(['pending', 'confirmed']),
     confirmedHash: z
@@ -69,7 +70,10 @@ const journalSchema = z
   })
   .strict()
 
-const v2IntentSchema = journalIntentSchema.omit({ broadcastAttempts: true })
+const v2IntentSchema = journalIntentSchema.omit({
+  broadcastAttempts: true,
+  rejectedBroadcastAttempts: true,
+})
 const v2JournalSchema = z
   .object({
     version: z.literal(2),
@@ -109,6 +113,7 @@ function migrateV2Intent(entry: z.infer<typeof v2IntentSchema>) {
     // v2 only persisted transaction identity after sendTransaction returned,
     // so any identified transaction must be treated as already attempted.
     broadcastAttempts: entry.submittedAtBlock === null ? 0 : 1,
+    rejectedBroadcastAttempts: 0,
   }
 }
 
@@ -135,6 +140,7 @@ export interface HeldIntent {
   lastHash: Hex | null
   blocksSinceSubmit: bigint
   blocksRemaining: bigint
+  recoveryState: string
 }
 
 export interface RecoveryReport {
@@ -148,6 +154,12 @@ export interface RecoverOptions {
    * recheck so a transient reorg-probe failure cannot fail a cycle.
    */
   scope?: 'full' | 'pending'
+  /**
+   * Independently queried RPC clients used only for transaction-presence
+   * confirmation. The canonical client is used when none are supplied; adding
+   * a fallback strengthens the evidence without making it a compatibility gate.
+   */
+  mempoolObservers?: readonly HedgeRecoveryClient[]
 }
 
 export interface HedgeRecoveryClient {
@@ -161,6 +173,8 @@ export interface HedgeRecoveryClient {
     to: Address | null
     status: 'success' | 'reverted'
   }>
+  /** Finds both pending and mined transactions; unknown hashes throw TransactionNotFoundError. */
+  getTransaction(args: { hash: Hex }): Promise<unknown>
   getTransactionCount(address: Address): Promise<number>
 }
 
@@ -169,6 +183,7 @@ export function createHedgeRecoveryClient(publicClient: PublicClient): HedgeReco
     getBlockNumber: () => publicClient.getBlockNumber(),
     getBlock: (args) => publicClient.getBlock(args),
     getTransactionReceipt: (args) => publicClient.getTransactionReceipt(args),
+    getTransaction: (args) => publicClient.getTransaction(args),
     getTransactionCount: (address) =>
       publicClient.getTransactionCount({ address, blockTag: 'latest' }),
   }
@@ -178,6 +193,7 @@ export interface HedgeJournalPort {
   begin(action: HedgeJournalAction): string
   observeTransaction(update: JournalTransactionUpdate): void
   recordBroadcastAttempt(): void
+  recordBroadcastRejection(): void
   confirm(receipt: { transactionHash: Hex; blockNumber: bigint; blockHash: Hex }): void
   fail(): void
   recover(publicClient: HedgeRecoveryClient, options?: RecoverOptions): Promise<RecoveryReport>
@@ -201,6 +217,10 @@ export function hedgeJournalPath(): string {
 export class HedgeJournal implements HedgeJournalPort {
   private data: JournalData
   private activeIntentId: string | null = null
+  /** First all-absent quorum observation; deliberately resets on process restart. */
+  private readonly absentAtBlock = new Map<string, bigint>()
+  /** Avoid repeating the same ambiguous-broadcast warning on every recovery poll. */
+  private readonly warnedFencedIntents = new Set<string>()
   private readonly confirmedRecheckBlocks: bigint
   private readonly nonceStallBlocks: bigint
 
@@ -209,7 +229,7 @@ export class HedgeJournal implements HedgeJournalPort {
     options: { confirmedRecheckBlocks?: bigint; nonceStallBlocks?: bigint } = {},
   ) {
     this.confirmedRecheckBlocks = options.confirmedRecheckBlocks ?? 64n
-    this.nonceStallBlocks = options.nonceStallBlocks ?? 64n
+    this.nonceStallBlocks = options.nonceStallBlocks ?? 8n
     const existing = readSecureJson(hedgeJournalPath(), journalFileSchema, {
       maxBytes: 256 * 1024,
       invalid: 'throw',
@@ -273,6 +293,7 @@ export class HedgeJournal implements HedgeJournalPort {
       calldataHash: null,
       submittedAtBlock: null,
       broadcastAttempts: 0,
+      rejectedBroadcastAttempts: 0,
       hashes: [],
       status: 'pending',
       confirmedHash: null,
@@ -326,6 +347,16 @@ export class HedgeJournal implements HedgeJournalPort {
     this.persist()
   }
 
+  recordBroadcastRejection(): void {
+    const entry = this.activeIntent()
+    const recordedOutcomes = entry.hashes.length + entry.rejectedBroadcastAttempts
+    if (recordedOutcomes >= entry.broadcastAttempts) {
+      throw new Error('broadcast rejection has no unresolved attempt')
+    }
+    entry.rejectedBroadcastAttempts += 1
+    this.persist()
+  }
+
   confirm(receipt: { transactionHash: Hex; blockNumber: bigint; blockHash: Hex }): void {
     const entry = this.activeIntent()
     const transactionHash = receipt.transactionHash.toLowerCase()
@@ -336,6 +367,8 @@ export class HedgeJournal implements HedgeJournalPort {
     entry.confirmedHash = transactionHash
     entry.blockNumber = receipt.blockNumber.toString()
     entry.blockHash = receipt.blockHash.toLowerCase()
+    this.absentAtBlock.delete(entry.id)
+    this.warnedFencedIntents.delete(entry.id)
     this.activeIntentId = null
     this.pruneTerminalIntents(receipt.blockNumber)
     this.persist()
@@ -344,6 +377,8 @@ export class HedgeJournal implements HedgeJournalPort {
   fail(): void {
     const entry = this.activeIntent()
     this.data.intents = this.data.intents.filter((candidate) => candidate.id !== entry.id)
+    this.absentAtBlock.delete(entry.id)
+    this.warnedFencedIntents.delete(entry.id)
     this.activeIntentId = null
     this.persist()
   }
@@ -463,18 +498,13 @@ export class HedgeJournal implements HedgeJournalPort {
         this.fail()
         continue
       }
+
       const submittedAt =
         entry.submittedAtBlock === null ? latestBlock : BigInt(entry.submittedAtBlock)
       const blocksSinceSubmit = latestBlock > submittedAt ? latestBlock - submittedAt : 0n
-      if (blocksSinceSubmit < this.nonceStallBlocks) {
-        // Nonce slot still open and it's too early to declare the send lost.
-        // Keep the entry pending; per-cycle recovery re-evaluates it until the
-        // wait exceeds the stall window.
-        botLog(
-          `[hedger-bot] pending intent ${entry.id} (action=${entry.action}, nonce=${entry.nonce}) ` +
-            `still legitimately in flight (chainNonce=${chainNonce}, blocksSinceSubmit=` +
-            `${blocksSinceSubmit}); keeping pending`,
-        )
+      const blocksRemaining =
+        blocksSinceSubmit < this.nonceStallBlocks ? this.nonceStallBlocks - blocksSinceSubmit : 0n
+      const hold = (recoveryState: string) => {
         held.push({
           id: entry.id,
           action: entry.action,
@@ -482,17 +512,106 @@ export class HedgeJournal implements HedgeJournalPort {
           lastHash:
             entry.hashes.length > 0 ? checkedHex(entry.hashes[entry.hashes.length - 1]) : null,
           blocksSinceSubmit,
-          blocksRemaining: this.nonceStallBlocks - blocksSinceSubmit,
+          blocksRemaining,
+          recoveryState,
         })
+      }
+      if (blocksSinceSubmit < this.nonceStallBlocks) {
+        botLog(
+          `[hedger-bot] pending intent ${entry.id} (action=${entry.action}, nonce=${entry.nonce}) ` +
+            `still legitimately in flight (chainNonce=${chainNonce}, blocksSinceSubmit=` +
+            `${blocksSinceSubmit}); keeping pending`,
+        )
+        hold('inside recovery window')
         continue
       }
-      botWarn(
-        `[hedger-bot] pending intent ${entry.id} (action=${entry.action}, nonce=${entry.nonce}) ` +
-          `and all fee-bumped replacements dropped from mempool ` +
-          `(chainNonce=${chainNonce}, blocksSinceSubmit=${blocksSinceSubmit}); auto-failing`,
+
+      // Once the recovery boundary is reached, an open nonce is released only
+      // after every known hash is absent from every configured RPC observer in
+      // two observations at distinct block heights. A fallback observer
+      // strengthens this evidence, but legacy single-RPC deployments retain the
+      // same two-observation recovery. Any visibility resets the absence proof.
+      const recordedOutcomes = entry.hashes.length + entry.rejectedBroadcastAttempts
+      if (recordedOutcomes !== entry.broadcastAttempts) {
+        this.absentAtBlock.delete(entry.id)
+        if (!this.warnedFencedIntents.has(entry.id)) {
+          this.warnedFencedIntents.add(entry.id)
+          botWarn(
+            `[hedger-bot] pending intent ${entry.id} (action=${entry.action}, nonce=${entry.nonce}) ` +
+              `passed the recovery boundary but a broadcast hash was not durably recorded; ` +
+              `keeping the nonce fenced for operator review`,
+          )
+        }
+        hold('ambiguous broadcast without a durable hash')
+        continue
+      }
+
+      const configuredObservers = options.mempoolObservers
+      const observers = [
+        ...new Set(
+          configuredObservers && configuredObservers.length > 0
+            ? configuredObservers
+            : [publicClient],
+        ),
+      ]
+
+      const observations = await Promise.all(
+        observers.map(async (observer) => {
+          const [blockNumber, transactions] = await Promise.all([
+            observer.getBlockNumber(),
+            Promise.all(
+              entry.hashes.map((hash) => {
+                if (!isHex(hash)) throw new Error('invalid transaction hash in hedge journal')
+                return observer.getTransaction({ hash }).catch((error) => {
+                  if (error instanceof TransactionNotFoundError) return null
+                  throw error
+                })
+              }),
+            ),
+          ])
+          return {
+            blockNumber,
+            anyVisible: transactions.some((transaction) => transaction !== null),
+          }
+        }),
       )
-      this.activeIntentId = entry.id
-      this.fail()
+      const visibleObservers = observations.filter((observation) => observation.anyVisible).length
+      if (visibleObservers > 0) {
+        this.absentAtBlock.delete(entry.id)
+        botLog(
+          `[hedger-bot] pending intent ${entry.id} (action=${entry.action}, nonce=${entry.nonce}) ` +
+            `remains visible to ${visibleObservers}/${observers.length} RPC mempools; keeping ` +
+            `the nonce fenced`,
+        )
+        hold('transaction remains visible to an RPC observer')
+        continue
+      }
+
+      const quorumBlock = observations.reduce(
+        (lowest, observation) =>
+          observation.blockNumber < lowest ? observation.blockNumber : lowest,
+        observations[0]?.blockNumber ?? latestBlock,
+      )
+      const priorAbsentBlock = this.absentAtBlock.get(entry.id)
+      if (priorAbsentBlock !== undefined && quorumBlock > priorAbsentBlock) {
+        botWarn(
+          `[hedger-bot] pending intent ${entry.id} (action=${entry.action}, nonce=${entry.nonce}) ` +
+            `and all recorded replacements were absent from ${observers.length} RPC mempools ` +
+            `at distinct blocks ${priorAbsentBlock} and ${quorumBlock}; releasing the nonce ` +
+            `for immediate re-plan`,
+        )
+        this.activeIntentId = entry.id
+        this.fail()
+        continue
+      }
+
+      this.absentAtBlock.set(entry.id, quorumBlock)
+      botLog(
+        `[hedger-bot] pending intent ${entry.id} (action=${entry.action}, nonce=${entry.nonce}) ` +
+          `is absent from ${observers.length} RPC mempools at block ${quorumBlock}; waiting for ` +
+          `a later block before releasing the nonce`,
+      )
+      hold(`first mempool absence observed at block ${quorumBlock}`)
     }
     this.pruneTerminalIntents(latestBlock)
     this.persist()

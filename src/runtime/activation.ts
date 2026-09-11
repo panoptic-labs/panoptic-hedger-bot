@@ -14,10 +14,10 @@ import { readSecureJson, removeSecureFile, writeSecureJson } from './secureFile'
 import { botVersion } from './stateFile'
 
 const ACTIVATION_SCHEMA_VERSION = 2 as const
-// v7: additionally binds the opt-in direct-EOA oracle-poke behavior.
+// v9: binds optional recovery RPC identity and the two-block/one-block fee policy.
 // Bumping this invalidates existing activation markers on purpose —
 // operators re-review and re-run `pnpm activate` after upgrading.
-export const ACTIVATION_POLICY_VERSION = 'hedger-bot-policy-v7' as const
+export const ACTIVATION_POLICY_VERSION = 'hedger-bot-policy-v9' as const
 const MAX_ACTIVATION_BYTES = 16 * 1024
 // keccak256(toHex(JSON.stringify(build<Role>DispatchConditions()))) of the
 // reviewed SDK condition trees — recompute and re-review on any builder change.
@@ -147,6 +147,7 @@ export function buildActivationPolicy(
     releaseVersion: botVersion(),
     chainId: config.CHAIN_ID,
     rpcUrl: config.RPC_URL,
+    rpcFallbackUrl: config.RPC_URL_FALLBACK ?? null,
     botAddress: canonicalAddress(botAddress),
     safeAddress: canonicalAddress(config.SAFE_ADDRESS),
     poolAddress: canonicalAddress(config.POOL_ADDRESS),
@@ -214,7 +215,8 @@ export function buildActivationPolicy(
       minKeeperBalanceEth: config.MIN_KEEPER_BALANCE_ETH.toString(),
       keeperBalanceWarnEth: config.KEEPER_BALANCE_WARN_ETH.toString(),
       receiptTimeoutMs: config.TX_RECEIPT_TIMEOUT_MS,
-      bumpIntervalMs: config.TX_BUMP_INTERVAL_MS,
+      firstReplacementBlockDelay: 2,
+      replacementCadenceBlocks: 1,
     },
     pollIntervalMs: config.POLL_INTERVAL_MS,
     oraclePokeEnabled: config.ORACLE_POKE_ENABLED,

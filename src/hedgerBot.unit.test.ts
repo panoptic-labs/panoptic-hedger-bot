@@ -288,6 +288,7 @@ async function makeBot(
       begin: vi.fn(() => '00000000-0000-4000-8000-000000000001'),
       observeTransaction: vi.fn(),
       recordBroadcastAttempt: vi.fn(),
+      recordBroadcastRejection: vi.fn(),
       confirm: vi.fn(),
       fail: vi.fn(),
       recover: vi.fn(async () => ({ held: [] })),
@@ -915,6 +916,7 @@ describe('HedgerBot off-venue transaction journal', () => {
       }),
       observeTransaction: vi.fn(),
       recordBroadcastAttempt: vi.fn(),
+      recordBroadcastRejection: vi.fn(),
       confirm: vi.fn((receipt) => order.push(`confirm:${receipt.transactionHash}`)),
       fail: vi.fn(),
       recover: vi.fn(async () => ({ held: [] })),
@@ -1081,6 +1083,7 @@ describe('HedgerBot off-venue transaction journal', () => {
         .mockReturnValueOnce('00000000-0000-4000-8000-000000000002'),
       observeTransaction: vi.fn(),
       recordBroadcastAttempt: vi.fn(),
+      recordBroadcastRejection: vi.fn(),
       confirm: vi.fn(),
       fail: vi.fn(),
       recover: vi.fn(async () => ({ held: [] })),
@@ -1168,6 +1171,7 @@ describe('HedgerBot off-venue transaction journal', () => {
       begin: vi.fn(() => swapIntentId),
       observeTransaction: vi.fn(),
       recordBroadcastAttempt: vi.fn(),
+      recordBroadcastRejection: vi.fn(),
       confirm: vi.fn(() => {
         checkpoint = {
           intentId: swapIntentId,
@@ -1248,6 +1252,7 @@ describe('HedgerBot hedge classification', () => {
           begin: vi.fn(),
           observeTransaction: vi.fn(),
           recordBroadcastAttempt: vi.fn(),
+          recordBroadcastRejection: vi.fn(),
           confirm: vi.fn(),
           fail: vi.fn(),
           recover: vi.fn(async () => ({ held: [] })),
@@ -1437,8 +1442,9 @@ describe('HedgerBot per-cycle pending intent recovery', () => {
     action: 'open' as const,
     nonce: 4,
     lastHash: `0x${'aa'.repeat(32)}` as const,
-    blocksSinceSubmit: 10n,
-    blocksRemaining: 54n,
+    blocksSinceSubmit: 6n,
+    blocksRemaining: 2n,
+    recoveryState: 'inside recovery window',
   }
 
   function journalFake(overrides: Partial<BotDeps['hedgeJournal']> = {}) {
@@ -1446,6 +1452,7 @@ describe('HedgerBot per-cycle pending intent recovery', () => {
       begin: vi.fn(() => '00000000-0000-4000-8000-000000000001'),
       observeTransaction: vi.fn(),
       recordBroadcastAttempt: vi.fn(),
+      recordBroadcastRejection: vi.fn(),
       confirm: vi.fn(),
       fail: vi.fn(),
       recover: vi.fn(async () => ({ held: [] })),

@@ -221,25 +221,33 @@ describe('fees — EIP-1559 caps', () => {
 })
 
 describe('bumped — stuck-tx replacement fees', () => {
-  it('takes prev x 1.125 when the fresh estimate is lower', async () => {
+  it('takes prev x 1.25 when the fresh estimate is lower', async () => {
     const { policy } = makePolicy({ baseFee: parseGwei('1'), priorityFee: parseGwei('0.001') })
     const next = await policy.bumped({
       maxFeePerGas: parseGwei('100'),
       maxPriorityFeePerGas: parseGwei('2'),
     })
     expect(next).toEqual({
-      maxFeePerGas: parseGwei('112.5'),
-      maxPriorityFeePerGas: parseGwei('2.25'),
+      maxFeePerGas: parseGwei('125'),
+      maxPriorityFeePerGas: parseGwei('2.5'),
     })
   })
 
-  it('takes the fresh estimate when the basefee ran past prev x 1.125', async () => {
+  it('rounds the 25% replacement increase upward', async () => {
+    const { policy } = makePolicy({ baseFee: null })
+    expect(await policy.bumped({ maxFeePerGas: 5n, maxPriorityFeePerGas: 1n })).toEqual({
+      maxFeePerGas: 7n,
+      maxPriorityFeePerGas: 2n,
+    })
+  })
+
+  it('takes the fresh estimate when the basefee ran past prev x 1.25', async () => {
     const { policy } = makePolicy({ baseFee: parseGwei('100'), priorityFee: parseGwei('0.1') })
     const next = await policy.bumped({
       maxFeePerGas: parseGwei('10'),
       maxPriorityFeePerGas: parseGwei('0.001'),
     })
-    // fresh maxFee = 2x100 + 0.1 = 200.1 > 10 x 1.125
+    // fresh maxFee = 2x100 + 0.1 = 200.1 > 10 x 1.25
     expect(next?.maxFeePerGas).toBe(parseGwei('200.1'))
     expect(next?.maxPriorityFeePerGas).toBe(parseGwei('0.1'))
   })
@@ -262,13 +270,15 @@ describe('bumped — stuck-tx replacement fees', () => {
     expect(next?.maxPriorityFeePerGas).toBe(parseGwei('1'))
   })
 
-  it('returns null once the bump would exceed MAX_FEE_GWEI', async () => {
-    const { policy } = makePolicy({ baseFee: parseGwei('30') })
+  it('alerts immediately once the bump would exceed MAX_FEE_GWEI', async () => {
+    const { policy, notify } = makePolicy({ baseFee: parseGwei('30') })
     const next = await policy.bumped({
       maxFeePerGas: parseGwei('400'), // already at the cap
       maxPriorityFeePerGas: parseGwei('2'),
     })
     expect(next).toBeNull()
+    expect(notify).toHaveBeenCalledOnce()
+    expect(notify).toHaveBeenCalledWith(expect.stringMatching(/replacement fee cap reached/))
   })
 
   it('clamps the tip to the bumped maxFee', async () => {

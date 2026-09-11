@@ -136,6 +136,7 @@ const noopJournal: HedgeJournalPort = {
   begin: () => 'noop-intent',
   observeTransaction: () => {},
   recordBroadcastAttempt: () => {},
+  recordBroadcastRejection: () => {},
   confirm: () => {},
   fail: () => {},
   recover: async () => ({ held: [] }),
@@ -428,7 +429,6 @@ describe('hedger-bot deleverager end-to-end (mainnet fork)', () => {
       DRY_RUN: false,
       URGENT_DRIFT_MULTIPLIER: 3,
       TX_RECEIPT_TIMEOUT_MS: 60_000,
-      TX_BUMP_INTERVAL_MS: 30_000,
       SIGNAL_TICK_SANITY_MAX: 100_000,
     } as unknown as HedgerBotConfig
 
@@ -446,10 +446,11 @@ describe('hedger-bot deleverager end-to-end (mainnet fork)', () => {
       chain: mainnet,
       fees: () => openGasPolicy.fees(),
       bumpFees: () => openGasPolicy.bumped(),
-      txWait: { timeoutMs: 60_000, bumpIntervalMs: 30_000 },
+      txWait: { timeoutMs: 60_000 },
       observeTransaction: () => {},
       assertSendAllowed: () => {},
       recordBroadcastAttempt: () => {},
+      recordBroadcastRejection: () => {},
     }
     const loanRolesExecutor = createRolesExecutor({ ...rolesExecutorDeps, roleKey: loanRoleKey })
     const delevRolesExecutor = createRolesExecutor({

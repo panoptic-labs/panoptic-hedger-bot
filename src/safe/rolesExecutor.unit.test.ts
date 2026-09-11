@@ -46,6 +46,7 @@ function makeDeps(overrides: Partial<RolesExecutorDeps> = {}): RolesExecutorDeps
     safeAddress: SAFE,
     observeTransaction: vi.fn(),
     recordBroadcastAttempt: vi.fn(),
+    recordBroadcastRejection: vi.fn(),
     assertSendAllowed: vi.fn(),
     ...overrides,
     publicClient,
@@ -156,8 +157,8 @@ describe('RolesExecutor.send — confirm-with-escalation', () => {
   const FEES_B = { maxFeePerGas: 200n, maxPriorityFeePerGas: 2n }
   const NONCE = 7
   const GAS = 123_456n
-  // Virtual-clock timings: budget 90, bump every 30, receipt poll every 10.
-  const TX_WAIT = { timeoutMs: 90, bumpIntervalMs: 30, pollIntervalMs: 10 }
+  // Virtual clock: a block every 10ms, receipt budget 90ms, poll every 10ms.
+  const TX_WAIT = { timeoutMs: 90, pollIntervalMs: 10 }
 
   /**
    * Escalation harness on a virtual clock (now/sleep injected): sendTransaction
@@ -172,11 +173,15 @@ describe('RolesExecutor.send — confirm-with-escalation', () => {
     /** Sequential bumpFees results; an Error entry is thrown instead. */
     bumpQueue?: (typeof FEES_A | null | Error)[]
     fees?: typeof FEES_A
+    blockAt?: (timeMs: number, callIndex: number) => bigint
+    txWait?: typeof TX_WAIT
   }) {
     let t = 0
+    const sendTimes: number[] = []
     const mineTimes = new Map<string, number>()
     let attempt = 0
     const sendTransaction = vi.fn(async (_args: Record<string, unknown>) => {
+      sendTimes.push(t)
       const i = attempt++
       const err = opts.sendErrors?.[i]
       if (err) throw err
@@ -197,24 +202,38 @@ describe('RolesExecutor.send — confirm-with-escalation', () => {
       if (next instanceof Error) throw next
       return next === undefined ? null : next
     })
+    let blockLookupIndex = 0
     const deps = makeDeps({
       publicClient: {
         getTransactionCount: vi.fn(async () => NONCE),
-        getBlockNumber: vi.fn(async () => 123n),
+        getBlockNumber: vi.fn(async () => {
+          const callIndex = blockLookupIndex
+          blockLookupIndex += 1
+          return opts.blockAt?.(t, callIndex) ?? 123n + BigInt(Math.floor(t / 10))
+        }),
         estimateGas: vi.fn(async () => GAS),
         getTransactionReceipt,
       } as never,
       walletClient: { sendTransaction, chain: null } as never,
       fees,
       bumpFees,
-      txWait: TX_WAIT,
+      txWait: opts.txWait ?? TX_WAIT,
       now: () => t,
       sleep: async (ms: number) => {
         t += ms
       },
     })
-    return { exec: createRolesExecutor(deps), sendTransaction, fees, bumpFees, deps }
+    return { exec: createRolesExecutor(deps), sendTransaction, sendTimes, fees, bumpFees, deps }
   }
+
+  it('waits two blocks before the first replacement, then escalates every block', async () => {
+    const { exec, sendTimes } = makeHarness({
+      bumpQueue: [FEES_B, FEES_B, FEES_B, FEES_B, FEES_B],
+      txWait: { timeoutMs: 70, pollIntervalMs: 5 },
+    })
+    await expect(exec.send(CALL)).rejects.toBeInstanceOf(TxNotMinedError)
+    expect(sendTimes).toEqual([0, 20, 30, 40, 50, 60])
+  })
 
   it('waits for confirmation without fee escalation when fees are unavailable', async () => {
     const sendTransaction = vi.fn().mockResolvedValue('0xhash')
@@ -281,9 +300,9 @@ describe('RolesExecutor.send — confirm-with-escalation', () => {
   })
 
   it('re-sends the SAME nonce with bumped fees when stuck, returns the mined replacement', async () => {
-    const { exec, sendTransaction, bumpFees, deps } = makeHarness({
+    const { exec, sendTransaction, sendTimes, bumpFees, deps } = makeHarness({
       bumpQueue: [FEES_B],
-      mineAt: { 1: 40 }, // replacement (sent at t=30) mines at t=40
+      mineAt: { 1: 40 }, // replacement (sent after two blocks at t=20) mines at t=40
     })
     expect((await exec.send(CALL, { urgent: true })).transactionHash).toBe('0xhash2')
     expect(sendTransaction).toHaveBeenCalledTimes(2)
@@ -292,6 +311,7 @@ describe('RolesExecutor.send — confirm-with-escalation', () => {
     expect(second.gas).toBe(GAS)
     expect(second.maxFeePerGas).toBe(FEES_B.maxFeePerGas)
     expect(second.maxPriorityFeePerGas).toBe(FEES_B.maxPriorityFeePerGas)
+    expect(sendTimes).toEqual([0, 20])
     expect(bumpFees).toHaveBeenCalledWith(FEES_A, { urgent: true })
     const markerCallOrder = vi.mocked(deps.recordBroadcastAttempt).mock.invocationCallOrder
     expect(markerCallOrder).toHaveLength(2)
@@ -328,22 +348,81 @@ describe('RolesExecutor.send — confirm-with-escalation', () => {
     expect((err as { cause?: unknown }).cause).toBeInstanceOf(Error)
   })
 
-  it("keeps waiting on sent txs when the replacement is 'underpriced'", async () => {
-    const { exec } = makeHarness({
+  it("records a rejected 'underpriced' replacement and keeps waiting on sent txs", async () => {
+    const { exec, deps } = makeHarness({
       bumpQueue: [FEES_B],
       sendErrors: { 1: new Error('replacement transaction underpriced') },
       mineAt: { 0: 45 },
     })
     expect((await exec.send(CALL)).transactionHash).toBe('0xhash1')
+    expect(deps.recordBroadcastRejection).toHaveBeenCalledOnce()
+  })
+
+  it('leaves a replacement transport failure unresolved for journal fencing', async () => {
+    const { exec, deps } = makeHarness({
+      bumpQueue: [FEES_B],
+      sendErrors: { 1: new Error('network timeout') },
+    })
+    await expect(exec.send(CALL)).rejects.toBeInstanceOf(TxNotMinedError)
+    expect(deps.recordBroadcastRejection).not.toHaveBeenCalled()
   })
 
   it('a transient bumpFees failure does not disable bumping', async () => {
     const { exec, sendTransaction } = makeHarness({
       bumpQueue: [new Error('rpc down'), FEES_B],
-      mineAt: { 1: 70 }, // replacement (sent on the SECOND bump window) mines
+      mineAt: { 1: 70 }, // replacement (sent on the next block) mines
     })
     expect((await exec.send(CALL)).transactionHash).toBe('0xhash2')
     expect(sendTransaction).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps polling receipts when escalation block lookups fail transiently', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      const { exec, sendTimes } = makeHarness({
+        bumpQueue: [FEES_B],
+        mineAt: { 1: 50 },
+        blockAt: (timeMs, callIndex) => {
+          if (callIndex === 2 || callIndex === 4) throw new Error('block RPC unavailable')
+          return 123n + BigInt(Math.floor(timeMs / 10))
+        },
+      })
+
+      expect((await exec.send(CALL)).transactionHash).toBe('0xhash2')
+      expect(sendTimes).toEqual([0, 30])
+      expect(warn).toHaveBeenCalledTimes(2)
+      expect(warn.mock.calls.every(([message]) => String(message).includes('receipt wait'))).toBe(
+        true,
+      )
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('preserves TxNotMinedError when escalation block lookups fail until the deadline', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      const { exec } = makeHarness({
+        blockAt: (timeMs, callIndex) => {
+          if (callIndex >= 2) throw new Error('block RPC unavailable')
+          return 123n + BigInt(Math.floor(timeMs / 10))
+        },
+      })
+
+      await expect(exec.send(CALL)).rejects.toBeInstanceOf(TxNotMinedError)
+      expect(warn).toHaveBeenCalled()
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('does not replace while the chain head remains in the submission block', async () => {
+    const { exec, sendTransaction } = makeHarness({
+      bumpQueue: [FEES_B],
+      blockAt: () => 123n,
+    })
+    await expect(exec.send(CALL)).rejects.toBeInstanceOf(TxNotMinedError)
+    expect(sendTransaction).toHaveBeenCalledTimes(1)
   })
 
   it('stops bumping at the fee cap and throws TxNotMinedError on budget exhaustion', async () => {

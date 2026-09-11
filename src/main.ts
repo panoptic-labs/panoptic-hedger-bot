@@ -30,7 +30,7 @@ import { resolveCexAssetOrientation } from './priceSignal/cexSource'
 import { AccountEventMonitor } from './runtime/accountEventMonitor'
 import { buildActivationEvidence, isActivated } from './runtime/activation'
 import { assertTradingEnabled, isDeactivated } from './runtime/deactivation'
-import { HedgeJournal } from './runtime/hedgeJournal'
+import { createHedgeRecoveryClient, HedgeJournal } from './runtime/hedgeJournal'
 import { formatHedgeTriggerStatus, HedgeTriggerMonitor } from './runtime/hedgeTriggerMonitor'
 import {
   type InstanceLeaseHeartbeat,
@@ -105,6 +105,20 @@ async function main(): Promise<void> {
     transport: makeTransport(),
     batch: { multicall: { wait: 16 } },
   })
+  // Recovery must distinguish independent "not found" observations from
+  // transport failover. These clients deliberately bypass makeTransport(): a
+  // successful miss on the primary must still be checked against the fallback.
+  const recoveryRpcUrls = parsed.RPC_URL_FALLBACK
+    ? [parsed.RPC_URL, parsed.RPC_URL_FALLBACK]
+    : [parsed.RPC_URL]
+  const recoveryClients = recoveryRpcUrls.map((rpcUrl) =>
+    createHedgeRecoveryClient(
+      createPublicClient({
+        chain,
+        transport: http(rpcUrl, { batch: true }),
+      }),
+    ),
+  )
   const evidence = await (async () => {
     assertProductionEligibleConfig(parsed)
     return buildActivationEvidence(publicClient, parsed)
@@ -184,10 +198,10 @@ async function main(): Promise<void> {
     bumpFees: (prev, opts) => gasPolicy.bumped(prev, opts),
     txWait: {
       timeoutMs: config.TX_RECEIPT_TIMEOUT_MS,
-      bumpIntervalMs: config.TX_BUMP_INTERVAL_MS,
     },
     observeTransaction: (update) => hedgeJournal.observeTransaction(update),
     recordBroadcastAttempt: () => hedgeJournal.recordBroadcastAttempt(),
+    recordBroadcastRejection: () => hedgeJournal.recordBroadcastRejection(),
     assertSendAllowed: () => {
       assertTradingEnabled()
       instanceLease.assertOwned()
@@ -221,10 +235,10 @@ async function main(): Promise<void> {
           bumpFees: (prev, opts) => gasPolicy.bumped(prev, opts),
           txWait: {
             timeoutMs: config.TX_RECEIPT_TIMEOUT_MS,
-            bumpIntervalMs: config.TX_BUMP_INTERVAL_MS,
           },
           observeTransaction: (update) => hedgeJournal.observeTransaction(update),
           recordBroadcastAttempt: () => hedgeJournal.recordBroadcastAttempt(),
+          recordBroadcastRejection: () => hedgeJournal.recordBroadcastRejection(),
           assertSendAllowed: () => {
             assertTradingEnabled()
             instanceLease.assertOwned()
@@ -428,6 +442,7 @@ async function main(): Promise<void> {
     notifier,
     gasPolicy,
     hedgeJournal,
+    recoveryClients,
     // Disk-backed sync checkpoints: a restart resumes the position-event scan
     // incrementally instead of re-scanning from genesis. Safe across restarts —
     // syncPositions detects reorgs against the stored checkpoint's block hash.
@@ -724,6 +739,18 @@ async function main(): Promise<void> {
         monitorHealthy: true,
         hedgeMonitorMode: observation?.status.mode,
       })
+
+      // A timed-out send needs a second mempool observation at a later block;
+      // do not make it wait for the 60-second drift retry cadence.
+      if (hedgeJournal.hasPendingIntent()) {
+        // scan() already advanced its durable cursor. Preserve an account event
+        // consumed during the pending window by invalidating the cached bands
+        // before this early return; the next observation then rebuilds them.
+        if (accountChanged) hedgeTriggerMonitor.invalidate()
+        await runAndRecord('pending-recovery')
+        return
+      }
+
       if (observation) {
         botStatus(
           `[hedger-bot] ${formatHedgeTriggerStatus(observation.status, {

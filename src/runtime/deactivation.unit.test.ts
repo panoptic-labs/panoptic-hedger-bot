@@ -15,7 +15,7 @@ import {
 
 const ACTIVATION_MARKER = {
   schemaVersion: 2,
-  policyVersion: 'hedger-bot-policy-v7',
+  policyVersion: 'hedger-bot-policy-v9',
   releaseVersion: 'test',
   activatedAt: '2026-01-01T00:00:00.000Z',
   doctorPassed: true,

@@ -49,17 +49,16 @@ export interface RolesExecutorDeps {
   fees?: (opts?: { urgent?: boolean }) => Promise<Fees | undefined>
   /**
    * Replacement-fee provider for a stuck send (gasPolicy.bumped): elementwise
-   * max(fresh estimate, prev x 1.125). Returning null means the fee cap is
+   * max(fresh estimate, ceil(prev x 1.25)). Returning null means the fee cap is
    * reached — stop bumping and wait out the remaining budget.
    */
   bumpFees?: (prev: Fees, opts?: { urgent?: boolean }) => Promise<Fees | null>
   /**
-   * Enables confirm-with-escalation in `send`: wait `bumpIntervalMs` for a
-   * receipt, then re-send the SAME nonce with bumped fees, within an overall
-   * `timeoutMs` budget. Requires `fees` + `bumpFees`; without it (or on
-   * pre-1559 chains) `send` is fire-and-forget as before.
+   * Enables confirm-with-escalation in `send`. The initial transaction gets two
+   * mined blocks before its first replacement; subsequent replacement attempts
+   * occur at most once per new block until the receipt deadline.
    */
-  txWait?: { timeoutMs: number; bumpIntervalMs: number; pollIntervalMs?: number }
+  txWait?: { timeoutMs: number; pollIntervalMs?: number }
   /** Injectable clock/sleep for tests. */
   now?: () => number
   sleep?: (ms: number) => Promise<void>
@@ -67,6 +66,8 @@ export interface RolesExecutorDeps {
   observeTransaction: (update: JournalTransactionUpdate) => void | Promise<void>
   /** Durable write-ahead marker recorded immediately before every broadcast attempt. */
   recordBroadcastAttempt: () => void | Promise<void>
+  /** Resolves the latest marker when the RPC explicitly rejects that broadcast. */
+  recordBroadcastRejection: () => void | Promise<void>
   /** Fencing/kill-switch assertion evaluated immediately before every broadcast. */
   assertSendAllowed: () => void | Promise<void>
 }
@@ -124,6 +125,14 @@ export interface RolesExecutor {
  * `success = false`.
  */
 const SHOULD_REVERT = true
+const FIRST_REPLACEMENT_BLOCK_DELAY = 2n
+
+function isExplicitBroadcastRejection(error: unknown): boolean {
+  if (isGasError(error)) return true
+  // "already known" proves that a hashless transaction may be live, so it must
+  // remain ambiguous. The other nonce errors explicitly reject this attempt.
+  return isNonceError(error) && !/already known/i.test(sanitizeError(error))
+}
 
 export function createRolesExecutor(deps: RolesExecutorDeps): RolesExecutor {
   const { publicClient, walletClient, account, rolesModifierAddress, roleKey, safeAddress, chain } =
@@ -177,6 +186,22 @@ export function createRolesExecutor(deps: RolesExecutorDeps): RolesExecutor {
 
   const now = deps.now ?? Date.now
   const sleep = deps.sleep ?? defaultSleep
+
+  async function recordBroadcastRejection(error: unknown): Promise<void> {
+    if (isExplicitBroadcastRejection(error)) await deps.recordBroadcastRejection()
+  }
+
+  async function readEscalationBlock(): Promise<bigint | null> {
+    try {
+      return await publicClient.getBlockNumber()
+    } catch (error) {
+      botWarn(
+        '[hedger-bot] escalation block lookup failed; continuing receipt wait: ' +
+          sanitizeError(error),
+      )
+      return null
+    }
+  }
 
   /**
    * Poll receipts for every attempt (newest first — the highest-fee replacement
@@ -263,6 +288,7 @@ export function createRolesExecutor(deps: RolesExecutorDeps): RolesExecutor {
         }
         return publicClient.waitForTransactionReceipt({ hash })
       } catch (err) {
+        await recordBroadcastRejection(err)
         return enrich(err, call)
       }
     }
@@ -298,8 +324,8 @@ export function createRolesExecutor(deps: RolesExecutorDeps): RolesExecutor {
     }
 
     let current = feeOverrides
-    let canBump = true
-    const deadline = now() + txWait.timeoutMs
+    const startedAt = now()
+    const deadline = startedAt + txWait.timeoutMs
     await deps.assertSendAllowed()
     await observe()
     await deps.recordBroadcastAttempt()
@@ -307,38 +333,65 @@ export function createRolesExecutor(deps: RolesExecutorDeps): RolesExecutor {
       hashes.push(await sendAttempt(current))
       await observe()
     } catch (err) {
+      await recordBroadcastRejection(err)
       // First send keeps the inner-revert decoding of the legacy path.
       return enrich(err, call)
     }
 
-    for (;;) {
-      const remaining = deadline - now()
-      const window =
-        canBump && txWait.bumpIntervalMs < remaining ? txWait.bumpIntervalMs : remaining
-      const mined = await waitForAnyReceipt(hashes, window)
-      if (mined) return mined
-      if (now() >= deadline) {
-        // One last sweep in case a receipt landed between the poll and now.
-        const swept = await waitForAnyReceipt(hashes, 0)
-        if (swept) return swept
-        throw new TxNotMinedError(hashes, txWait.timeoutMs)
+    // Anchor escalation to the head observed after the initial broadcast. This
+    // guarantees that transaction two mined blocks of propagation/inclusion
+    // opportunity even if estimation or signing crossed a block boundary.
+    let lastEscalationBlock = await publicClient.getBlockNumber().catch((err) => {
+      botWarn(
+        '[hedger-bot] post-broadcast block lookup failed; using the pre-send block: ' +
+          sanitizeError(err),
+      )
+      return submittedAtBlock
+    })
+    let nextBlockDelay = FIRST_REPLACEMENT_BLOCK_DELAY
+
+    while (now() < deadline) {
+      const targetBlock = lastEscalationBlock + nextBlockDelay
+      let currentBlock = await readEscalationBlock()
+      if (currentBlock === null) {
+        const remaining = deadline - now()
+        if (remaining <= 0) break
+        const pollMs = txWait.pollIntervalMs ?? 4_000
+        const receipt = await waitForAnyReceipt(hashes, remaining < pollMs ? remaining : pollMs)
+        if (receipt) return receipt
+        continue
       }
-      if (!canBump) continue
+      while (currentBlock < targetBlock) {
+        const remaining = deadline - now()
+        if (remaining <= 0) break
+        const pollMs = txWait.pollIntervalMs ?? 4_000
+        const receipt = await waitForAnyReceipt(hashes, remaining < pollMs ? remaining : pollMs)
+        if (receipt) return receipt
+        currentBlock = (await readEscalationBlock()) ?? currentBlock
+      }
+      if (now() >= deadline) break
+
+      // Count this as the block's escalation opportunity even when fee lookup
+      // or broadcast fails. Retrying within the same block creates bursts and
+      // cannot improve inclusion; the next attempt waits for the next head.
+      lastEscalationBlock = currentBlock
+      nextBlockDelay = 1n
+
       let next: Fees | null
       try {
         next = await bumpFees(current, opts)
       } catch (err) {
         // Transient failure estimating replacement fees (e.g. RPC hiccup in
-        // getBlock): keep bumping enabled and retry on the next window.
+        // getBlock): keep bumping enabled and retry on the next block.
         botWarn(
           '[hedger-bot] replacement fee estimation failed (will retry): ' + sanitizeError(err),
         )
         continue
       }
       if (next === null) {
-        canBump = false // fee cap reached — wait out the remaining budget
-        continue
+        break // gasPolicy already emitted the immediate cap warning + notification
       }
+      if (now() >= deadline) break
       await deps.assertSendAllowed()
       await deps.recordBroadcastAttempt()
       try {
@@ -346,6 +399,7 @@ export function createRolesExecutor(deps: RolesExecutorDeps): RolesExecutor {
         await observe()
         current = next
       } catch (err) {
+        await recordBroadcastRejection(err)
         if (isNonceError(err)) {
           // The nonce was consumed: almost certainly one of OUR attempts mined
           // between the poll and the re-send. Give receipts a short window.
@@ -373,6 +427,15 @@ export function createRolesExecutor(deps: RolesExecutorDeps): RolesExecutor {
         }
       }
     }
+
+    const remaining = deadline - now()
+    if (remaining > 0) {
+      const mined = await waitForAnyReceipt(hashes, remaining)
+      if (mined) return mined
+    }
+    const swept = await waitForAnyReceipt(hashes, 0)
+    if (swept) return swept
+    throw new TxNotMinedError(hashes, txWait.timeoutMs)
   }
 
   async function simulate(call: RolesCall): Promise<void> {

@@ -71,6 +71,7 @@ describe('activation marker', () => {
 
     const mutations = [
       { ...config, RPC_URL: 'https://different.invalid/rpc' },
+      { ...config, RPC_URL_FALLBACK: 'https://fallback.invalid/rpc' },
       { ...config, SAFE_ADDRESS: POOL },
       { ...config, POOL_ADDRESS: SAFE },
       { ...config, ROLES_MODIFIER_ADDRESS: SAFE },
@@ -104,7 +105,6 @@ describe('activation marker', () => {
       { ...config, MIN_KEEPER_BALANCE_ETH: config.MIN_KEEPER_BALANCE_ETH + 1n },
       { ...config, KEEPER_BALANCE_WARN_ETH: config.KEEPER_BALANCE_WARN_ETH + 1n },
       { ...config, TX_RECEIPT_TIMEOUT_MS: config.TX_RECEIPT_TIMEOUT_MS + 1 },
-      { ...config, TX_BUMP_INTERVAL_MS: config.TX_BUMP_INTERVAL_MS + 1 },
       { ...config, DELEVERAGER_ENABLED: true },
     ]
     for (const changed of mutations) expect(isActivated(changed, BOT, evidence)).toBe(false)

@@ -245,6 +245,7 @@ it writes (and for the manual path). The full annotated list lives in
 |----------|----------|-------------|
 | `CHAIN_ID` | ✅ | Target chain id (e.g. `1` for mainnet) |
 | `RPC_URL` | ✅ | RPC endpoint for reads, gas estimation, and dispatch |
+| `RPC_URL_FALLBACK` | | Optional but strongly recommended independent RPC endpoint. Recovery requires every configured provider to report every replacement absent in two observations at distinct block heights; equivalent primary/fallback URLs degrade safely to single-RPC mode. |
 | `POOL_ADDRESS` | ✅ | Panoptic pool holding the options + hedge loans |
 | `SAFE_ADDRESS` | ✅ | Gnosis Safe (deployed via the wizard or `deploy:safe-roles`) |
 | `ROLES_MODIFIER_ADDRESS` | ✅ | Zodiac Roles v2 modifier enabled on the Safe |

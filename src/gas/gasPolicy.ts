@@ -44,8 +44,9 @@ export interface GasPolicy {
   fees(opts?: { urgent?: boolean }): Promise<GasFees | undefined>
   /**
    * Replacement fees for a stuck send: elementwise max of a fresh estimate and
-   * prev x 1.125 (geth requires >=10% on BOTH fields). Returns null once the
-   * bumped maxFeePerGas would exceed MAX_FEE_GWEI — stop bumping, keep waiting.
+   * ceil(prev x 1.25), comfortably above common node replacement thresholds.
+   * Returns null once the bumped maxFeePerGas would exceed MAX_FEE_GWEI; the
+   * cap breach is logged and notified before returning.
    */
   bumped(prev: GasFees, opts?: { urgent?: boolean }): Promise<GasFees | null>
   /** Alert (rate-limited) when the keeper EOA runs low on gas money. */
@@ -74,6 +75,10 @@ export interface GasPolicyDeps {
 
 const SKIP_ALERT_COOLDOWN_MS = 30 * 60 * 1000
 const BALANCE_ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000
+
+function multiplyRatioCeil(value: bigint, numerator: bigint, denominator: bigint): bigint {
+  return (value * numerator + denominator - 1n) / denominator
+}
 
 export function createGasPolicy(deps: GasPolicyDeps): GasPolicy {
   const { publicClient, account, notifier, config } = deps
@@ -173,17 +178,26 @@ export function createGasPolicy(deps: GasPolicyDeps): GasPolicy {
     fees,
 
     async bumped(prev: GasFees, opts?: { urgent?: boolean }): Promise<GasFees | null> {
-      // Fresh estimate tracks a moving basefee; prev x 1.125 satisfies geth's
-      // >=10% replacement minimum on both fields. Take the max of each.
+      // Fresh estimates track a moving basefee. A ceiling-rounded 25% increase
+      // on both fields also clears common client replacement thresholds without
+      // relying on truncation at an exact boundary.
       const fresh = await fees(opts)
-      let maxFeePerGas = (prev.maxFeePerGas * 1125n) / 1000n
+      let maxFeePerGas = multiplyRatioCeil(prev.maxFeePerGas, 125n, 100n)
       if (fresh && fresh.maxFeePerGas > maxFeePerGas) maxFeePerGas = fresh.maxFeePerGas
-      let maxPriorityFeePerGas = (prev.maxPriorityFeePerGas * 1125n) / 1000n
+      let maxPriorityFeePerGas = multiplyRatioCeil(prev.maxPriorityFeePerGas, 125n, 100n)
       if (fresh && fresh.maxPriorityFeePerGas > maxPriorityFeePerGas) {
         maxPriorityFeePerGas = fresh.maxPriorityFeePerGas
       }
       if (maxPriorityFeePerGas > maxFeePerGas) maxPriorityFeePerGas = maxFeePerGas
-      if (maxFeePerGas > maxFeeCap) return null
+      if (maxFeePerGas > maxFeeCap) {
+        const message =
+          `[hedger-bot] replacement fee cap reached: next maxFeePerGas ` +
+          `${formatUnits(maxFeePerGas, 9)} gwei exceeds MAX_FEE_GWEI ` +
+          `${formatUnits(maxFeeCap, 9)}; no further replacement will be broadcast`
+        botWarn(message)
+        await notifier.notify(`⚠️ ${message}`)
+        return null
+      }
       return { maxFeePerGas, maxPriorityFeePerGas }
     },
 

@@ -1,6 +1,6 @@
 import { DELEVERAGER_ROLE_KEY as SDK_DELEVERAGER_ROLE_KEY } from '@panoptic-eng/sdk/zodiac'
 import { parseGwei } from 'viem'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { deleveragerRoleKey, parseHedgerBotConfig } from './config'
 
@@ -268,6 +268,28 @@ describe('parseHedgerBotConfig', () => {
     ).not.toThrow()
   })
 
+  it.each([BASE_ENV.RPC_URL, 'https://RPC.EXAMPLE/', 'https://rpc.example:443///'])(
+    'warns and degrades equivalent fallback %s to single-RPC mode',
+    (fallbackUrl) => {
+      const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+      const config = parseHedgerBotConfig({
+        ...BASE_ENV,
+        RPC_URL_FALLBACK: fallbackUrl,
+      })
+
+      expect(config.RPC_URL_FALLBACK).toBeUndefined()
+      expect(warning).toHaveBeenCalledWith(expect.stringMatching(/using single-RPC recovery/))
+      warning.mockRestore()
+    },
+  )
+
+  it('preserves a genuinely distinct fallback RPC', () => {
+    const fallbackUrl = 'https://fallback.example/rpc'
+    expect(
+      parseHedgerBotConfig({ ...BASE_ENV, RPC_URL_FALLBACK: fallbackUrl }).RPC_URL_FALLBACK,
+    ).toBe(fallbackUrl)
+  })
+
   it('allows at most one non-interactive keystore passphrase source', () => {
     expect(() =>
       parseHedgerBotConfig({
@@ -301,11 +323,11 @@ describe('parseHedgerBotConfig', () => {
     expect(cfg.CEX_SYMBOL).toBe('ETH-USD')
   })
 
-  it('defaults the routine and urgent tip floors and bump interval', () => {
+  it('defaults the routine and urgent tip floors and nonce recovery boundary', () => {
     const cfg = parseHedgerBotConfig({ ...BASE_ENV })
     expect(cfg.MIN_PRIORITY_FEE_GWEI).toBe(parseGwei('0.1'))
     expect(cfg.URGENT_PRIORITY_FEE_GWEI).toBe(parseGwei('1'))
-    expect(cfg.TX_BUMP_INTERVAL_MS).toBe(45_000)
+    expect(cfg.HEDGER_NONCE_STALL_BLOCKS).toBe(8)
   })
 
   it('rejects a routine tip floor above its ceiling', () => {
@@ -346,16 +368,6 @@ describe('parseHedgerBotConfig', () => {
     expect(() =>
       parseHedgerBotConfig({ ...BASE_ENV, MAX_FEE_GWEI: '300', URGENT_PRIORITY_FEE_GWEI: '301' }),
     ).toThrow(/URGENT_PRIORITY_FEE_GWEI/)
-  })
-
-  it('rejects a bump interval longer than the receipt budget', () => {
-    expect(() =>
-      parseHedgerBotConfig({
-        ...BASE_ENV,
-        TX_RECEIPT_TIMEOUT_MS: '60000',
-        TX_BUMP_INTERVAL_MS: '90000',
-      }),
-    ).toThrow(/TX_BUMP_INTERVAL_MS/)
   })
 
   it('requires TELEGRAM_CHAT_ID when a Telegram token is set', () => {
@@ -403,12 +415,11 @@ describe('parseHedgerBotConfig', () => {
     )
   })
 
-  it('bounds receipt timeout with a compatible bump interval', () => {
+  it('bounds the receipt timeout', () => {
     expect(() =>
       parseHedgerBotConfig({
         ...BASE_ENV,
         TX_RECEIPT_TIMEOUT_MS: '30000',
-        TX_BUMP_INTERVAL_MS: '5000',
       }),
     ).not.toThrow()
     expect(() =>

@@ -3,6 +3,8 @@ import { DELEVERAGER_ROLE_KEY as SDK_DELEVERAGER_ROLE_KEY } from '@panoptic-eng/
 import { getAddress, isAddress, isHex, parseEther, parseUnits, size } from 'viem'
 import { z } from 'zod'
 
+import { botWarn } from './utils/log'
+
 /**
  * Environment / configuration schema for the hedger bot.
  *
@@ -61,6 +63,13 @@ const rpcUrlSchema = z
       })
     }
   })
+
+/** Compare the network resource after URL-standard host/port normalization. */
+function normalizedRpcEndpoint(value: string): string {
+  const url = new URL(value)
+  const pathname = url.pathname.replace(/\/+$/, '')
+  return `${url.origin.toLowerCase()}${pathname}${url.search}`
+}
 
 const booleanSchema = z
   .enum(['true', 'false', '1', '0'])
@@ -287,13 +296,12 @@ const rawEnvSchema = z
     // Give up waiting for a dispatch receipt after this long (alert; the next
     // cycle re-reads chain state and reconciles).
     TX_RECEIPT_TIMEOUT_MS: boundedInteger(30_000, 900_000, 180_000),
-    // While waiting, re-send the same nonce with >=12.5%-bumped fees every this
-    // often, until MAX_FEE_GWEI caps the escalation or the receipt budget ends.
-    TX_BUMP_INTERVAL_MS: boundedInteger(5_000, 300_000, 45_000),
-    // Blocks past a pending intent's submission before recovery declares its
-    // nonce slot a mempool-drop and auto-fails the entry. Below this, the
-    // slot is treated as still-in-flight and the entry is retained.
-    HEDGER_NONCE_STALL_BLOCKS: boundedInteger(4, 4_096, 64),
+    // Recovery boundary for an open nonce. Once reached, fully recorded
+    // broadcasts may be released only after all configured RPCs report them
+    // absent at two distinct block heights; a genuinely unknown broadcast stays
+    // fenced. Block-height recovery is independent of the wall-clock receipt
+    // timeout because block production is not guaranteed.
+    HEDGER_NONCE_STALL_BLOCKS: boundedInteger(4, 4_096, 8),
 
     // Loop
     // Authoritative account reconciliation cadence. Price and account events
@@ -475,14 +483,6 @@ const rawEnvSchema = z
         message: 'URGENT_PRIORITY_FEE_GWEI must be <= MAX_FEE_GWEI (the tip must fit the fee cap)',
       })
     }
-    if (cfg.TX_BUMP_INTERVAL_MS > cfg.TX_RECEIPT_TIMEOUT_MS) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['TX_BUMP_INTERVAL_MS'],
-        message:
-          'TX_BUMP_INTERVAL_MS must be <= TX_RECEIPT_TIMEOUT_MS (need at least one wait segment)',
-      })
-    }
     if (cfg.KEEPER_BALANCE_WARN_ETH >= cfg.MIN_KEEPER_BALANCE_ETH) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -613,6 +613,17 @@ export function parseHedgerBotConfig(env: NodeJS.ProcessEnv = process.env): Hedg
       .map((issue) => `  - ${issue.path.join('.') || '(root)'}: ${issue.message}`)
       .join('\n')
     throw new Error(`Invalid hedger-bot configuration:\n${issues}`)
+  }
+  if (
+    result.data.RPC_URL_FALLBACK &&
+    normalizedRpcEndpoint(result.data.RPC_URL_FALLBACK) ===
+      normalizedRpcEndpoint(result.data.RPC_URL)
+  ) {
+    botWarn(
+      '[hedger-bot] RPC_URL_FALLBACK resolves to the primary RPC endpoint; ' +
+        'ignoring it and using single-RPC recovery',
+    )
+    return { ...result.data, RPC_URL_FALLBACK: undefined }
   }
   return result.data
 }

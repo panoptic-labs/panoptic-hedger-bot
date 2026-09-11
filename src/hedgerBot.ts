@@ -51,6 +51,7 @@ import {
   type HedgeJournalAction,
   type HedgeJournalCheckpoint,
   type HedgeJournalPort,
+  type HedgeRecoveryClient,
   type RecoveryReport,
   createHedgeRecoveryClient,
 } from './runtime/hedgeJournal'
@@ -92,6 +93,8 @@ export interface HedgerBotDeps {
   notifier: Notifier
   gasPolicy: GasPolicy
   hedgeJournal: HedgeJournalPort
+  /** Direct, independent RPC clients used to confirm dropped transactions. */
+  recoveryClients?: readonly HedgeRecoveryClient[]
   /** Persistence for the SDK position sync (file-backed; survives restarts). */
   storage: StorageAdapter
   /**
@@ -230,7 +233,14 @@ export class HedgerBot {
   /** One-time startup: verify the Roles modifier is wired to the Safe. */
   async init(): Promise<void> {
     await this.deps.rolesExecutor.preflight()
-    await this.deps.hedgeJournal.recover(createHedgeRecoveryClient(this.deps.publicClient))
+    const recoveryClient = createHedgeRecoveryClient(this.deps.publicClient)
+    if (this.deps.recoveryClients) {
+      await this.deps.hedgeJournal.recover(recoveryClient, {
+        mempoolObservers: this.deps.recoveryClients,
+      })
+    } else {
+      await this.deps.hedgeJournal.recover(recoveryClient)
+    }
     const checkpoint = this.deps.hedgeJournal.checkpoint()
     this.lastDispatchTxHash = checkpoint.transactionHash
     this.reconcilePendingSwapAfterRecovery(checkpoint)
@@ -272,9 +282,12 @@ export class HedgerBot {
     if (!this.deps.hedgeJournal.hasPendingIntent()) return 'clear'
     let report: RecoveryReport
     try {
+      const recoveryOptions = this.deps.recoveryClients
+        ? { scope: 'pending' as const, mempoolObservers: this.deps.recoveryClients }
+        : { scope: 'pending' as const }
       report = await this.deps.hedgeJournal.recover(
         createHedgeRecoveryClient(this.deps.publicClient),
-        { scope: 'pending' },
+        recoveryOptions,
       )
     } catch (error) {
       if (isRetryableRpcError(error)) {
@@ -291,7 +304,9 @@ export class HedgerBot {
       botLog(
         `[hedger-bot] pending ${held.action} intent ${held.id} still in flight ` +
           `(hash=${held.lastHash ?? 'none'}, nonce=${held.nonce ?? 'none'}, ` +
-          `~${held.blocksRemaining} blocks until auto-fail); skipping planning (${trigger})`,
+          `blocksSinceSubmit=${held.blocksSinceSubmit}, ` +
+          `recovery=${held.recoveryState ?? 'pending chain-state confirmation'}); ` +
+          `skipping planning (${trigger})`,
       )
       return 'held'
     }
