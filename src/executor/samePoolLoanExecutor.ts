@@ -1,8 +1,11 @@
 import {
+  type BatchDispatchArgs,
   type BatchOp,
   buildBatchDispatchArgs,
   buildCreditSwapCall,
+  getNotEnoughTokensError,
   simulateBatchDispatch,
+  simulateDispatch,
   simulateWithTokenFlow,
 } from '@panoptic-eng/sdk/v2'
 import type { Address, Hex, PublicClient } from 'viem'
@@ -16,9 +19,11 @@ import {
   buildHedgeDispatchCalldata,
   buildOffVenueHedgeBatchOps,
   buildOffVenueHedgeDispatchCalldata,
+  encodeDispatchArgs,
 } from './dispatchCalldata'
 import type {
   CollateralSwapRequest,
+  DispatchArgsPreview,
   HedgeContext,
   HedgeExecutionResult,
   HedgeExecutor,
@@ -281,6 +286,87 @@ export function createSamePoolLoanExecutor(deps: SamePoolLoanExecutorDeps): Hedg
           marginExcess1: postMarginExcess1,
           tick: postTick,
         }),
+      }
+    },
+    async previewDispatchArgs(
+      dispatch: BatchDispatchArgs,
+      existingPositionIds: bigint[],
+      blockNumber: bigint,
+    ): Promise<DispatchArgsPreview> {
+      const simulation = await simulateDispatch({
+        client: asSdkClient<typeof simulateDispatch>(publicClient),
+        poolAddress,
+        account: safeAddress,
+        existingPositionIdList: existingPositionIds,
+        ...dispatch,
+        blockNumber,
+      })
+      if (!simulation.success) {
+        // A collateral token shortfall is the one failure a larger temporary loan
+        // can fix (trackers compare shares; NotEnoughTokens reports assets, so an
+        // exact principal can revert by one share). Classify it with the typed SDK
+        // helper — never by matching the message string.
+        const retryable = getNotEnoughTokensError(simulation.error) !== null
+        return {
+          success: false,
+          reason: `netted-dispatch simulation failed: ${simulation.error.message}`,
+          retryable,
+        }
+      }
+      const { postCollateral0, postCollateral1, postMarginExcess0, postMarginExcess1 } =
+        simulation.data
+      const postTick = simulation.tokenFlow?.tickAfter
+      if (
+        postMarginExcess0 === null ||
+        postMarginExcess1 === null ||
+        postTick === null ||
+        postTick === undefined
+      ) {
+        return {
+          success: false,
+          reason: 'netted-dispatch simulation returned incomplete data',
+          retryable: false,
+        }
+      }
+      return {
+        success: true,
+        margin: normalizePostDispatchMargin({
+          collateral0: postCollateral0,
+          collateral1: postCollateral1,
+          marginExcess0: postMarginExcess0,
+          marginExcess1: postMarginExcess1,
+          tick: postTick,
+        }),
+      }
+    },
+    async executeDispatchArgs(
+      dispatch: BatchDispatchArgs,
+      result: { openedTokenId: bigint | null; closedTokenIds: bigint[] },
+      ctx?: HedgeContext,
+    ): Promise<HedgeExecutionResult> {
+      const call = {
+        to: poolAddress,
+        value: 0n,
+        data: encodeDispatchArgs(dispatch),
+        operation: 0 as const,
+      }
+      if (dryRun) {
+        await rolesExecutor.simulate(call)
+        return {
+          transactionHash: null,
+          receipt: null,
+          openedTokenId: result.openedTokenId,
+          closedTokenIds: result.closedTokenIds,
+          dryRun: true,
+        }
+      }
+      const receipt = await rolesExecutor.send(call, { urgent: ctx?.urgent })
+      return {
+        transactionHash: receipt.transactionHash,
+        receipt,
+        openedTokenId: result.openedTokenId,
+        closedTokenIds: result.closedTokenIds,
+        dryRun: false,
       }
     },
     execute(intent: HedgeIntent, ctx?: HedgeContext) {

@@ -1,4 +1,5 @@
 import {
+  type BatchDispatchArgs,
   type PoolMetadata,
   type StorageAdapter,
   isNonceError,
@@ -35,6 +36,7 @@ import { type MarginReserveAssessment, assessMarginReserve } from './hedge/margi
 import { assessSafety } from './hedge/safety'
 import type { SfpmSwapQuote, SfpmVenueDecision } from './hedge/sfpmVenueCoordinator'
 import { isSfpmVenueEligible } from './hedge/sfpmVenueRouter'
+import { resolveNettedShrinkDispatch } from './hedge/shrinkRouteEvaluator'
 import { type HedgeSnapshot, readHedgeSnapshot } from './hedge/snapshot'
 import { timedHedgeCadence } from './hedge/timedCadence'
 import { EMPTY_SAFE_WALLET_BALANCES, spendableAfterCollateralReserve } from './hedge/walletBalances'
@@ -57,6 +59,7 @@ import {
 } from './runtime/hedgeJournal'
 import type { PendingSfpmSwapPort } from './runtime/pendingSfpmSwap'
 import { type RolesExecutor, TxNotMinedError } from './safe/rolesExecutor'
+import { parseBuilderCode } from './utils/builderCode'
 import { botError, botLog, botWarn, formatLogColumns } from './utils/log'
 import { sanitizeError } from './utils/sanitize'
 
@@ -194,8 +197,17 @@ async function assessFinalStateReserve(
   intent: HedgeIntent,
   blockNumber: bigint,
   reserveBps: bigint,
+  /**
+   * When a netted-shrink route was chosen, the reserve must be assessed against
+   * THAT dispatch (previewed via `simulateDispatch`), not the ordinary in-pool
+   * intent — otherwise the gate greenlights a dispatch the bot will not send.
+   */
+  nettedDispatch?: BatchDispatchArgs,
 ): Promise<MarginReserveAssessment> {
-  const preview = await executor.previewFinalState(intent, blockNumber)
+  const preview =
+    nettedDispatch && executor.previewDispatchArgs
+      ? await executor.previewDispatchArgs(nettedDispatch, intent.existingPositionIds, blockNumber)
+      : await executor.previewFinalState(intent, blockNumber)
   if (!preview.success) {
     return { sufficient: false, free0: 0n, free1: 0n, reasons: [preview.reason] }
   }
@@ -554,18 +566,46 @@ export class HedgerBot {
 
     if (balanceFirstSwap === 'deferred') return
 
+    // Netted shrink route selection. Decide once here — before the margin gate —
+    // so the reserve check and the send both use the SAME dispatch. Only a plain
+    // shrink qualifies (not a balance-first swap, not SafeMode=1 which is
+    // close-only and would reject the temporary loan mint). Reassigned to null
+    // below if the netted route fails the reserve but the in-pool route passes.
+    let nettedShrinkDispatch =
+      balanceFirstSwap === null && safeModeLevel !== 1n
+        ? await this.chooseNettedShrinkDispatch(plan, snapshot)
+        : null
+
     let safeModeCreditSwap: SafeModeCreditSwap | null = null
     if (
       balanceFirstSwap === null &&
       plan.action !== 'none' &&
       (plan.intent.openTokenId !== null || safeModeLevel === 1n)
     ) {
-      const margin = await assessFinalStateReserve(
+      let margin = await assessFinalStateReserve(
         executor,
         plan.intent,
         snapshot.blockNumber,
         config.MIN_MARGIN_RESERVE_BPS,
+        nettedShrinkDispatch ?? undefined,
       )
+      // The netted route may leave less free collateral (its temporary loan's
+      // commission is charged on top). If it fails the reserve, fall back to the
+      // ordinary in-pool route before skipping the hedge — netting is an
+      // optimization, never a reason to leave delta unhedged.
+      if (!margin.sufficient && nettedShrinkDispatch !== null) {
+        const inPool = await assessFinalStateReserve(
+          executor,
+          plan.intent,
+          snapshot.blockNumber,
+          config.MIN_MARGIN_RESERVE_BPS,
+        )
+        if (inPool.sufficient) {
+          botLog(`[hedger-bot] netted shrink failed the margin reserve; using in-pool (${trigger})`)
+          nettedShrinkDispatch = null
+          margin = inPool
+        }
+      }
       if (!margin.sufficient) {
         if (safeModeLevel === 1n) {
           safeModeCreditSwap = await this.planSafeModeCreditSwap(plan, snapshot)
@@ -662,12 +702,30 @@ export class HedgerBot {
     try {
       if (!config.DRY_RUN && plan.intent.openTokenId !== null) {
         const preSendBlock = await publicClient.getBlockNumber()
-        const latestMargin = await assessFinalStateReserve(
+        let latestMargin = await assessFinalStateReserve(
           executor,
           plan.intent,
           preSendBlock,
           config.MIN_MARGIN_RESERVE_BPS,
+          nettedShrinkDispatch ?? undefined,
         )
+        // Same fallback as the pre-plan gate: if the netted route no longer clears
+        // the reserve at the send block, drop to in-pool rather than skip.
+        if (!latestMargin.sufficient && nettedShrinkDispatch !== null) {
+          const inPool = await assessFinalStateReserve(
+            executor,
+            plan.intent,
+            preSendBlock,
+            config.MIN_MARGIN_RESERVE_BPS,
+          )
+          if (inPool.sufficient) {
+            botLog(
+              `[hedger-bot] netted shrink failed the pre-send reserve; using in-pool (${trigger})`,
+            )
+            nettedShrinkDispatch = null
+            latestMargin = inPool
+          }
+        }
         if (!latestMargin.sufficient) {
           botWarn(
             `[hedger-bot] final-state preflight changed before send (${trigger}): ` +
@@ -681,37 +739,50 @@ export class HedgerBot {
         dispatchIntentId = this.deps.hedgeJournal.begin(plan.action)
         activeJournal = plan.action
       }
-      execution = await this.executeIntent(
-        plan.intent,
-        ctx,
-        (pending) => {
-          if (dispatchIntentId === null || !this.deps.sfpmVenue || !this.deps.pendingSwapStore) {
-            throw new Error('off-venue dispatch started without durable journal state')
-          }
-          this.deps.pendingSwapStore.save({
-            dispatchIntentId,
-            sellToken0: pending.sellToken0,
-            amount: pending.amount,
-          })
-          pendingPrepared = true
-        },
-        (dispatch) => {
-          const receipt = successfulReceipt(dispatch, 'off-venue dispatch')
-          dispatchConfirmed = true
-          this.lastDispatchTxHash = receipt.transactionHash
-          this.deps.hedgeJournal.confirm({
-            transactionHash: receipt.transactionHash,
-            blockNumber: receipt.blockNumber,
-            blockHash: receipt.blockHash,
-          })
-          activeJournal = null
-          const swapIntentId = this.deps.hedgeJournal.begin('sfpm_swap')
-          activeJournal = 'sfpm_swap'
-          const pending = this.deps.pendingSwapStore?.read()
-          if (!pending) throw new Error('durable SFPM swap obligation disappeared after dispatch')
-          this.deps.pendingSwapStore?.save({ ...pending, swapIntentId })
-        },
-      )
+      if (nettedShrinkDispatch !== null && executor.executeDispatchArgs) {
+        // Netted route: a single dispatch (no off-venue second tx), so it takes
+        // the venue=null bookkeeping path below, exactly like an in-pool dispatch.
+        execution = {
+          dispatch: await executor.executeDispatchArgs(
+            nettedShrinkDispatch,
+            { openedTokenId: plan.intent.openTokenId, closedTokenIds: plan.intent.closeTokenIds },
+            ctx,
+          ),
+          venue: null,
+        }
+      } else {
+        execution = await this.executeIntent(
+          plan.intent,
+          ctx,
+          (pending) => {
+            if (dispatchIntentId === null || !this.deps.sfpmVenue || !this.deps.pendingSwapStore) {
+              throw new Error('off-venue dispatch started without durable journal state')
+            }
+            this.deps.pendingSwapStore.save({
+              dispatchIntentId,
+              sellToken0: pending.sellToken0,
+              amount: pending.amount,
+            })
+            pendingPrepared = true
+          },
+          (dispatch) => {
+            const receipt = successfulReceipt(dispatch, 'off-venue dispatch')
+            dispatchConfirmed = true
+            this.lastDispatchTxHash = receipt.transactionHash
+            this.deps.hedgeJournal.confirm({
+              transactionHash: receipt.transactionHash,
+              blockNumber: receipt.blockNumber,
+              blockHash: receipt.blockHash,
+            })
+            activeJournal = null
+            const swapIntentId = this.deps.hedgeJournal.begin('sfpm_swap')
+            activeJournal = 'sfpm_swap'
+            const pending = this.deps.pendingSwapStore?.read()
+            if (!pending) throw new Error('durable SFPM swap obligation disappeared after dispatch')
+            this.deps.pendingSwapStore?.save({ ...pending, swapIntentId })
+          },
+        )
+      }
     } catch (error) {
       // A receipt timeout is uncertain: one of the observed transactions may
       // still land. Preserve that active intent for per-cycle recovery rather
@@ -1123,6 +1194,55 @@ export class HedgerBot {
     const at = new Date().toISOString()
     this.lastDeltaHedgeAt = at
     this.deps.recordDeltaHedge?.(at)
+  }
+
+  /**
+   * For an eligible shrink-and-remint, return the netted dispatch to send — one
+   * swap of only the principal reduction instead of the gross double-swap. Every
+   * eligible shrink is netted (no cost comparison). Returns null so the caller
+   * uses the ordinary in-pool route when the shrink is ineligible (not a shrink,
+   * no remint, or loans outside the single-leg/borrowed-token/one-side scope) or
+   * the netted candidate reverts. Never throws — any failure falls back to
+   * in-pool.
+   *
+   * A pure shrink (no remint) is excluded: the margin gate's `containsMint: true`
+   * reserve assumes a standing mint remains, which a no-remint shrink does not
+   * leave; those keep using the in-pool route.
+   */
+  private async chooseNettedShrinkDispatch(
+    plan: HedgePlan,
+    snapshot: HedgeSnapshot,
+  ): Promise<BatchDispatchArgs | null> {
+    const { config, executor } = this.deps
+    if (
+      plan.action !== 'shrink' ||
+      plan.intent.openTokenId === null ||
+      !executor.previewDispatchArgs ||
+      !executor.executeDispatchArgs
+    ) {
+      return null
+    }
+    const previewDispatchArgs = executor.previewDispatchArgs.bind(executor)
+    try {
+      return await resolveNettedShrinkDispatch(
+        plan.intent,
+        snapshot.positions,
+        // Same tick the in-pool route's swap band uses (pool spot at planning), so
+        // the netted band carries no extra staleness vs. the ordinary route.
+        plan.intent.currentTick,
+        {
+          poolAddress: config.POOL_ADDRESS,
+          builderCode: parseBuilderCode(config.PANOPTIC_BUILDER_CODE),
+          previewDispatchArgs: (dispatch) =>
+            previewDispatchArgs(dispatch, plan.intent.existingPositionIds, snapshot.blockNumber),
+        },
+      )
+    } catch (error) {
+      botWarn(
+        `[hedger-bot] netted shrink resolution failed; using in-pool: ${sanitizeError(error)}`,
+      )
+      return null
+    }
   }
 
   /**

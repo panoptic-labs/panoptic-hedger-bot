@@ -5,6 +5,7 @@ import type { HedgerBotConfig } from './config'
 import type { CollateralSwapRequest, HedgeExecutionResult, HedgeExecutor } from './executor/types'
 import { computeHedgePlan } from './hedge/decision'
 import { assessSafety } from './hedge/safety'
+import { resolveNettedShrinkDispatch } from './hedge/shrinkRouteEvaluator'
 import { readHedgeSnapshot } from './hedge/snapshot'
 import { HedgerBot } from './hedgerBot'
 import { type RolesExecutor, TxNotMinedError } from './safe/rolesExecutor'
@@ -47,6 +48,9 @@ vi.mock('./hedge/safety', () => ({
   assessSafety: vi.fn(() => ({ safe: true, reasons: [], isLiquidatable: false })),
 }))
 vi.mock('./hedge/decision', () => ({ computeHedgePlan: vi.fn() }))
+// Netting resolution is unit-tested in shrinkRouteEvaluator.unit.test.ts; here we
+// drive it directly to exercise hedgerBot's send/fallback wiring deterministically.
+vi.mock('./hedge/shrinkRouteEvaluator', () => ({ resolveNettedShrinkDispatch: vi.fn() }))
 // Real greeks need fully-formed legs; the deleverage-path tests only care about
 // per-position |delta| for the pre-sort, so stub it deterministically.
 vi.mock('./hedge/frame', () => ({
@@ -193,6 +197,31 @@ const consolidatePlan = {
   },
 } as unknown as ReturnType<typeof computeHedgePlan>
 
+/** A shrink that burns loan 7n and remints a smaller replacement (99n). */
+const shrinkRemintPlan = {
+  action: 'shrink',
+  mints: [{ tokenType: 1n, size: 6n }],
+  burns: [7n],
+  swapAtMint: true,
+  H: -20n,
+  Hstar: -6n,
+  driftBps: 0n,
+  triggers: { drift: true, timedDrift: false, overCap: false },
+  netDelta: -6n,
+  portfolioSize: 100n,
+  intent: {
+    action: 'shrink',
+    openTokenId: 99n,
+    openPositionSize: 6n,
+    swapAtMint: true,
+    closeTokenIds: [7n],
+    existingPositionIds: [7n, 8n],
+    skippedCollidingTokenIds: [],
+    currentTick: 0n,
+    slippageBps: 30n,
+  },
+} as unknown as ReturnType<typeof computeHedgePlan>
+
 const openBalanceFirstPlan = {
   action: 'open',
   mints: [{ tokenType: 0n, size: 100n }],
@@ -234,7 +263,7 @@ async function makeBot(
       | 'hedgeJournal'
       | 'recordDeltaHedge'
     >
-  > = {},
+  > & { config?: Partial<HedgerBotConfig> } = {},
 ) {
   const receipt = {
     status: receiptStatus,
@@ -258,7 +287,7 @@ async function makeBot(
   const notifier = overrides.notifier ?? { notify: vi.fn(async () => undefined) }
   let pendingSwap: ReturnType<NonNullable<BotDeps['pendingSwapStore']>['read']> = null
   const bot = new HedgerBot({
-    config: CONFIG,
+    config: { ...CONFIG, ...(overrides.config ?? {}) },
     publicClient,
     account: {} as Account,
     priceSource: {
@@ -1607,5 +1636,137 @@ describe('HedgerBot per-cycle pending intent recovery', () => {
     expect(executePendingSwap).toHaveBeenCalledOnce()
     expect(pendingSwap).toBeNull()
     expect(notify).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('HedgerBot netted shrink route', () => {
+  const executionResult = {
+    transactionHash: '0x01',
+    receipt: {
+      status: 'success',
+      transactionHash: '0x01',
+      blockNumber: 123n,
+      blockHash: `0x${'ab'.repeat(32)}`,
+    },
+    openedTokenId: 99n,
+    closedTokenIds: [7n],
+    dryRun: false,
+  } as unknown as HedgeExecutionResult
+
+  const sufficientMargin = {
+    success: true as const,
+    margin: {
+      collateralBalance0: 1_000n,
+      requiredCollateral0: 100n,
+      collateralBalance1: 1_000n,
+      requiredCollateral1: 100n,
+    },
+  }
+  const insufficientMargin = {
+    success: true as const,
+    margin: {
+      collateralBalance0: 1_000n,
+      requiredCollateral0: 950n,
+      collateralBalance1: 1_000n,
+      requiredCollateral1: 950n,
+    },
+  }
+  // A canned netted dispatch the resolver hands back (4 ops incl. the temp loan).
+  const nettedDispatch = {
+    positionIdList: [500n, 99n, 7n, 500n],
+    finalPositionIdList: [99n],
+    positionSizes: [1_258n, 6n, 0n, 0n],
+    tickAndSpreadLimits: [],
+    usePremiaAsCollateral: false,
+    builderCode: 0n,
+  } as never
+
+  const resolver = vi.mocked(resolveNettedShrinkDispatch)
+  beforeEach(() => {
+    vi.mocked(computeHedgePlan).mockReturnValue(shrinkRemintPlan)
+    resolver.mockReset()
+  })
+
+  function shrinkExecutor(
+    over: Partial<{
+      previewFinalState: ReturnType<typeof vi.fn>
+      previewDispatchArgs: ReturnType<typeof vi.fn>
+      executeDispatchArgs: ReturnType<typeof vi.fn>
+      execute: ReturnType<typeof vi.fn>
+    }> = {},
+  ) {
+    return {
+      kind: 'same-pool-loan',
+      previewFinalState: over.previewFinalState ?? vi.fn(async () => sufficientMargin),
+      previewDispatchArgs: over.previewDispatchArgs ?? vi.fn(async () => sufficientMargin),
+      executeDispatchArgs: over.executeDispatchArgs ?? vi.fn(async () => executionResult),
+      execute: over.execute ?? vi.fn(async () => executionResult),
+    }
+  }
+
+  it('sends the netted dispatch when resolution succeeds and margin clears', async () => {
+    resolver.mockResolvedValue(nettedDispatch)
+    const executeDispatchArgs = vi.fn(async () => executionResult)
+    const previewDispatchArgs = vi.fn(async () => sufficientMargin)
+    const execute = vi.fn(async () => executionResult)
+    const { bot } = await makeBot(executionResult, 'success', {
+      executor: shrinkExecutor({ previewDispatchArgs, executeDispatchArgs, execute }) as never,
+    })
+
+    expect(await bot.runCycle('c1')).toBe('complete')
+    // Margin was assessed against the netted dispatch, and that dispatch was sent.
+    expect(previewDispatchArgs).toHaveBeenCalledWith(nettedDispatch, [7n, 8n], 123n)
+    expect(executeDispatchArgs).toHaveBeenCalledTimes(1)
+    expect(executeDispatchArgs.mock.calls[0][0]).toBe(nettedDispatch)
+    expect(execute).not.toHaveBeenCalled() // in-pool route not used
+  })
+
+  it('falls back to in-pool when the netted route fails the margin reserve', async () => {
+    // Major finding: a netted dispatch that simulates but leaves too little free
+    // collateral must not skip the hedge — the in-pool route is tried instead.
+    resolver.mockResolvedValue(nettedDispatch)
+    const previewDispatchArgs = vi.fn(async () => insufficientMargin) // netted fails reserve
+    const previewFinalState = vi.fn(async () => sufficientMargin) // in-pool passes
+    const executeDispatchArgs = vi.fn(async () => executionResult)
+    const execute = vi.fn(async () => executionResult)
+    const { bot } = await makeBot(executionResult, 'success', {
+      executor: shrinkExecutor({
+        previewDispatchArgs,
+        previewFinalState,
+        executeDispatchArgs,
+        execute,
+      }) as never,
+    })
+
+    expect(await bot.runCycle('c1')).toBe('complete')
+    expect(execute).toHaveBeenCalledTimes(1) // fell back to in-pool
+    expect(executeDispatchArgs).not.toHaveBeenCalled() // netted route abandoned
+  })
+
+  it('falls back to the in-pool route (never throws) when netting resolution fails', async () => {
+    resolver.mockRejectedValue(new Error('sim boom'))
+    const executeDispatchArgs = vi.fn(async () => executionResult)
+    const execute = vi.fn(async () => executionResult)
+    const { bot } = await makeBot(executionResult, 'success', {
+      executor: shrinkExecutor({ executeDispatchArgs, execute }) as never,
+    })
+
+    expect(await bot.runCycle('c1')).toBe('complete')
+    expect(execute).toHaveBeenCalledTimes(1) // ordinary in-pool route
+    expect(executeDispatchArgs).not.toHaveBeenCalled() // netted route not sent
+  })
+
+  it('does not attempt netting for a non-shrink plan', async () => {
+    vi.mocked(computeHedgePlan).mockReturnValue(consolidatePlan)
+    const executeDispatchArgs = vi.fn(async () => executionResult)
+    const execute = vi.fn(async () => executionResult)
+    const { bot } = await makeBot(executionResult, 'success', {
+      executor: shrinkExecutor({ executeDispatchArgs, execute }) as never,
+    })
+
+    expect(await bot.runCycle('c1')).toBe('complete')
+    expect(resolver).not.toHaveBeenCalled() // netting only runs for shrinks
+    expect(executeDispatchArgs).not.toHaveBeenCalled()
+    expect(execute).toHaveBeenCalledTimes(1)
   })
 })

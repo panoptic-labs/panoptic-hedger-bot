@@ -1,4 +1,5 @@
 import {
+  type BatchDispatchArgs,
   type BatchOp,
   buildBatchDispatchArgs,
   panopticPoolV2Abi,
@@ -104,6 +105,18 @@ function encodeHedgeDispatchCalldata(
   if (args === null) {
     throw new Error(`dispatch batch invalid: ${diagnostics.map((d) => d.message).join('; ')}`)
   }
+  return encodeDispatchArgs(args)
+}
+
+/**
+ * Encode `PanopticPool.dispatch` calldata directly from pre-built dispatch args.
+ *
+ * Unlike {@link buildHedgeDispatchCalldata}, this bypasses `buildBatchDispatchArgs`
+ * (and therefore the batch validator), so it can encode the netted-shrink
+ * dispatch whose temporary loan reuses one tokenId for its mint and burn — a
+ * sequence the validator rejects as `duplicate-tokenid-in-batch`.
+ */
+export function encodeDispatchArgs(args: BatchDispatchArgs): Hex {
   return encodeFunctionData({
     abi: panopticPoolV2Abi,
     functionName: 'dispatch',

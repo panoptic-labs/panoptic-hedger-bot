@@ -1,3 +1,4 @@
+import type { BatchDispatchArgs } from '@panoptic-eng/sdk/v2'
 import type { Hex, TransactionReceipt } from 'viem'
 
 import type { MarginSnapshot } from '../hedge/marginReserve'
@@ -121,10 +122,41 @@ export type HedgeFinalStatePreview =
   | { success: true; margin: MarginSnapshot }
   | { success: false; reason: string }
 
+/**
+ * Preview of a pre-built dispatch (e.g. the netted-shrink candidate) simulated
+ * with `simulateDispatch`. On failure, `retryable` is set by the executor from a
+ * typed classification of the revert (a collateral token shortfall, fixable by a
+ * larger temporary loan) — the caller must not re-parse `reason` to decide.
+ */
+export type DispatchArgsPreview =
+  | { success: true; margin: MarginSnapshot }
+  | { success: false; reason: string; retryable: boolean }
+
 export interface HedgeExecutor {
   readonly kind: 'same-pool-loan'
   /** Simulate the exact ordered dispatch and return its final margin state. */
   previewFinalState(intent: HedgeIntent, blockNumber: bigint): Promise<HedgeFinalStatePreview>
+  /**
+   * Simulate a pre-built dispatch (e.g. the netted-shrink candidate) with
+   * `simulateDispatch` — the batch-validator path cannot preview a dispatch whose
+   * temporary loan reuses one tokenId. Returns margin + post-dispatch collateral.
+   * Optional (like the other advanced methods) for test/dummy executors.
+   */
+  previewDispatchArgs?(
+    dispatch: BatchDispatchArgs,
+    existingPositionIds: bigint[],
+    blockNumber: bigint,
+  ): Promise<DispatchArgsPreview>
+  /**
+   * Submit (or simulate when dryRun) a pre-built dispatch. Used to send the
+   * chosen route's exact dispatch — the same args that were previewed.
+   * Optional (like the other advanced methods) for test/dummy executors.
+   */
+  executeDispatchArgs?(
+    dispatch: BatchDispatchArgs,
+    result: { openedTokenId: bigint | null; closedTokenIds: bigint[] },
+    ctx?: HedgeContext,
+  ): Promise<HedgeExecutionResult>
   /** Convert an intent to on-chain calls and submit (or simulate when dryRun). */
   execute(intent: HedgeIntent, ctx?: HedgeContext): Promise<HedgeExecutionResult>
   /**
