@@ -27,6 +27,7 @@ export interface MultiInstanceIdentity {
   safeAddress: Address
   poolAddress: Address
   mode: 'dry-run' | 'live'
+  safeRelay: boolean
 }
 
 export interface MultiInstanceCheck {
@@ -108,6 +109,7 @@ function checkInstance(directory: string): MultiInstanceIdentity {
     safeAddress: config.SAFE_ADDRESS,
     poolAddress: config.POOL_ADDRESS,
     mode: config.DRY_RUN ? 'dry-run' : 'live',
+    safeRelay: config.SAFE_RELAY_ENABLED,
   }
 }
 
@@ -118,6 +120,7 @@ function normalizedAddress(address: Address): string {
 function assertUniqueInstances(instances: MultiInstanceIdentity[]): void {
   const signers = new Map<string, string>()
   const portfolios = new Map<string, string>()
+  const relayedSafes = new Map<string, string>()
   for (const instance of instances) {
     const signer = normalizedAddress(instance.signerAddress)
     const existingSigner = signers.get(signer)
@@ -140,6 +143,16 @@ function assertUniqueInstances(instances: MultiInstanceIdentity[]): void {
       )
     }
     portfolios.set(portfolio, instance.name)
+
+    if (!instance.safeRelay) continue
+    const safe = `${instance.chainId}:${normalizedAddress(instance.safeAddress)}`
+    const existingRelay = relayedSafes.get(safe)
+    if (existingRelay) {
+      throw new Error(
+        `${instance.name}: SAFE_RELAY_ENABLED duplicates ${existingRelay} for the same Safe; enable the signed-transaction relay on one instance per Safe`,
+      )
+    }
+    relayedSafes.set(safe, instance.name)
   }
 }
 

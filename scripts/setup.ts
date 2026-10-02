@@ -134,6 +134,8 @@ interface DeployState {
   hedgeWalletBalances: boolean
   /** Explicit consent to install the expanded SFPM swap authorization surface. */
   sfpmSwapProvisioned: boolean
+  /** The keeper executes owner-signed Safe transactions and pays their gas. */
+  safeRelayEnabled: boolean
   storage: 'keystore' | 'plaintext'
   extraRoles: { kind: ExtraRoleKind; member: `0x${string}`; sizeCap?: string }[]
   /** Filled in by onDeployed as each contract lands, for a clean resume. */
@@ -185,6 +187,7 @@ export const deployStateSchema: z.ZodType<DeployState, z.ZodTypeDef, unknown> = 
     // hedging became opt-in.
     hedgeWalletBalances: z.boolean().optional().default(false),
     sfpmSwapProvisioned: z.boolean().optional().default(false),
+    safeRelayEnabled: z.boolean().optional().default(false),
     storage: z.enum(['keystore', 'plaintext']),
     extraRoles: z.array(
       z
@@ -630,6 +633,11 @@ async function main(): Promise<void> {
       'Include loose Safe wallet balances in the delta hedge?',
       false,
     )
+    const safeRelayEnabled = await p.confirm(
+      'Gas-less Safe transactions? (the bot executes transactions once the owners have ' +
+        'signed them in Safe{Wallet}, paying the gas from its own ETH)',
+      false,
+    )
 
     // Optional: an extra address (besides the Safe) holding plain Uniswap v3/v4
     // LP positions on this pool's token pair. Recorded as UNISWAP_LP_OWNER and
@@ -921,6 +929,9 @@ async function main(): Promise<void> {
     console.log(
       ` Wallet balances in hedge delta: ${hedgeWalletBalances ? 'INCLUDED' : 'excluded (default)'}`,
     )
+    console.log(
+      ` Gas-less signed Safe transactions: ${safeRelayEnabled ? 'ENABLED (bot pays gas)' : 'disabled (default)'}`,
+    )
     if (!(await p.confirm('\n Proceed?', false))) {
       console.log('Aborted. Nothing was deployed.')
       p.close()
@@ -970,6 +981,7 @@ async function main(): Promise<void> {
       hedgeIncludeLp,
       hedgeWalletBalances,
       sfpmSwapProvisioned,
+      safeRelayEnabled,
       storage: botStorage,
       extraRoles: extraRoles.map((r) => ({
         kind: r.kind,
@@ -1299,6 +1311,7 @@ async function finalizeDeployment(args: {
     UNISWAP_LP_OWNER: state.uniswapLpOwner,
     HEDGE_INCLUDE_LP: state.hedgeIncludeLp,
     HEDGE_WALLET_BALANCES: state.hedgeWalletBalances,
+    SAFE_RELAY_ENABLED: state.safeRelayEnabled,
     DELEVERAGER_ENABLED: deleveragerSpec ? true : undefined,
     ...sfpmSwap?.env,
   }

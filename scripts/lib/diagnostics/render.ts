@@ -80,6 +80,7 @@ export function renderStatus(s: StatusSnapshot): void {
   row('last poll', s.lastPoll)
   row('last hedge', s.lastHedge)
   row('oracle recovery', s.oracleRecovery)
+  row('signed-tx relay', s.safeRelay)
   row('timed hedge', s.timedHedging)
   row('deleverager', s.deleverager)
   for (const note of s.notes) console.log(paint(33, `  note: ${note}`))

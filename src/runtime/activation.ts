@@ -220,6 +220,8 @@ export function buildActivationPolicy(
     },
     pollIntervalMs: config.POLL_INTERVAL_MS,
     oraclePokeEnabled: config.ORACLE_POKE_ENABLED,
+    // Omitted when disabled so markers written before the relay existed stay valid.
+    ...(config.SAFE_RELAY_ENABLED ? { safeRelay: 'threshold-signed-current-nonce-v1' } : {}),
     codeIdentityFingerprint: evidence.codeIdentityFingerprint,
     permissionManifestFingerprint: evidence.permissionManifestFingerprint,
   }

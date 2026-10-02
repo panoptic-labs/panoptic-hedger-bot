@@ -152,6 +152,18 @@ export const DEFAULT_LP_SUBGRAPH_URL =
 /** Default for LP_SUBGRAPH_MAX_LAG_BLOCKS; shared with the setup wizard's preview. */
 export const DEFAULT_LP_SUBGRAPH_MAX_LAG_BLOCKS = 50n
 
+const SAFE_TX_SERVICE_CHAIN_PREFIX: Readonly<Record<number, string>> = {
+  1: 'eth',
+  8453: 'base',
+  11155111: 'sep',
+}
+
+/** Public Safe Transaction Service base URL for a chain, when one exists. */
+export function safeTransactionServiceUrl(chainId: number): string | undefined {
+  const prefix = SAFE_TX_SERVICE_CHAIN_PREFIX[chainId]
+  return prefix === undefined ? undefined : `https://api.safe.global/tx-service/${prefix}`
+}
+
 export const PRICE_SIGNAL_SOURCES = ['pool-tick', 'uniswap-pool', 'cex'] as const
 
 /**
@@ -310,6 +322,10 @@ const rawEnvSchema = z
     // Permissionless direct-EOA recovery call. Opt-in because it spends keeper
     // gas independently of hedge dispatches; live use is activation-bound.
     ORACLE_POKE_ENABLED: booleanSchema.default('false'),
+    // Gas-less owner flow: the keeper executes queued Safe transactions once the
+    // owners' off-chain signatures reach the threshold, paying the gas itself.
+    // Opt-in and activation-bound because it spends keeper gas on owner intents.
+    SAFE_RELAY_ENABLED: booleanSchema.default('false'),
     DRY_RUN: booleanSchema.default('false'),
     BALANCE_FIRST_ENABLED: booleanSchema.default('false'),
 
@@ -552,6 +568,14 @@ const rawEnvSchema = z
             'must be below MIN_MARGIN_RESERVE_BPS (emergency burns must trigger only below the mint gate)',
         })
       }
+    }
+
+    if (cfg.SAFE_RELAY_ENABLED && safeTransactionServiceUrl(cfg.CHAIN_ID) === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SAFE_RELAY_ENABLED'],
+        message: `no Safe Transaction Service is known for chain ${cfg.CHAIN_ID}`,
+      })
     }
 
     const hasTgToken = Boolean(cfg.TELEGRAM_BOT_TOKEN)

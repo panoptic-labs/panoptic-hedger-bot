@@ -33,6 +33,16 @@ describe('parseHedgerBotConfig', () => {
     expect(cfg.HEDGE_WALLET_BALANCES).toBe(false)
   })
 
+  it('enables the signed Safe transaction relay only where a Safe service exists', () => {
+    expect(parseHedgerBotConfig({ ...BASE_ENV }).SAFE_RELAY_ENABLED).toBe(false)
+    expect(
+      parseHedgerBotConfig({ ...BASE_ENV, SAFE_RELAY_ENABLED: 'true' }).SAFE_RELAY_ENABLED,
+    ).toBe(true)
+    expect(() =>
+      parseHedgerBotConfig({ ...BASE_ENV, CHAIN_ID: '31337', SAFE_RELAY_ENABLED: 'true' }),
+    ).toThrow(/SAFE_RELAY_ENABLED: no Safe Transaction Service is known for chain 31337/)
+  })
+
   it('allows explicit wallet-balance hedging opt-in', () => {
     expect(
       parseHedgerBotConfig({ ...BASE_ENV, HEDGE_WALLET_BALANCES: 'true' }).HEDGE_WALLET_BALANCES,

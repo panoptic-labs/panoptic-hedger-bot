@@ -48,6 +48,7 @@ export interface EnvValues {
   // Loop
   POLL_INTERVAL_MS?: number
   ORACLE_POKE_ENABLED?: boolean
+  SAFE_RELAY_ENABLED?: boolean
   DRY_RUN?: boolean
   // Optional
   UNISWAP_LP_OWNER?: `0x${string}`
@@ -157,6 +158,7 @@ export function renderEnvFile(values: EnvValues): string {
         // (falls back to the schema default when the wizard didn't set one).
         { key: 'POLL_INTERVAL_MS', value: values.POLL_INTERVAL_MS ?? 60_000 },
         { key: 'ORACLE_POKE_ENABLED', value: values.ORACLE_POKE_ENABLED ?? false },
+        { key: 'SAFE_RELAY_ENABLED', value: values.SAFE_RELAY_ENABLED ?? false },
         { key: 'DRY_RUN', value: values.DRY_RUN },
       ],
     },

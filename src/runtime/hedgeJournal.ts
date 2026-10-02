@@ -14,6 +14,7 @@ export type HedgeJournalAction =
   | 'collateral_swap'
   | 'sfpm_swap'
   | 'wallet_redeposit'
+  | 'safe_relay'
 
 const addressSchema = z.string().regex(/^0x[0-9a-fA-F]{40}$/)
 const hexSchema = z.string().regex(/^0x[0-9a-f]+$/)
@@ -34,6 +35,7 @@ const journalIntentSchema = z
       'collateral_swap',
       'sfpm_swap',
       'wallet_redeposit',
+      'safe_relay',
     ]),
     sender: addressSchema.nullable(),
     nonce: z.number().int().nonnegative().nullable(),

@@ -154,4 +154,20 @@ describe('multi-instance operations validation', () => {
     addInstance(ops, 'instance-b', { signer: address('6') })
     expect(() => checkMultiInstanceDirectory(ops)).toThrow(/chain\+Safe\+pool duplicates/)
   })
+
+  it('allows the signed-transaction relay on only one instance per Safe', () => {
+    const ops = createOps()
+    addInstance(ops, 'instance-a', { env: { SAFE_RELAY_ENABLED: 'true' } })
+    addInstance(ops, 'instance-b', {
+      signer: address('6'),
+      env: { POOL_ADDRESS: address('7'), SAFE_RELAY_ENABLED: 'false' },
+    })
+    expect(checkMultiInstanceDirectory(ops).instances).toHaveLength(2)
+
+    addInstance(ops, 'instance-c', {
+      signer: address('8'),
+      env: { POOL_ADDRESS: address('9'), SAFE_RELAY_ENABLED: 'true' },
+    })
+    expect(() => checkMultiInstanceDirectory(ops)).toThrow(/one instance per Safe/)
+  })
 })

@@ -39,8 +39,8 @@ const BASE_ENV_BODY = [
   '',
 ].join('\n')
 
-// 15 knobs apply with this env (no SFPM, no deleverager).
-const KNOB_COUNT = 15
+// 16 knobs apply with this env (no SFPM, no deleverager).
+const KNOB_COUNT = 16
 
 let dir: string
 afterEach(() => rmSync(dir, { recursive: true, force: true }))
@@ -108,6 +108,16 @@ describe('runTune', () => {
     expect(body).toContain('TIMED_HEDGE_INTERVAL_MS=300000')
     expect(body).toContain('TIMED_HEDGE_MIN_DRIFT_BPS=50')
     expect(body).not.toContain('TIMED_HEDGE_MIN_DRIFT_BPS=100')
+  })
+
+  it('enables the signed Safe transaction relay from its confirm prompt', async () => {
+    const envPath = makeEnv()
+    const answers = Array(KNOB_COUNT).fill('')
+    answers[15] = 'y' // SAFE_RELAY_ENABLED is the last ungated knob
+    const p = prompter(answers)
+    await runTune(envPath, p, () => {})
+    p.close()
+    expect(readFileSync(envPath, 'utf8')).toContain('SAFE_RELAY_ENABLED=true')
   })
 
   it('throws a pnpm-onboard pointer when no .env exists', async () => {

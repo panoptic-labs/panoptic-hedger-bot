@@ -46,6 +46,7 @@ export interface StatusSnapshot {
   lastPoll?: string
   lastHedge?: string
   oracleRecovery?: string
+  safeRelay?: string
   timedHedging?: string
   deleverager?: string
   notes: string[]
@@ -126,6 +127,11 @@ export async function gatherStatus(ctx: StatusDiagnosticsContext): Promise<Statu
         } (${state?.lastOraclePokeResult ?? 'none'}${
           state?.lastOraclePokeTx ? ` ${state.lastOraclePokeTx}` : ''
         })`,
+    safeRelay: !config.SAFE_RELAY_ENABLED
+      ? 'disabled'
+      : `enabled; last ${state?.lastSafeRelayAt ? fmtAgo(state.lastSafeRelayAt) : 'never'} (${
+          state?.lastSafeRelayResult ?? 'none'
+        }${state?.lastSafeRelayTx ? ` ${state.lastSafeRelayTx}` : ''})`,
     timedHedging,
     deleverager: !config.DELEVERAGER_ENABLED
       ? 'disabled'

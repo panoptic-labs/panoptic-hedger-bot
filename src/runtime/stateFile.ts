@@ -65,6 +65,18 @@ const runtimeStateSchema = z
       .regex(/^0x[0-9a-fA-F]+$/)
       .optional(),
     lastOraclePokeResult: z.enum(['confirmed', 'dry-run', 'deferred', 'failed']).optional(),
+    lastSafeRelayAt: iso.optional(),
+    lastSafeRelaySafeTxHash: z
+      .string()
+      .regex(/^0x[0-9a-fA-F]{64}$/)
+      .optional(),
+    lastSafeRelayTx: z
+      .string()
+      .regex(/^0x[0-9a-fA-F]+$/)
+      .optional(),
+    lastSafeRelayResult: z
+      .enum(['executed', 'dry-run', 'deferred', 'skipped', 'failed'])
+      .optional(),
     consecutiveSignalFailures: z.number().int().nonnegative().optional(),
     consecutivePendingHolds: z.number().int().nonnegative().optional(),
     lastHedgeAt: iso.optional(),

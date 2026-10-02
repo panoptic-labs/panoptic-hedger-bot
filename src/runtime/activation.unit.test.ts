@@ -16,6 +16,7 @@ import { parseHedgerBotConfig } from '../config'
 import {
   type ActivationEvidence,
   buildActivationMarker,
+  buildActivationPolicy,
   clearActivation,
   isActivated,
   readActivation,
@@ -106,6 +107,7 @@ describe('activation marker', () => {
       { ...config, KEEPER_BALANCE_WARN_ETH: config.KEEPER_BALANCE_WARN_ETH + 1n },
       { ...config, TX_RECEIPT_TIMEOUT_MS: config.TX_RECEIPT_TIMEOUT_MS + 1 },
       { ...config, DELEVERAGER_ENABLED: true },
+      { ...config, SAFE_RELAY_ENABLED: true },
     ]
     for (const changed of mutations) expect(isActivated(changed, BOT, evidence)).toBe(false)
     expect(isActivated(config, SAFE, evidence)).toBe(false)
@@ -113,6 +115,13 @@ describe('activation marker', () => {
     expect(isActivated(config, BOT, { ...evidence, permissionManifestFingerprint: HASH_A })).toBe(
       false,
     )
+  })
+
+  it('leaves the policy of a relay-disabled bot unchanged so existing markers stay valid', () => {
+    expect(buildActivationPolicy(config, BOT, evidence)).not.toHaveProperty('safeRelay')
+    expect(
+      buildActivationPolicy({ ...config, SAFE_RELAY_ENABLED: true }, BOT, evidence),
+    ).toHaveProperty('safeRelay')
   })
 
   it('canonicalizes address case', () => {

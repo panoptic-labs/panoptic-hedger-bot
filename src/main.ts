@@ -16,7 +16,12 @@ import {
 import type { Address } from 'viem'
 import { createPublicClient, createWalletClient, fallback, http, parseAbi, zeroAddress } from 'viem'
 
-import { deleveragerRoleKey, parseHedgerBotConfig, walletWethAddress } from './config'
+import {
+  deleveragerRoleKey,
+  parseHedgerBotConfig,
+  safeTransactionServiceUrl,
+  walletWethAddress,
+} from './config'
 import { createHedgeExecutor, createSamePoolLoanExecutor } from './executor'
 import { createSfpmSwapExecutor } from './executor/sfpmSwapExecutor'
 import { createGasPolicy } from './gas/gasPolicy'
@@ -46,8 +51,10 @@ import {
   trustedLastDeltaHedgeAt,
   writeRuntimeState,
 } from './runtime/stateFile'
+import { type KeeperSenderDeps, createKeeperSender } from './safe/keeperSender'
 import { resolveBotAccount } from './safe/resolveBotAccount'
 import { createRolesExecutor } from './safe/rolesExecutor'
+import { type SafeRelayOutcome, createSignedSafeTxRelay } from './safe/signedTxRelay'
 import { assertProductionEligibleConfig } from './security/productionProfile'
 import { parseBuilderCode } from './utils/builderCode'
 import { defineBotChain } from './utils/chain'
@@ -61,6 +68,7 @@ const STARTUP_RETRY_DELAYS_MS = [15_000, 60_000, 120_000, 300_000] as const
 const ORACLE_POKE_INTERVAL_MS = 65_000
 const FAST_MONITOR_INTERVAL_MS = 12_000
 const DEGRADED_RECONCILE_INTERVAL_MS = 60_000
+const SAFE_RELAY_INTERVAL_MS = 15_000
 
 async function initWithRetry(
   init: () => Promise<void>,
@@ -186,12 +194,10 @@ async function main(): Promise<void> {
     { nonceStallBlocks: BigInt(config.HEDGER_NONCE_STALL_BLOCKS) },
   )
 
-  const rolesExecutor = createRolesExecutor({
+  const keeperSenderDeps: KeeperSenderDeps = {
     publicClient,
     walletClient,
     account,
-    rolesModifierAddress: config.ROLES_MODIFIER_ADDRESS,
-    roleKey: config.ROLE_KEY,
     safeAddress: config.SAFE_ADDRESS,
     chain,
     fees: (opts) => gasPolicy.fees(opts),
@@ -206,6 +212,11 @@ async function main(): Promise<void> {
       assertTradingEnabled()
       instanceLease.assertOwned()
     },
+  }
+  const rolesExecutor = createRolesExecutor({
+    ...keeperSenderDeps,
+    rolesModifierAddress: config.ROLES_MODIFIER_ADDRESS,
+    roleKey: config.ROLE_KEY,
   })
 
   const executor = createHedgeExecutor(config, {
@@ -224,30 +235,30 @@ async function main(): Promise<void> {
         publicClient,
         safeAddress: config.SAFE_ADDRESS,
         rolesExecutor: createRolesExecutor({
-          publicClient,
-          walletClient,
-          account,
+          ...keeperSenderDeps,
           rolesModifierAddress: config.ROLES_MODIFIER_ADDRESS,
           roleKey: deleveragerRoleKey(config),
-          safeAddress: config.SAFE_ADDRESS,
-          chain,
-          fees: (opts) => gasPolicy.fees(opts),
-          bumpFees: (prev, opts) => gasPolicy.bumped(prev, opts),
-          txWait: {
-            timeoutMs: config.TX_RECEIPT_TIMEOUT_MS,
-          },
-          observeTransaction: (update) => hedgeJournal.observeTransaction(update),
-          recordBroadcastAttempt: () => hedgeJournal.recordBroadcastAttempt(),
-          recordBroadcastRejection: () => hedgeJournal.recordBroadcastRejection(),
-          assertSendAllowed: () => {
-            assertTradingEnabled()
-            instanceLease.assertOwned()
-          },
         }),
         builderCode: parseBuilderCode(config.PANOPTIC_BUILDER_CODE),
         dryRun: config.DRY_RUN,
       })
     : undefined
+
+  const safeRelayServiceUrl = safeTransactionServiceUrl(config.CHAIN_ID)
+  const safeRelay =
+    config.SAFE_RELAY_ENABLED && safeRelayServiceUrl
+      ? createSignedSafeTxRelay({
+          publicClient,
+          sender: createKeeperSender(keeperSenderDeps),
+          gasPolicy,
+          hedgeJournal,
+          fetch,
+          serviceUrl: safeRelayServiceUrl,
+          safeAddress: config.SAFE_ADDRESS,
+          botAddress: account.address,
+          dryRun: config.DRY_RUN,
+        })
+      : undefined
 
   // Pool token decimals (needed by the cex signal to convert USD price → tick).
   const metadata = await getPoolMetadata({
@@ -539,6 +550,8 @@ async function main(): Promise<void> {
   }
   let activeCycle: Promise<CycleOutcome> | null = null
   let activeOraclePoke: Promise<void> | null = null
+  let activeRelay: Promise<void> | null = null
+  let lastRelayReport = ''
   let lastOracleDiagnosis = ''
   let shuttingDown = false
   let fastMonitorInFlight = false
@@ -553,7 +566,8 @@ async function main(): Promise<void> {
       !config.ORACLE_POKE_ENABLED ||
       !oracleRiskParameters ||
       activeCycle ||
-      activeOraclePoke
+      activeOraclePoke ||
+      activeRelay
     ) {
       return Promise.resolve()
     }
@@ -687,7 +701,7 @@ async function main(): Promise<void> {
   }
 
   const runAndRecord = (trigger: string): Promise<CycleOutcome> => {
-    if (activeCycle || activeOraclePoke) {
+    if (activeCycle || activeOraclePoke || activeRelay) {
       queuedTrigger ??= trigger
       return Promise.resolve('in-flight')
     }
@@ -708,6 +722,120 @@ async function main(): Promise<void> {
       // A failed SafeMode hedge should not wait for the next 65-second timer
       // edge. The epoch check makes this a no-op when a dispatch already poked.
       void runOraclePoke('post-cycle')
+    }
+    void pending.then(clear, clear)
+    return pending
+  }
+
+  const reportRelay = async (outcome: SafeRelayOutcome): Promise<void> => {
+    if (outcome.kind === 'idle') {
+      lastRelayReport = ''
+      return
+    }
+    if (outcome.kind === 'deferred') {
+      const now = new Date().toISOString()
+      patchRuntimeState(instanceId, {
+        lastSafeRelayAt: now,
+        lastSafeRelayTx: undefined,
+        lastSafeRelaySafeTxHash: outcome.safeTxHash,
+        lastSafeRelayResult: 'deferred',
+      })
+      if (!outcome.shouldNotify) return
+      botLog(`[hedger-bot] signed Safe tx ${outcome.safeTxHash} deferred: ${outcome.reason}`)
+      await notifier.notify(`Signed Safe transaction deferred: ${outcome.reason}`)
+      return
+    }
+    const key = `${outcome.kind}:${outcome.safeTxHash ?? ''}:${
+      outcome.kind === 'skipped' ? outcome.code : ''
+    }`
+    if (key === lastRelayReport) return
+    lastRelayReport = key
+    const now = new Date().toISOString()
+    if (outcome.kind === 'executed') {
+      patchRuntimeState(instanceId, {
+        lastSafeRelayAt: now,
+        lastSafeRelaySafeTxHash: outcome.safeTxHash,
+        lastSafeRelayTx: outcome.transactionHash,
+        lastSafeRelayResult: 'executed',
+      })
+      botLog(
+        `[hedger-bot] relayed signed Safe tx ${outcome.safeTxHash} (nonce ${outcome.nonce}): ` +
+          outcome.transactionHash,
+      )
+      await notifier.notify(
+        `✅ Executed signed Safe transaction (nonce ${outcome.nonce}): ${outcome.transactionHash}`,
+      )
+    } else if (outcome.kind === 'simulated') {
+      patchRuntimeState(instanceId, {
+        lastSafeRelayAt: now,
+        lastSafeRelaySafeTxHash: outcome.safeTxHash,
+        lastSafeRelayTx: undefined,
+        lastSafeRelayResult: 'dry-run',
+      })
+      botLog(
+        `[hedger-bot] DRY RUN: would relay signed Safe tx ${outcome.safeTxHash} ` +
+          `(nonce ${outcome.nonce})`,
+      )
+    } else {
+      patchRuntimeState(instanceId, {
+        lastSafeRelaySafeTxHash: outcome.safeTxHash,
+        lastSafeRelayAt: now,
+        lastSafeRelayTx: undefined,
+        lastSafeRelayResult: 'skipped',
+      })
+      botWarn(
+        `[hedger-bot] not relaying signed Safe tx ${outcome.safeTxHash ?? '(multiple)'}: ` +
+          outcome.reason,
+      )
+      await notifier.notify(`Signed Safe transaction not executed: ${outcome.reason}`)
+    }
+  }
+
+  const runSafeRelay = (): Promise<void> => {
+    if (
+      !safeRelay ||
+      shuttingDown ||
+      activeCycle ||
+      activeOraclePoke ||
+      activeRelay ||
+      hedgeJournal.hasPendingIntent() ||
+      pendingSwapStore.read()
+    ) {
+      return Promise.resolve()
+    }
+    const pending = (async () => {
+      let executed = false
+      try {
+        const outcome = await safeRelay.relayNext()
+        executed = outcome.kind === 'executed'
+        await reportRelay(outcome)
+      } catch (error) {
+        patchRuntimeState(instanceId, {
+          lastSafeRelayAt: new Date().toISOString(),
+          lastSafeRelayTx: undefined,
+          lastSafeRelayResult: 'failed',
+        })
+        if (lastRelayReport !== 'failed') {
+          lastRelayReport = 'failed'
+          botError('[hedger-bot] signed Safe tx relay failed', error)
+          await notifier.notify(`Signed Safe transaction relay failed: ${sanitizeError(error)}`)
+        }
+      }
+      if (executed) {
+        // An owner transaction may have changed the positions or collateral being hedged.
+        hedgeTriggerMonitor.invalidate()
+        queuedTrigger ??= 'safe-relay'
+      }
+    })()
+    activeRelay = pending
+    const clear = () => {
+      if (activeRelay !== pending) return
+      activeRelay = null
+      if (queuedTrigger) {
+        const queued = queuedTrigger
+        queuedTrigger = undefined
+        void runAndRecord(queued)
+      }
     }
     void pending.then(clear, clear)
     return pending
@@ -800,7 +928,8 @@ async function main(): Promise<void> {
   botLog(
     `[hedger-bot] starting: chain=${config.CHAIN_ID} pool=${config.POOL_ADDRESS} safe=${config.SAFE_ADDRESS} ` +
       `signal=${config.PRICE_SIGNAL_SOURCE} dryRun=${config.DRY_RUN}${activated ? '' : ' (forced: not activated)'} ` +
-      `reconcileInterval=${config.POLL_INTERVAL_MS}ms fastMonitorInterval=${FAST_MONITOR_INTERVAL_MS}ms`,
+      `reconcileInterval=${config.POLL_INTERVAL_MS}ms fastMonitorInterval=${FAST_MONITOR_INTERVAL_MS}ms ` +
+      `safeRelay=${safeRelay ? 'on' : 'off'}`,
   )
 
   const recordInitFailure = (attempt: number, error: unknown) =>
@@ -815,6 +944,7 @@ async function main(): Promise<void> {
   let fastMonitorTimer: ReturnType<typeof setInterval> | undefined
   let degradedTimer: ReturnType<typeof setInterval> | undefined
   let oraclePokeTimer: ReturnType<typeof setInterval> | undefined
+  let safeRelayTimer: ReturnType<typeof setInterval> | undefined
   let leaseHeartbeat: InstanceLeaseHeartbeat | undefined
   // Register before startup RPC work so termination still releases state,
   // signer resources, and the single-instance lease during initialization.
@@ -826,6 +956,7 @@ async function main(): Promise<void> {
     if (fastMonitorTimer) clearInterval(fastMonitorTimer)
     if (degradedTimer) clearInterval(degradedTimer)
     if (oraclePokeTimer) clearInterval(oraclePokeTimer)
+    if (safeRelayTimer) clearInterval(safeRelayTimer)
     leaseHeartbeat?.stop()
     priceSource.stop?.()
     if (activeCycle) {
@@ -833,6 +964,9 @@ async function main(): Promise<void> {
     }
     if (activeOraclePoke) {
       await Promise.race([activeOraclePoke.catch(() => undefined), sleep(15_000)])
+    }
+    if (activeRelay) {
+      await Promise.race([activeRelay.catch(() => undefined), sleep(15_000)])
     }
     // Keep the final heartbeat as trusted cadence history. `pnpm status` uses
     // the recorded PID to distinguish this stopped instance from a live one,
@@ -894,6 +1028,12 @@ async function main(): Promise<void> {
     oraclePokeTimer = setInterval(() => {
       void runOraclePoke('safe-mode-recovery')
     }, ORACLE_POKE_INTERVAL_MS)
+  }
+  if (safeRelay) {
+    void runSafeRelay()
+    safeRelayTimer = setInterval(() => {
+      void runSafeRelay()
+    }, SAFE_RELAY_INTERVAL_MS)
   }
 }
 

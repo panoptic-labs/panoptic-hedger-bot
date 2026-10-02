@@ -103,6 +103,12 @@ export const TUNE_KNOBS: readonly TuneKnob[] = [
     current: (cfg) => gwei(cfg.URGENT_PRIORITY_FEE_GWEI),
   },
   {
+    key: 'SAFE_RELAY_ENABLED',
+    hint: 'gas-less owners: bot executes Safe txs once signed, paying the gas',
+    current: (cfg) => String(cfg.SAFE_RELAY_ENABLED),
+    kind: 'confirm',
+  },
+  {
     key: 'SFPM_SWAP_MIN_SAVINGS_BPS',
     hint: 'route off-venue only when 5bps beats in-pool by this margin',
     current: (cfg) => cfg.SFPM_SWAP_MIN_SAVINGS_BPS.toString(),
