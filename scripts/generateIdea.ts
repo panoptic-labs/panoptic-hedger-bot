@@ -83,12 +83,12 @@ export async function runGenerateIdea(p: Prompter, ctx: GenerateIdeaContext): Pr
     'Position convexity',
     [
       {
-        label: 'Long convexity — BUY options (pay premium; unlimited upside, capped downside)',
+        label: 'Long convexity — BUY options (pay streamia; unlimited upside, capped downside)',
         value: 'long',
       },
       {
         label:
-          'Short convexity — SELL options (collect premium; capped upside, unlimited downside)',
+          'Short convexity — SELL options (collect streamia; capped upside, unlimited downside)',
         value: 'short',
       },
     ],

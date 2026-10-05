@@ -190,7 +190,7 @@ temporary-loan dispatch (`swapAtMint=false` mint followed by a
 `swapAtMint=true` burn) whose final position list is unchanged. Off-venue it is
 one atomic SFPM withdrawal/swap/deposit. Partial inventory is consumed first and
 the next pinned cycle replans the residual. Every balance-first swap retains a
-rounded-up 50bps reserve of the sold token for premiums and commissions; a
+rounded-up 50bps reserve of the sold token for streamia (streaming premium) and commissions; a
 positive dust balance therefore never rounds down to a zero reserve.
 
 The two-transaction off-venue loan fallback remains restart-safe: after its
@@ -478,7 +478,7 @@ would *mint* a loan is deferred while paused; loan-shrinking burns proceed.
 
 The deleverager role can **only burn** (every `positionSizes` entry must be 0 —
 a zero size can never mint, and the whole dispatch reverts otherwise). It
-**cannot mint, cannot move funds, and cannot settle premium**. Funds always stay
+**cannot mint, cannot move funds, and cannot settle streamia**. Funds always stay
 in the Safe. It is disabled by default; enable it with `DELEVERAGER_ENABLED=true`.
 
 Provision it:
