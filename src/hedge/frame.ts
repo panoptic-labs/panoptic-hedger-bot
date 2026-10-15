@@ -40,8 +40,8 @@ export function toVaultFrameAtSqrtPriceX96(
 /**
  * Wallet-aware option-book delta (free-collateral term added by the caller).
  *
- * Option legs (width>0): delta is computed in the leg's own `leg.asset` frame then
- * converted to the vault frame.
+ * Option legs (width>0): delta is the leg's current holding of the vault token,
+ * with no mint-time adjustment.
  *
  * Loan/credit legs (width=0): evaluated DIRECTLY in the vault frame. A width=0 leg
  * on the vault asset is spot the user has "tucked away" — credit = +notional,
