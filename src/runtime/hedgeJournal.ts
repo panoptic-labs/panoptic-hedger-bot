@@ -489,6 +489,21 @@ export class HedgeJournal implements HedgeJournalPort {
         this.fail()
         continue
       }
+      // Every recorded attempt was explicitly rejected by the RPC and none produced
+      // a hash, so no transaction for this intent can be live. Older entries
+      // without rejection evidence are not reinterpreted and stay on the fence.
+      if (
+        entry.hashes.length === 0 &&
+        entry.rejectedBroadcastAttempts === entry.broadcastAttempts
+      ) {
+        botLog(
+          `[hedger-bot] releasing intent ${entry.id} (action=${entry.action}, nonce=${entry.nonce}): ` +
+            `all ${entry.broadcastAttempts} broadcast attempt(s) were explicitly rejected`,
+        )
+        this.activeIntentId = entry.id
+        this.fail()
+        continue
+      }
       const chainNonce = await publicClient.getTransactionCount(getAddress(entry.sender))
       if (chainNonce > entry.nonce) {
         botWarn(

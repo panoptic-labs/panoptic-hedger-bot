@@ -8,7 +8,11 @@ import { assessSafety } from './hedge/safety'
 import { resolveNettedShrinkDispatch } from './hedge/shrinkRouteEvaluator'
 import { readHedgeSnapshot } from './hedge/snapshot'
 import { HedgerBot } from './hedgerBot'
-import { type RolesExecutor, TxNotMinedError } from './safe/rolesExecutor'
+import {
+  type RolesExecutor,
+  KeeperInsufficientFundsError,
+  TxNotMinedError,
+} from './safe/rolesExecutor'
 
 vi.mock('@panoptic-eng/sdk/v2', () => ({
   getChainDeployment: () => undefined,
@@ -911,6 +915,42 @@ describe('HedgerBot stuck dispatch (TxNotMinedError)', () => {
     // best-guess dispatch hash into the read.
     expect(vi.mocked(readHedgeSnapshot).mock.calls.length).toBe(2)
     expect(execute).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('HedgerBot keeper insufficient funds', () => {
+  it('alerts once per nonce while the keeper stays underfunded', async () => {
+    const notify = vi.fn(async (_message: unknown) => undefined)
+    const shortfall = (available: bigint) =>
+      new KeeperInsufficientFundsError({
+        sender: '0x3333333333333333333333333333333333333333',
+        nonce: 102,
+        available,
+        required: 1_000n,
+      })
+    const execute = vi
+      .fn()
+      .mockRejectedValueOnce(shortfall(10n))
+      .mockRejectedValueOnce(shortfall(20n))
+      .mockRejectedValueOnce(shortfall(30n))
+    const { bot } = await makeBot(
+      {
+        transactionHash: null,
+        receipt: null,
+        openedTokenId: null,
+        closedTokenIds: [],
+        dryRun: false,
+      },
+      'success',
+      {
+        executor: { kind: 'same-pool-loan', execute } as unknown as HedgeExecutor,
+        notifier: { notify },
+      },
+    )
+    for (const trigger of ['c1', 'c2', 'c3']) expect(await bot.runCycle(trigger)).toBe('error')
+    expect(execute).toHaveBeenCalledTimes(3)
+    expect(notify).toHaveBeenCalledTimes(1)
+    expect(String(notify.mock.calls[0][0])).toMatch(/keeper has insufficient ETH for nonce 102/)
   })
 })
 

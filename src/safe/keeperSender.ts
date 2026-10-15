@@ -8,7 +8,12 @@ import type {
   TransactionReceipt,
   WalletClient,
 } from 'viem'
-import { keccak256, TransactionReceiptNotFoundError } from 'viem'
+import {
+  formatEther,
+  InsufficientFundsError,
+  keccak256,
+  TransactionReceiptNotFoundError,
+} from 'viem'
 
 import type { GasFees } from '../gas/gasPolicy'
 import type { JournalTransactionUpdate } from '../runtime/hedgeJournal'
@@ -81,16 +86,72 @@ export class TxNotMinedError extends Error {
   readonly hashes: Hex[]
   /** The most recent (highest-fee) attempt — the best guess at what may land. */
   readonly lastHash: Hex
+  /** Set when fee escalation stopped because the keeper could not fund a replacement. */
+  readonly insufficientFunds?: KeeperInsufficientFundsError
 
-  constructor(hashes: Hex[], timeoutMs: number) {
+  constructor(hashes: Hex[], timeoutMs: number, insufficientFunds?: KeeperInsufficientFundsError) {
     const last = hashes[hashes.length - 1]
     super(
       `dispatch not mined within ${timeoutMs}ms after ${hashes.length} attempt(s) ` +
-        `(last ${last}) — check the keeper's pending txs`,
+        `(last ${last}) — check the keeper's pending txs` +
+        (insufficientFunds ? `; fee escalation stopped: ${insufficientFunds.message}` : ''),
     )
     this.name = 'TxNotMinedError'
     this.hashes = hashes
     this.lastHash = last
+    this.insufficientFunds = insufficientFunds
+  }
+}
+
+/**
+ * The keeper EOA cannot fund the maximum cost (gas * maxFeePerGas + value) of a
+ * broadcast. Raised either by the local balance preflight (nothing was sent)
+ * or from an explicit RPC insufficient-funds rejection (recorded as rejected).
+ * The message avoids the phrases matched by the SDK's isNonceError so cycle
+ * error handling cannot suppress the alert.
+ */
+export class KeeperInsufficientFundsError extends Error {
+  readonly sender: Address
+  readonly nonce: number
+  /** Balance observed, or null when the balance read itself failed. */
+  readonly available: bigint | null
+  /** Null when the gas limit was never estimated locally (legacy send path). */
+  readonly required: bigint | null
+  /** Null when the local reading cannot quantify it (RPC rejection race). */
+  readonly shortfall: bigint | null
+  /**
+   * The node's rejection. Deliberately not `cause`: the SDK's retryable-RPC
+   * check walks `cause` and treats code -32003 as transient, which would
+   * suppress the alert.
+   */
+  readonly rpcRejection?: unknown
+
+  constructor(args: {
+    sender: Address
+    nonce: number
+    available: bigint | null
+    required: bigint | null
+    rpcRejection?: unknown
+  }) {
+    const { sender, nonce, available, required } = args
+    const shortfall =
+      available !== null && required !== null && required > available ? required - available : null
+    const formatAmount = (wei: bigint | null) =>
+      wei === null ? 'unknown' : `${formatEther(wei)} ETH`
+    super(
+      `keeper has insufficient ETH for nonce ${nonce}: available ${formatAmount(available)}, ` +
+        `required max ${formatAmount(required)}` +
+        (shortfall === null
+          ? ' (rejected by the RPC node)'
+          : `, shortfall ${formatEther(shortfall)} ETH`),
+    )
+    this.name = 'KeeperInsufficientFundsError'
+    this.sender = sender
+    this.nonce = nonce
+    this.available = available
+    this.required = required
+    this.shortfall = shortfall
+    this.rpcRejection = args.rpcRejection
   }
 }
 
@@ -105,8 +166,35 @@ export interface KeeperSender {
 
 const FIRST_REPLACEMENT_BLOCK_DELAY = 2n
 
+const INSUFFICIENT_FUNDS_MESSAGE = /insufficient funds for gas \* price \+ value/i
+
+/**
+ * True when the node deterministically refused a send because the sender
+ * cannot fund it. viem wraps the node error (TransactionExecutionError ->
+ * InsufficientFundsError -> TransactionRejectedRpcError), so walk the cause
+ * chain. A generic TransactionRejectedRpcError is deliberately NOT matched.
+ */
+export function isInsufficientFundsError(error: unknown): boolean {
+  let current: unknown = error
+  for (let depth = 0; depth < 8 && current !== null && current !== undefined; depth++) {
+    if (current instanceof InsufficientFundsError) return true
+    if (typeof current !== 'object') return false
+    const candidate = current as { name?: unknown; message?: unknown; cause?: unknown }
+    if (candidate.name === 'InsufficientFundsError') return true
+    if (candidate.cause === undefined || candidate.cause === null) {
+      // Innermost error only: the node's own rejection text.
+      return (
+        typeof candidate.message === 'string' && INSUFFICIENT_FUNDS_MESSAGE.test(candidate.message)
+      )
+    }
+    current = candidate.cause
+  }
+  return false
+}
+
 function isExplicitBroadcastRejection(error: unknown): boolean {
   if (isGasError(error)) return true
+  if (isInsufficientFundsError(error)) return true
   // "already known" proves that a hashless transaction may be live, so it must
   // remain ambiguous. The other nonce errors explicitly reject this attempt.
   return isNonceError(error) && !/already known/i.test(sanitizeError(error))
@@ -119,6 +207,45 @@ export function createKeeperSender(deps: KeeperSenderDeps): KeeperSender {
 
   async function recordBroadcastRejection(error: unknown): Promise<void> {
     if (isExplicitBroadcastRejection(error)) await deps.recordBroadcastRejection()
+  }
+
+  async function readBalance(): Promise<bigint | null> {
+    try {
+      return await publicClient.getBalance({ address: account.address })
+    } catch (error) {
+      botWarn(
+        '[hedger-bot] keeper balance preflight failed; relying on the RPC funds check: ' +
+          sanitizeError(error),
+      )
+      return null
+    }
+  }
+
+  /** Returns the shortfall error when the keeper cannot fund `gas * maxFeePerGas`. */
+  async function checkAffordable(
+    nonce: number,
+    gas: bigint,
+    fees: Fees,
+  ): Promise<KeeperInsufficientFundsError | null> {
+    const required = gas * fees.maxFeePerGas // value is always 0
+    const available = await readBalance()
+    if (available === null || available >= required) return null
+    return new KeeperInsufficientFundsError({ sender: account.address, nonce, available, required })
+  }
+
+  async function insufficientFundsFromRpc(
+    nonce: number,
+    gas: bigint | undefined,
+    fees: Fees | undefined,
+    rpcRejection: unknown,
+  ): Promise<KeeperInsufficientFundsError> {
+    return new KeeperInsufficientFundsError({
+      sender: account.address,
+      nonce,
+      available: await readBalance(),
+      required: gas !== undefined && fees ? gas * fees.maxFeePerGas : null,
+      rpcRejection,
+    })
   }
 
   async function readEscalationBlock(): Promise<bigint | null> {
@@ -229,6 +356,9 @@ export function createKeeperSender(deps: KeeperSenderDeps): KeeperSender {
         return publicClient.waitForTransactionReceipt({ hash })
       } catch (err) {
         await recordBroadcastRejection(err)
+        if (isInsufficientFundsError(err)) {
+          throw await insufficientFundsFromRpc(nonce, undefined, feeOverrides, err)
+        }
         return rejectWith(err)
       }
     }
@@ -267,6 +397,9 @@ export function createKeeperSender(deps: KeeperSenderDeps): KeeperSender {
     const startedAt = now()
     const deadline = startedAt + txWait.timeoutMs
     await deps.assertSendAllowed()
+    // Preflight before any durable marker: an unaffordable send is never broadcast.
+    const initialShortfall = await checkAffordable(nonce, gas, current)
+    if (initialShortfall) throw initialShortfall
     await observe()
     await deps.recordBroadcastAttempt()
     options.onBroadcastAttempt?.()
@@ -275,6 +408,9 @@ export function createKeeperSender(deps: KeeperSenderDeps): KeeperSender {
       await observe()
     } catch (err) {
       await recordBroadcastRejection(err)
+      if (isInsufficientFundsError(err)) {
+        throw await insufficientFundsFromRpc(nonce, gas, current, err)
+      }
       // First send keeps the inner-revert decoding of the legacy path.
       return rejectWith(err)
     }
@@ -290,6 +426,7 @@ export function createKeeperSender(deps: KeeperSenderDeps): KeeperSender {
       return submittedAtBlock
     })
     let nextBlockDelay = FIRST_REPLACEMENT_BLOCK_DELAY
+    let insufficientFunds: KeeperInsufficientFundsError | undefined
 
     while (now() < deadline) {
       const targetBlock = lastEscalationBlock + nextBlockDelay
@@ -334,6 +471,13 @@ export function createKeeperSender(deps: KeeperSenderDeps): KeeperSender {
       }
       if (now() >= deadline) break
       await deps.assertSendAllowed()
+      const shortfall = await checkAffordable(nonce, gas, next)
+      if (shortfall) {
+        // Stop escalating; the recorded attempts may still land within the budget.
+        insufficientFunds = shortfall
+        botWarn(`[hedger-bot] ${shortfall.message}; no further replacement will be broadcast`)
+        break
+      }
       await deps.recordBroadcastAttempt()
       options.onBroadcastAttempt?.()
       try {
@@ -342,6 +486,13 @@ export function createKeeperSender(deps: KeeperSenderDeps): KeeperSender {
         current = next
       } catch (err) {
         await recordBroadcastRejection(err)
+        if (isInsufficientFundsError(err)) {
+          insufficientFunds = await insufficientFundsFromRpc(nonce, gas, next, err)
+          botWarn(
+            `[hedger-bot] ${insufficientFunds.message}; no further replacement will be broadcast`,
+          )
+          break
+        }
         if (isNonceError(err)) {
           // The nonce was consumed: almost certainly one of OUR attempts mined
           // between the poll and the re-send. Give receipts a short window.
@@ -377,7 +528,7 @@ export function createKeeperSender(deps: KeeperSenderDeps): KeeperSender {
     }
     const swept = await waitForAnyReceipt(hashes, 0)
     if (swept) return swept
-    throw new TxNotMinedError(hashes, txWait.timeoutMs)
+    throw new TxNotMinedError(hashes, txWait.timeoutMs, insufficientFunds)
   }
 
   return { send }

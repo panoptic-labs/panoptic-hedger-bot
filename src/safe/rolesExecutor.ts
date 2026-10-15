@@ -6,7 +6,7 @@ import { assertBotIsNotSafeOwner } from '../security/safeOwnerInvariant'
 import { type KeeperSenderDeps, createKeeperSender } from './keeperSender'
 import { rolesModifierV2Abi } from './rolesAbi'
 
-export { TxNotMinedError } from './keeperSender'
+export { KeeperInsufficientFundsError, TxNotMinedError } from './keeperSender'
 
 /** A single call the bot wants the Safe to perform, relayed via the Roles modifier. */
 export interface RolesCall {

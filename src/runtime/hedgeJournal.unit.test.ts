@@ -402,6 +402,42 @@ describe('HedgeJournal', () => {
     expect(restarted.hasPendingIntent()).toBe(false)
   })
 
+  it('releases immediately when every broadcast attempt was explicitly rejected', async () => {
+    const first = journal()
+    first.begin('open')
+    persistIdentity(first)
+    for (let i = 0; i < 3; i++) {
+      first.recordBroadcastAttempt()
+      first.recordBroadcastRejection()
+    }
+
+    const restarted = journal()
+    // Block 101: well inside the nonce-stall window, before any absence quorum.
+    const recoveryClient = client(new Map(), BLOCK_HASH, 4, 101n, new Set())
+    expect((await restarted.recover(recoveryClient, { scope: 'pending' })).held).toEqual([])
+    expect(restarted.hasPendingIntent()).toBe(false)
+    expect(recoveryClient.captured.transactionQueries).toEqual([])
+  })
+
+  it('keeps legacy unrecorded rejections fenced without rewriting their evidence', async () => {
+    const first = journal()
+    first.begin('open')
+    broadcast(first, [HASH_A, HASH_B])
+    // Incident shape: further attempts whose rejections were never recorded.
+    for (let i = 0; i < 3; i++) first.recordBroadcastAttempt()
+
+    const restarted = journal()
+    const before = JSON.stringify((restarted as unknown as { data: unknown }).data)
+    for (const block of [200n, 201n, 202n]) {
+      const report = await restarted.recover(client(new Map(), BLOCK_HASH, 4, block, new Set()), {
+        scope: 'pending',
+      })
+      expect(report.held[0]?.recoveryState).toBe('ambiguous broadcast without a durable hash')
+    }
+    expect(restarted.hasPendingIntent()).toBe(true)
+    expect(JSON.stringify((restarted as unknown as { data: unknown }).data)).toBe(before)
+  })
+
   it('propagates transport failures from getTransactionReceipt instead of treating them as no-receipt', async () => {
     const first = journal()
     first.begin('open')

@@ -1,5 +1,16 @@
+import { isRetryableRpcError } from '@panoptic-eng/sdk/v2'
 import type { Account, Address, Hex } from 'viem'
-import { decodeFunctionData, toFunctionSelector, TransactionReceiptNotFoundError } from 'viem'
+import {
+  decodeFunctionData,
+  HttpRequestError,
+  InsufficientFundsError,
+  RpcRequestError,
+  TimeoutError,
+  toFunctionSelector,
+  TransactionExecutionError,
+  TransactionReceiptNotFoundError,
+  TransactionRejectedRpcError,
+} from 'viem'
 import { describe, expect, it, vi } from 'vitest'
 
 import { rolesModifierV2Abi } from './rolesAbi'
@@ -7,6 +18,7 @@ import {
   type RolesCall,
   type RolesExecutorDeps,
   createRolesExecutor,
+  KeeperInsufficientFundsError,
   TxNotMinedError,
 } from './rolesExecutor'
 
@@ -175,6 +187,8 @@ describe('RolesExecutor.send — confirm-with-escalation', () => {
     fees?: typeof FEES_A
     blockAt?: (timeMs: number, callIndex: number) => bigint
     txWait?: typeof TX_WAIT
+    /** Keeper balance (wei); defaults to effectively unlimited. */
+    balance?: bigint
   }) {
     let t = 0
     const sendTimes: number[] = []
@@ -212,6 +226,7 @@ describe('RolesExecutor.send — confirm-with-escalation', () => {
           return opts.blockAt?.(t, callIndex) ?? 123n + BigInt(Math.floor(t / 10))
         }),
         estimateGas: vi.fn(async () => GAS),
+        getBalance: vi.fn(async () => opts.balance ?? 10n ** 30n),
         getTransactionReceipt,
       } as never,
       walletClient: { sendTransaction, chain: null } as never,
@@ -363,6 +378,112 @@ describe('RolesExecutor.send — confirm-with-escalation', () => {
       bumpQueue: [FEES_B],
       sendErrors: { 1: new Error('network timeout') },
     })
+    await expect(exec.send(CALL)).rejects.toBeInstanceOf(TxNotMinedError)
+    expect(deps.recordBroadcastRejection).not.toHaveBeenCalled()
+  })
+
+  /** viem's real wrapping as observed in the incident logs. */
+  const wrappedInsufficientFunds = () =>
+    new TransactionExecutionError(
+      new InsufficientFundsError({
+        cause: new TransactionRejectedRpcError(
+          new Error('insufficient funds for gas * price + value: balance 56000000000000'),
+        ),
+      }),
+      { account, chain: undefined } as never,
+    )
+
+  it('records an RPC insufficient-funds rejection of the initial send as explicit', async () => {
+    const { exec, deps, sendTransaction } = makeHarness({
+      sendErrors: { 0: wrappedInsufficientFunds() },
+      balance: 10n ** 30n,
+    })
+    const err = await exec.send(CALL).catch((e) => e)
+    expect(err).toBeInstanceOf(KeeperInsufficientFundsError)
+    expect(err.nonce).toBe(NONCE)
+    expect(err.rpcRejection).toBeInstanceOf(TransactionExecutionError)
+    // The SDK treats a nested -32003 as transient; the alert must not be suppressed.
+    expect(isRetryableRpcError(err)).toBe(false)
+    expect(sendTransaction).toHaveBeenCalledOnce()
+    expect(deps.recordBroadcastAttempt).toHaveBeenCalledOnce()
+    expect(deps.recordBroadcastRejection).toHaveBeenCalledOnce()
+  })
+
+  it('preflights the balance and never broadcasts an unaffordable initial send', async () => {
+    const required = GAS * FEES_A.maxFeePerGas
+    const { exec, deps, sendTransaction } = makeHarness({ balance: required - 5n })
+    const err = await exec.send(CALL).catch((e) => e)
+    expect(err).toBeInstanceOf(KeeperInsufficientFundsError)
+    expect(err).toMatchObject({
+      nonce: NONCE,
+      available: required - 5n,
+      required,
+      shortfall: 5n,
+    })
+    expect(err.message).toMatch(new RegExp(`keeper has insufficient ETH for nonce ${NONCE}`))
+    expect(err.message).not.toMatch(/nonce too (low|high)|already known/i)
+    expect(sendTransaction).not.toHaveBeenCalled()
+    expect(deps.recordBroadcastAttempt).not.toHaveBeenCalled()
+    expect(deps.observeTransaction).not.toHaveBeenCalled()
+  })
+
+  it('stops escalating when a replacement is rejected for insufficient funds', async () => {
+    const { exec, deps, sendTransaction, bumpFees } = makeHarness({
+      bumpQueue: [FEES_B, FEES_B, FEES_B],
+      sendErrors: { 1: wrappedInsufficientFunds() },
+    })
+    const err = await exec.send(CALL).catch((e) => e)
+    expect(err).toBeInstanceOf(TxNotMinedError)
+    expect(err.hashes).toEqual(['0xhash1'])
+    expect(err.insufficientFunds).toBeInstanceOf(KeeperInsufficientFundsError)
+    expect(err.message).toMatch(/keeper has insufficient ETH for nonce/)
+    expect(sendTransaction).toHaveBeenCalledTimes(2)
+    expect(bumpFees).toHaveBeenCalledOnce()
+    expect(deps.recordBroadcastAttempt).toHaveBeenCalledTimes(2)
+    expect(deps.recordBroadcastRejection).toHaveBeenCalledOnce()
+  })
+
+  it('stops escalating without broadcasting when the replacement preflight is short', async () => {
+    // Affords the initial fee level but not the bumped one.
+    const { exec, deps, sendTransaction } = makeHarness({
+      bumpQueue: [FEES_B, FEES_B],
+      balance: GAS * FEES_A.maxFeePerGas,
+      mineAt: { 0: 60 },
+    })
+    expect((await exec.send(CALL)).transactionHash).toBe('0xhash1')
+    expect(sendTransaction).toHaveBeenCalledOnce()
+    expect(deps.recordBroadcastAttempt).toHaveBeenCalledOnce()
+    expect(deps.recordBroadcastRejection).not.toHaveBeenCalled()
+  })
+
+  it("keeps an 'already known' replacement ambiguous", async () => {
+    const { exec, deps } = makeHarness({
+      bumpQueue: [FEES_B],
+      sendErrors: { 1: new Error('already known') },
+    })
+    await expect(exec.send(CALL)).rejects.toBeInstanceOf(Error)
+    expect(deps.recordBroadcastRejection).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['timeout', () => new TimeoutError({ body: {}, url: 'http://rpc' })],
+    [
+      'connection reset',
+      () => new HttpRequestError({ url: 'http://rpc', details: 'socket hang up' }),
+    ],
+    [
+      'generic RPC rejection',
+      () =>
+        new TransactionRejectedRpcError(
+          new RpcRequestError({
+            body: {},
+            url: 'http://rpc',
+            error: { code: -32003, message: 'rejected' },
+          }),
+        ),
+    ],
+  ])('leaves a replacement %s unresolved for journal fencing', async (_label, make) => {
+    const { exec, deps } = makeHarness({ bumpQueue: [FEES_B], sendErrors: { 1: make() } })
     await expect(exec.send(CALL)).rejects.toBeInstanceOf(TxNotMinedError)
     expect(deps.recordBroadcastRejection).not.toHaveBeenCalled()
   })

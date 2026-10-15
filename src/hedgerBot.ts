@@ -58,7 +58,11 @@ import {
   createHedgeRecoveryClient,
 } from './runtime/hedgeJournal'
 import type { PendingSfpmSwapPort } from './runtime/pendingSfpmSwap'
-import { type RolesExecutor, TxNotMinedError } from './safe/rolesExecutor'
+import {
+  type RolesExecutor,
+  KeeperInsufficientFundsError,
+  TxNotMinedError,
+} from './safe/rolesExecutor'
 import { parseBuilderCode } from './utils/builderCode'
 import { botError, botLog, botWarn, formatLogColumns } from './utils/log'
 import { sanitizeError } from './utils/sanitize'
@@ -348,7 +352,11 @@ export class HedgerBot {
         // A stuck recovery failure repeats identically every cycle — alert only
         // when the error changes; ordinary cycle errors keep alerting each time.
         const dedupKey =
-          error instanceof AmbiguousPendingIntentError ? sanitizeError(error) : undefined
+          error instanceof AmbiguousPendingIntentError
+            ? sanitizeError(error)
+            : error instanceof KeeperInsufficientFundsError
+              ? `insufficient-funds:${error.sender}:${error.nonce}`
+              : undefined
         if (dedupKey === undefined || dedupKey !== this.lastAlertedCycleErrorKey) {
           await this.deps.notifier.notify(formatError(trigger, error))
         }
@@ -805,6 +813,9 @@ export class HedgerBot {
       if (error instanceof TxNotMinedError) {
         this.lastDispatchTxHash = error.lastHash
         botError('[hedger-bot] dispatch not mined', error)
+        if (error.insufficientFunds) {
+          botWarn(`[hedger-bot] status: ${error.insufficientFunds.message}`)
+        }
         await notifier.notify(formatError(trigger, error))
         return
       }
