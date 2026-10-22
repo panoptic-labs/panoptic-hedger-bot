@@ -1,7 +1,13 @@
 import { getLpGreeks } from '@panoptic-eng/sdk/uniswap'
 import { describe, expect, it } from 'vitest'
 
-import { type HedgeItem, type PlanHedgeConfig, computeHedgePlan, planHedge } from './decision'
+import {
+  type HedgeItem,
+  type PlanHedgeConfig,
+  computeHedgeExposure,
+  computeHedgePlan,
+  planHedge,
+} from './decision'
 import type { LpPositionForHedge } from './lpPositions'
 
 // assetIndex = 1n → short hedge tokenType = 1n (asset), long hedge tokenType = 0n (numeraire).
@@ -45,6 +51,65 @@ function planWithCollateral(args: {
     hedgePositions: [],
   })
 }
+
+describe('computeHedgePlan — hedge sizing', () => {
+  // tick 0 is price 1; tick 6932 is ~2x token0 priced in token1.
+  const PRICE_DOUBLED_TICK = 6932n
+  const loanAt = (tokenId: bigint, tokenType: bigint, positionSize: bigint) =>
+    ({
+      tokenId,
+      positionSize,
+      tickAtMint: 0n,
+      legs: [
+        {
+          index: 0n,
+          asset: 0n,
+          tokenType,
+          optionRatio: 1n,
+          isLong: false,
+          riskPartner: 0n,
+          strike: 0n,
+          width: 0n,
+          tickLower: 0n,
+          tickUpper: 0n,
+        },
+      ],
+    }) as never
+  const exposureAt = (currentTick: bigint, hedge: never) =>
+    computeHedgeExposure({
+      pool: { currentTick, poolId: 1n, tickSpacing: 1n, poolKey: { tickSpacing: 1 } } as never,
+      collateral: { token0: { assets: 0n }, token1: { assets: 0n } } as never,
+      signalTick: currentTick,
+      assetIndex: 0n,
+      deltaThresholdBps: 200n,
+      deltaOffsetBps: 0n,
+      absoluteMaxHedgeCount: 4,
+      slippageBps: 30n,
+      positions: [hedge],
+      hedgePositions: [hedge],
+    })
+
+  it('sizes a short hedge by its debt regardless of price', () => {
+    const exposure = exposureAt(PRICE_DOUBLED_TICK, loanAt(1n, 0n, 1_000n))
+    expect(exposure.H_short).toBe(1_000n)
+    expect(exposure.H_long).toBe(0n)
+    expect(exposure.hedgeItems[0].size).toBe(1_000n)
+  })
+
+  it('sizes a long hedge by the vault asset its repayment costs at the current price', () => {
+    // Borrow token1 worth 1000 token0 at the strike (price 1) and swap into
+    // token0. When token0 doubles, repaying the same token1 principal costs
+    // only ~500 token0: that is all the delta a swapped burn removes.
+    const atStrike = exposureAt(0n, loanAt(1n, 1n, 1_000n))
+    expect(atStrike.H_long).toBe(1_000n)
+
+    const doubled = exposureAt(PRICE_DOUBLED_TICK, loanAt(1n, 1n, 1_000n))
+    expect(doubled.H_short).toBe(0n)
+    expect(doubled.H_long).toBeGreaterThan(495n)
+    expect(doubled.H_long).toBeLessThan(505n)
+    expect(doubled.hedgeItems[0]).toEqual({ tokenId: 1n, tokenType: 1n, size: doubled.H_long })
+  })
+})
 
 describe('computeHedgePlan — collateral delta', () => {
   it('uses only token0 collateral when token0 is the vault asset', () => {

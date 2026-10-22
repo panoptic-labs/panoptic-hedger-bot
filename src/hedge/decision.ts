@@ -426,13 +426,21 @@ export function computeHedgeExposure(deps: ComputeHedgeExposureDeps): HedgeExpos
           `hedge loan ${h.tokenId} has mixed-side zero-width legs; expected a single-side loan`,
         )
       }
+      // Size each loan by the delta a swapped burn moves today. The loan owes a
+      // fixed principal of its tokenType (the notional converted at the strike).
+      // A loan on the vault asset repays that asset one-for-one; a loan on the
+      // other token is repaid with the vault asset bought at the current price,
+      // so its size is the principal converted back at the mark tick, not the
+      // vault-asset notional it was minted with.
       const notional = h.positionSize * leg.optionRatio
-      const sizeVault = toVaultFrameAtSqrtPriceX96(
+      const debtToken: 0n | 1n = leg.tokenType === 0n ? 0n : 1n
+      const principal = toVaultFrameAtSqrtPriceX96(
         notional,
         leg.asset,
-        assetIndex,
+        debtToken,
         tickToSqrtPriceX96(leg.strike),
       )
+      const sizeVault = toVaultFrameAtTick(principal, debtToken, assetIndex, markTick)
       const mag = sizeVault < 0n ? -sizeVault : sizeVault
       sizeMag += mag
       side = leg.tokenType

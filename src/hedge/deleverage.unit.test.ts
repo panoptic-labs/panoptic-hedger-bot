@@ -174,3 +174,27 @@ describe('selectOptionBurns', () => {
     expect(result.tokenIds).toEqual([2n])
   })
 })
+
+describe('owed interest in the deleverage trigger', () => {
+  // Same account read two ways. Collateral 10_000 in token1, requirement 9_000
+  // in token0, 1_200 of owed token0 interest with no token0 balance to pay it.
+  // Price 1, so both frames are identical.
+  const triggerMarginBps = 500n
+
+  it('does not fire on the pre-interest (assetsOf) numbers', () => {
+    const assetsOfBased = liq(10_000n, 9_000n, 10_000n, 9_000n)
+    const bufferBps = computeLiquidationBufferBps(assetsOfBased)
+    expect(bufferBps).toBe((1_000n * 10_000n) / 9_000n)
+    expect(isDeleverageTriggered({ isLiquidatable: false, bufferBps, triggerMarginBps })).toBe(
+      false,
+    )
+  })
+
+  it('fires once unpayable interest is added to the requirement', () => {
+    // RiskEngine._getMargin: interest > balance → balance 0, requirement += interest.
+    const engineBased = liq(10_000n, 10_200n, 10_000n, 10_200n)
+    const bufferBps = computeLiquidationBufferBps(engineBased)
+    expect(bufferBps).toBe(0n)
+    expect(isDeleverageTriggered({ isLiquidatable: false, bufferBps, triggerMarginBps })).toBe(true)
+  })
+})
